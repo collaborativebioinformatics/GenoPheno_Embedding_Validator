@@ -34,13 +34,46 @@ For more see: [haploblocks.org](haploblocks.org)
 - xgboost (XGBoost embeddings)
 - evo2 + flash-attn (step 4)
 
-## Install
+## Install on Nvidia Brev
 
 ```bash
-pip install numpy pandas scipy torch xgboost
-pip install flash-attn==2.8.0.post2 --no-build-isolation
+# 1. Install the CUDA Toolkit and cuDNN (one time, system-wide)
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt update
+
+# CUDA 12.8 toolkit (includes nvcc) + cuDNN 9 headers for Transformer Engine
+sudo apt install -y cuda-toolkit-12-8 libcudnn9-dev-cuda-12 build-essential
+
+# 2. Set CUDA_HOME
+echo 'export CUDA_HOME=/usr/local/cuda-12.8' >> ~/.bashrc
+echo 'export PATH=$CUDA_HOME/bin:$PATH' >> ~/.bashrc
+echo 'export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
+source ~/.bashrc
+
+nvcc --version   # should report 12.8
+
+# 3. Create a virtual environment and install the Python packages
+python3.12 -m venv ~/evo2-env
+source ~/evo2-env/bin/activate
+pip install --upgrade pip setuptools wheel ninja packaging
+
+# PyTorch built for CUDA 12.8 (matches the toolkit above)
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+
+# Transformer Engine (needed for the 1B, 20B and 40B models; skip for 7B only)
+sudo apt install -y libnccl2 libnccl-dev
+pip install --no-build-isolation "transformer_engine[pytorch]"
+
+# Flash Attention, then Evo 2
+MAX_JOBS=4 pip install flash-attn==2.8.0.post2 --no-build-isolation
 pip install evo2
+export NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE=1
+
+# Other packages
+pip install numpy pandas scipy xgboost
 ```
+
 
 ## Usage
 

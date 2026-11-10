@@ -137,6 +137,40 @@ def find_embedding_module(net, name):
     raise SystemExit("could not find Evo 2's token embedding layer; pass --embed-module")
 
 
+def convert_inference_tensors(net):
+    """The evo2 package loads its weights under torch.inference_mode(), which makes them
+    'inference tensors' that autograd can neither train nor save for backward (needed even for
+    frozen blocks, so gradients can flow back to the input projection). Replace every parameter,
+    buffer and plain tensor attribute that is an inference tensor with a normal clone, one tensor
+    at a time (peak extra memory = one tensor). Tied parameters stay tied."""
+    import torch
+    memo, n = {}, 0
+
+    def fresh(t, as_param):
+        nonlocal n
+        if id(t) not in memo:
+            c = t.clone()                      # outside inference mode -> normal tensor
+            memo[id(t)] = torch.nn.Parameter(c, requires_grad=False) if as_param else c
+            n += 1
+        return memo[id(t)]
+
+    with torch.no_grad():
+        for mod in net.modules():
+            for name, p in list(mod._parameters.items()):
+                if p is not None and p.is_inference():
+                    mod._parameters[name] = fresh(p, True)
+            for name, b in list(mod._buffers.items()):
+                if b is not None and b.is_inference():
+                    mod._buffers[name] = fresh(b, False)
+            for name, v in list(vars(mod).items()):
+                if (isinstance(v, torch.Tensor) and not isinstance(v, torch.nn.Parameter)
+                        and v.is_inference()):
+                    setattr(mod, name, fresh(v, False))
+    memo.clear()
+    torch.cuda.empty_cache()
+    return n
+
+
 def train(args):
     import torch
     import torch.nn as nn
@@ -174,6 +208,9 @@ def train(args):
     evo = Evo2(args.evo2_model)
     net = evo.model
     dev = next(net.parameters()).device
+    n_conv = convert_inference_tensors(net)
+    if n_conv:
+        log(f"  converted {n_conv:,} inference-mode tensors from the evo2 loader to trainable tensors")
 
     # ---- freeze all, unfreeze the last `train_blocks` blocks up to the read-out layer
     m = re.match(r"blocks\.(\d+)\.", args.layer)
