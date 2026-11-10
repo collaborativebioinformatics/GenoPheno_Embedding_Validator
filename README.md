@@ -36,44 +36,12 @@ For more see: [haploblocks.org](haploblocks.org)
 
 ## Install on Nvidia Brev
 
+`install_evo2.sh` sets up everything on an RTX PRO 6000 Blackwell or an L40S instance: the CUDA 12.8 toolkit, a Python 3.12 virtual environment at ~/evo2-env, PyTorch 2.7.1, flash-attn 2.8.0.post2, the Evo 2 light install (7B models, no Transformer Engine) and the other packages, then runs a test generation. It detects the GPU automatically; the only difference is that on the RTX PRO 6000 (sm_120) flash-attn is always compiled from source, which takes 20–40 minutes, while on the L40S (sm_89) a prebuilt wheel is usually used and the install finishes in a few minutes. The RTX PRO 6000's 96 GB is recommended for fine-tuning in step 4, since the L40S's 48 GB limits sequence length and how many blocks can be unfrozen. If the build gets killed for lack of RAM, lower MAX_JOBS.
+
 ```bash
-# 1. Install the CUDA Toolkit and cuDNN (one time, system-wide)
-wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
-sudo dpkg -i cuda-keyring_1.1-1_all.deb
-sudo apt update
-
-# CUDA 12.8 toolkit (includes nvcc) + cuDNN 9 headers for Transformer Engine
-sudo apt install -y cuda-toolkit-12-8 libcudnn9-dev-cuda-12 build-essential
-
-# 2. Set CUDA_HOME
-echo 'export CUDA_HOME=/usr/local/cuda-12.8' >> ~/.bashrc
-echo 'export PATH=$CUDA_HOME/bin:$PATH' >> ~/.bashrc
-echo 'export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
-source ~/.bashrc
-
-nvcc --version   # should report 12.8
-
-# 3. Create a virtual environment and install the Python packages
-python3.12 -m venv ~/evo2-env
+bash install_evo2.sh          # auto-detect GPU (or: bash install_evo2.sh rtx / l40s)
 source ~/evo2-env/bin/activate
-pip install --upgrade pip setuptools wheel ninja packaging
-
-# PyTorch built for CUDA 12.8 (matches the toolkit above)
-pip install torch --index-url https://download.pytorch.org/whl/cu128
-
-# Transformer Engine (needed for the 1B, 20B and 40B models; skip for 7B only)
-sudo apt install -y libnccl2 libnccl-dev
-pip install --no-build-isolation "transformer_engine[pytorch]"
-
-# Flash Attention, then Evo 2
-MAX_JOBS=4 pip install flash-attn==2.8.0.post2 --no-build-isolation
-pip install evo2
-export NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE=1
-
-# Other packages
-pip install numpy pandas scipy xgboost
 ```
-
 
 ## Usage
 
