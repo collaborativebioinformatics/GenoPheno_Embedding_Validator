@@ -58,9 +58,11 @@ Add `--chroms chr21,chr22` to any step for a quick test run, and `--help` to see
 
 ### Example test run
 
+This runs the full pipeline as a quick test on chr 21. The first command builds the haploblock co-occurrence graph for chr21 and writes it to `haplograph/chr21/`, and the second assigns 1000 Genomes ancestry labels to that graph. The third turns the graph nodes into embeddings with node2vec. The fourth fine-tunes Evo2 for one epoch to predict ancestry from those embeddings, with `--train-blocks 0` keeping all Evo2 blocks frozen so only the added layers are trained.
+
 ```bash
 python3 1_build_graph.py --chroms chr21
-python3 2_ancestry_labels.py --graph haplograph/chr21/
-python3 3_node_embeddings.py --method node2vec --graph haplograph/chr21/
-python3 4_finetune_evo2.py   --method node2vec --graph haplograph/chr21/ --objective ancestry --train-blocks 0 --epochs 1
+python3 2_ancestry_labels.py --graph-dir haplograph/chr21/
+python3 3_node_embeddings.py --method node2vec --graph-dir haplograph/chr21/
+python3 4_finetune_evo2.py   --method node2vec --graph-dir haplograph/chr21/ --objective ancestry --train-blocks 0 --epochs 1
 ```
