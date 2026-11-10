@@ -48,10 +48,19 @@ source ~/evo2-env/bin/activate
 Run the scripts in order. Step 1 writes the graph to `haplograph/genome/`; steps 2–4 read and write there (change with `--graph-dir`).
 
 ```bash
-python 1_build_graph.py                            # whole genome (or --chroms chr21,chr22)
-python 2_ancestry_labels.py                        # needed for xgboost or --objective ancestry
-python 3_node_embeddings.py --method node2vec      # or gnn / xgboost
-python 4_finetune_evo2.py   --method node2vec      # --objective next (default) or ancestry
+python3 1_build_graph.py                            # whole genome (or --chroms chr21,chr22)
+python3 2_ancestry_labels.py                        # needed for xgboost or --objective ancestry
+python3 3_node_embeddings.py --method node2vec      # or gnn / xgboost
+python3 4_finetune_evo2.py   --method node2vec      # --objective next (default) or ancestry
 ```
 
 Add `--chroms chr21,chr22` to any step for a quick test run, and `--help` to see all options.
+
+### Example test run
+
+```bash
+python3 1_build_graph.py --chroms chr21
+python3 2_ancestry_labels.py --graph haplograph/chr21/
+python3 3_node_embeddings.py --method node2vec --graph haplograph/chr21/
+python3 4_finetune_evo2.py   --method node2vec --graph haplograph/chr21/ --objective ancestry --train-blocks 0 --epochs 1
+```
