@@ -66,3 +66,18 @@ python3 2_ancestry_labels.py --graph-dir haplograph/chr21/
 python3 3_node_embeddings.py --method node2vec --graph-dir haplograph/chr21/
 python3 4_finetune_evo2.py   --method node2vec --graph-dir haplograph/chr21/ --objective ancestry --train-blocks 0 --epochs 1
 ```
+
+### Running the whole genome 
+
+The example above runs on chr21 as a quick test. To run the whole genome, build the graph across all autosomes (1_build_graph.py with no --chroms covers chr1–chr22) and point the later steps at haplograph/genome/.
+
+I ran this on an RTX PRO 6000 Blackwell for the hackathon. Worth flagging up front: the bottleneck here is host RAM, not GPU. Steps 1–3 are CPU/memory-bound. The step that strains is 3_node_embeddings.py --method xgboost: its leaf-embedding stage one-hot encodes every node’s leaf index across all trees, and at genome scale (11M nodes) that transient matrix is large enough to exhaust ~250 GB at the default --xgb-trees 100 --xgb-depth 6. On a 141 GB machine this gets OOM-killed right after the accuracy line, with no traceback.
+
+The fix is to shrink the leaf matrix with fewer, shallower trees. --xgb-trees 20 --xgb-depth 3 keeps peak RAM around 120 GB and still reaches ~0.98 ancestry accuracy (versus ~0.99 at default), since the super-population signal is easily separable. --device cpu avoids a GPU/CPU device-mismatch in XGBoost’s apply step.
+
+'''bash
+python3 1_build_graph.py
+python3 2_ancestry_labels.py --graph-dir haplograph/genome/
+python3 3_node_embeddings.py --method xgboost --graph-dir haplograph/genome/ --device cpu --xgb-trees 20 --xgb-depth 3
+python3 4_finetune_evo2.py   --method xgboost --graph-dir haplograph/genome/ --objective ancestry --train-blocks 0 --epochs 1
+'''
