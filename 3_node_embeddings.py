@@ -12,6 +12,11 @@ METHODS (--method)
             predicts each node's ancestry label from [own carrier profile, neighbourhood-averaged
             profile over the graph]; the leaves each node falls into (across all trees) are one-hot
             encoded and compressed with SVD.
+            Memory-bounded for large graphs: trains on at most --xgb-train-nodes labelled nodes
+            (compressed QuantileDMatrix), fits the leaf SVD on --xgb-svd-nodes sampled nodes, then
+            embeds all nodes in chunks of --chunk-nodes (embedding = one-hot leaves @ SVD basis,
+            identical to the SVD scores on the sampled nodes). Still OOM? Lower those three
+            options, --xgb-max-bin, or --xgb-trees, or use --device cpu.
 
 Note: the data has only within-chromosome edges, so a genome-wide graph is one disconnected block
 per chromosome. node2vec walks never leave their chromosome, so node2vec vectors are comparable
@@ -286,51 +291,89 @@ def embed_gnn(args, A):
 # XGBoost (leaf embeddings)
 # ---------------------------------------------------------------------------
 
-def leaf_embedding(leaves, dim, seed=0):
-    """One-hot encode leaf indices per tree ([N, n_trees]) and compress with SVD -> [N, dim]."""
+def propagate(A, X):
+    """D^-1/2 (A + I) D^-1/2 @ X (GCN-normalized neighbourhood average) without copying A."""
+    d = np.asarray(A.sum(axis=1)).ravel() + 1.0
+    s = (1.0 / np.sqrt(d)).astype(np.float32)[:, None]
+    Y = s * X
+    return s * (A @ Y + Y)
+
+
+def leaf_onehot(leaves, width):
+    """[n, n_trees] leaf ids -> sparse one-hot [n, n_trees * width] (tree j uses columns j*width...)."""
     n, n_trees = leaves.shape
-    cols, offset = np.empty_like(leaves, dtype=np.int64), 0
-    for j in range(n_trees):
-        _, inv = np.unique(leaves[:, j], return_inverse=True)
-        cols[:, j] = inv + offset
-        offset += inv.max() + 1
-    rows = np.repeat(np.arange(n), n_trees)
-    M = sp.csr_matrix((np.ones(rows.size, np.float32), (rows, cols.ravel())), shape=(n, offset))
+    cols = (np.arange(n_trees, dtype=np.int64) * width)[None, :] + leaves
+    rows = np.repeat(np.arange(n, dtype=np.int64), n_trees)
+    return sp.csr_matrix((np.ones(rows.size, np.float32), (rows, cols.ravel())),
+                         shape=(n, n_trees * width))
+
+
+def leaf_basis(M, dim, seed=0):
+    """SVD of a (sampled) one-hot leaf matrix -> basis V [n_cols, k], largest component first.
+    For the sampled rows, M @ V equals the usual SVD scores U * S."""
     k = min(dim, min(M.shape) - 1)
-    U, S, _ = svds(M, k=k, random_state=seed)
-    return (U * S)[:, ::-1].astype(np.float32).copy()
+    _, S, Vt = svds(M, k=k, random_state=seed)
+    return Vt[np.argsort(S)[::-1]].T.astype(np.float32).copy()
 
 
 def embed_xgboost(args, A):
     import xgboost as xgb
+    rng = np.random.default_rng(args.seed)
     lab = np.load(gfile(args, "labels.npz"), allow_pickle=True)
     y, classes = lab["labels"], lab["classes"]
     X = carrier_features(args)
-    feats = np.hstack([X, normalized_adjacency(A) @ X])    # own profile + graph neighbourhood
-    idx = np.where(y >= 0)[0]
-    rng = np.random.default_rng(args.seed)
-    rng.shuffle(idx)
-    n_val = max(1, int(0.1 * len(idx)))
-    val, tr = idx[:n_val], idx[n_val:]
+    H = propagate(A, X)                                   # graph neighbourhood average
+    n = len(X)
+
+    def feats(idx):                                       # own profile + neighbourhood, built per batch
+        return np.hstack([X[idx], H[idx]])
+
+    labelled = np.where(y >= 0)[0]
+    rng.shuffle(labelled)
+    n_val = min(max(1, int(0.1 * len(labelled))), args.xgb_val_nodes)
+    val, tr = labelled[:n_val], labelled[n_val:n_val + args.xgb_train_nodes]
 
     try:
         device = "cuda" if torch_device(args.device).type == "cuda" else "cpu"
     except ImportError:
-        device = "cpu"
-    clf = xgb.XGBClassifier(
-        n_estimators=args.xgb_trees, max_depth=args.xgb_depth, learning_rate=0.1,
-        subsample=0.8, colsample_bytree=0.8, tree_method="hist", device=device,
-        objective="multi:softprob", eval_metric="mlogloss", random_state=args.seed,
-    )
-    log(f"  XGBoost on {device}: {len(tr):,} train / {len(val):,} val nodes, "
-        f"{feats.shape[1]} features, classes {classes.tolist()}")
-    clf.fit(feats[tr], y[tr], eval_set=[(feats[val], y[val])], verbose=False)
-    acc = float((clf.predict(feats[val]) == y[val]).mean())
+        device = args.device or "cpu"
+    params = {
+        "objective": "multi:softprob", "num_class": len(classes), "eval_metric": "mlogloss",
+        "max_depth": args.xgb_depth, "eta": 0.1, "subsample": 0.8, "colsample_bytree": 0.8,
+        "tree_method": "hist", "max_bin": args.xgb_max_bin, "device": device, "seed": args.seed,
+    }
+    log(f"  XGBoost on {device}: {len(tr):,} train / {len(val):,} val nodes "
+        f"(of {len(labelled):,} labelled, {n:,} total), {2 * X.shape[1]} features, "
+        f"classes {classes.tolist()}")
+    dtrain = xgb.QuantileDMatrix(feats(tr), label=y[tr], max_bin=args.xgb_max_bin)
+    dval = xgb.QuantileDMatrix(feats(val), label=y[val], ref=dtrain, max_bin=args.xgb_max_bin)
+    booster = xgb.train(params, dtrain, num_boost_round=args.xgb_trees,
+                        evals=[(dval, "val")], verbose_eval=False)
+    acc = float((np.asarray(booster.predict(dval)).reshape(len(val), -1).argmax(1) == y[val]).mean())
     base = float(np.bincount(y[tr]).max() / len(tr))
     log(f"  node-ancestry accuracy on held-out nodes {acc:.3f} (majority-class baseline {base:.3f})")
-    leaves = clf.apply(feats)                          # leaf index per tree, for every node
-    Z = leaf_embedding(leaves.reshape(len(feats), -1), args.dim, args.seed)
-    return Z, {"val_accuracy": acc, "baseline_accuracy": base, "n_trees_total": int(leaves.reshape(len(feats), -1).shape[1])}
+    del dtrain, dval
+
+    width = 2 ** (args.xgb_depth + 1)                     # depth-d tree node ids are < 2^(d+1) - 1
+
+    def leaves(idx):
+        L = np.asarray(booster.predict(xgb.DMatrix(feats(idx)), pred_leaf=True)).astype(np.int64)
+        L = L.reshape(len(idx), -1)
+        if L.size and L.max() >= width:
+            raise RuntimeError(f"leaf id {L.max()} >= {width}; trees are deeper than --xgb-depth")
+        return L
+
+    sample = np.sort(rng.choice(n, min(n, args.xgb_svd_nodes), replace=False))
+    V = leaf_basis(leaf_onehot(leaves(sample), width), args.dim, args.seed)
+    log(f"  leaf SVD fitted on {len(sample):,} nodes ({V.shape[0]:,} leaf columns -> {V.shape[1]} dims)")
+    Z = np.empty((n, V.shape[1]), np.float32)
+    for b in range(0, n, args.chunk_nodes):
+        idx = np.arange(b, min(b + args.chunk_nodes, n))
+        Z[idx] = leaf_onehot(leaves(idx), width) @ V
+        if (b // args.chunk_nodes) % 20 == 0:
+            log(f"    embedded {idx[-1] + 1:,}/{n:,} nodes")
+    return Z, {"val_accuracy": acc, "baseline_accuracy": base, "train_nodes": int(len(tr)),
+               "svd_nodes": int(len(sample)), "n_trees_total": int(V.shape[0] // width)}
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +409,11 @@ def main():
     g.add_argument("--edge-batch", type=int, default=500_000)
     g.add_argument("--xgb-trees", type=int, default=100)
     g.add_argument("--xgb-depth", type=int, default=6)
+    g.add_argument("--xgb-train-nodes", type=int, default=1_000_000, help="max labelled nodes to train on")
+    g.add_argument("--xgb-val-nodes", type=int, default=100_000, help="max held-out nodes for accuracy")
+    g.add_argument("--xgb-svd-nodes", type=int, default=300_000, help="nodes sampled to fit the leaf SVD")
+    g.add_argument("--xgb-max-bin", type=int, default=256, help="histogram bins (lower = less memory)")
+    g.add_argument("--chunk-nodes", type=int, default=200_000, help="nodes embedded per chunk")
     args = ap.parse_args()
 
     out = gfile(args, f"node_emb_{args.method}.npy")
