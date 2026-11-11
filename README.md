@@ -51,10 +51,16 @@ Run the scripts in order. Step 1 writes the graph to `haplograph/genome/`; steps
 python3 1_build_graph.py                            # whole genome (or --chroms chr21,chr22)
 python3 2_ancestry_labels.py                        # needed for xgboost or --objective ancestry
 python3 3_node_embeddings.py --method node2vec      # or gnn / xgboost
-python3 4_finetune_evo2.py   --method node2vec      # --objective next (default) or ancestry
+python 4a_finetune_evo2_embeddings.py --method node2vec   # --objective next (default) or ancestry
 ```
 
 Add `--chroms chr21,chr22` to any step for a quick test run, and `--help` to see all options.
+
+To fine-tune on hash-phenotype associations instead, use step 4b on its own (no steps 1–3 needed). Its input is a TSV with two columns, a genomic hash (0/1 string) and a phenotype (e.g. height).
+
+```bash
+python 4b_finetune_evo2_hash.py --hash-pheno hash_height.tsv   # numeric -> regression, labels -> classification
+```
 
 ### Example test run
 
