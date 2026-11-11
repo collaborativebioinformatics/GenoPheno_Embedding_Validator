@@ -1,0 +1,127 @@
+# Step 3 with RAPIDS — environment setup
+
+**RAPIDS goes in its own venv. The system Python stays clean for Step 4 (Evo2 / PyTorch).**
+
+Installing RAPIDS into the system/user site-packages downgrades the CUDA bindings
+(`cuda-bindings`, `cuda-toolkit`) from the CUDA 13 that this instance's PyTorch (`torch 2.14.1+cu130`)
+depends on, to CUDA 12. On this box PyTorch happened to keep working because it bundles its own
+CUDA libs, but that is luck, not design — do not rely on it. Keep the two environments separate:
+
+- **venv active** (`(rapids-env)` in the prompt) → RAPIDS / Step 3 `--rapids`
+- **venv deactivated** → everything else: Step 4 (Evo2), and Step 3 without `--rapids`
+
+Check the prompt before every run.
+
+## Environment facts on this instance
+
+- GPU: RTX PRO 6000 Blackwell, 96 GB VRAM
+- Driver: 580.126.09 (CUDA 13.0 capable); toolkit `nvcc` 12.8 — driver newer than toolkit is fine
+- System Python: 3.10.12, no conda (pip `--user` only)
+- So: CUDA 12 RAPIDS **pip wheels** (`-cu12`) are the route; conda is not available
+
+## Install (once)
+
+```bash
+# system package needed for venv creation (needs sudo)
+sudo apt install -y python3.10-venv
+
+# isolated environment for RAPIDS
+python3 -m venv ~/rapids-env
+source ~/rapids-env/bin/activate
+pip install --upgrade pip
+
+# RAPIDS (CUDA 12 wheels) + the libs the script imports, all inside the venv
+pip install --extra-index-url=https://pypi.nvidia.com \
+    cudf-cu12 cuml-cu12 cupy-cuda12x \
+    numpy pandas scipy xgboost
+```
+
+Verified working versions from this build (pin these if a later resolver drifts):
+
+```
+cudf-cu12      26.02.*
+cuml-cu12      26.02.000
+cupy-cuda12x   14.2.0
+numpy          2.2.x
+scipy          1.15.x
+xgboost        (cuda-enabled wheel)
+```
+
+To pin explicitly:
+
+```bash
+pip install --extra-index-url=https://pypi.nvidia.com \
+    "cudf-cu12==26.2.*" "cuml-cu12==26.2.*" "cupy-cuda12x==14.2.0" \
+    numpy pandas scipy xgboost
+```
+
+## Verify the venv
+
+```bash
+# inside the venv
+python3 -c "import cudf, cuml, cupy; print('cuml', cuml.__version__, '| gpu', cupy.cuda.runtime.getDeviceCount())"
+# expect: cuml 26.02.000 | gpu 1
+```
+
+## If RAPIDS was already pip-installed into system Python (cleanup)
+
+The first attempt here fell back to a `--user` install because `python3-venv` was missing, leaving
+RAPIDS and CUDA-12 bindings in `~/.local`. After the venv works, clean the system env so Step 4 is
+unambiguous. Run with the **venv deactivated**:
+
+```bash
+deactivate 2>/dev/null
+pip uninstall -y cudf-cu12 cuml-cu12 cupy-cuda12x \
+    libcudf-cu12 libcuml-cu12 pylibcudf-cu12 librmm-cu12 rmm-cu12 \
+    libraft-cu12 pylibraft-cu12 libkvikio-cu12
+
+# confirm Step 4's runtime is intact
+python3 -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+# expect: 2.14.1+cu130 True
+```
+
+If that torch check ever prints False or errors, restore the bindings PyTorch wants:
+
+```bash
+pip install --user --force-reinstall 'cuda-bindings>=13.0.3' 'cuda-toolkit==13.0.3'
+```
+
+## Running Step 3
+
+CPU (no venv needed; system Python):
+```bash
+python3 3_node_embeddings.py --method xgboost --graph-dir haplograph/genome --device cpu \
+    --xgb-trees 100 --xgb-depth 4
+```
+
+XGBoost native GPU, SVD on CPU (no venv needed):
+```bash
+python3 3_node_embeddings.py --method xgboost --graph-dir haplograph/genome --device cuda \
+    --xgb-trees 100 --xgb-depth 4
+```
+
+RAPIDS GPU SVD (**inside the venv**):
+```bash
+source ~/rapids-env/bin/activate
+python3 3_node_embeddings.py --method xgboost --graph-dir haplograph/genome --device cuda --rapids \
+    --xgb-trees 100 --xgb-depth 4 --xgb-svd-nodes 150000 --chunk-nodes 100000
+deactivate
+```
+
+Notes:
+- `--rapids` only accelerates the two SVD steps (carrier-matrix SVD and leaf-basis SVD).
+  Tree-fit uses XGBoost's own GPU path (`--device cuda`); everything else is CPU numpy.
+- The carrier SVD is fit on a `--rapids-fit-rows` sample (default 150k) then projected in
+  `--rapids-chunk` dense chunks (default 200k). The sampling is an approximation: on the genome
+  run it gave val-accuracy 0.986 vs 0.992/0.993 for the exact CPU SVD. Raise `--rapids-fit-rows`
+  (e.g. 300000) to close that gap — the carrier matrix has only ~2,548 columns, so a larger fit
+  sample is cheap.
+- Delete any cached `features_svd*.npy` in the graph-dir before benchmarking `--rapids`, or the
+  cached CPU features load and the GPU SVD never runs.
+
+## Why RAPIDS here, honestly
+
+This step is CPU/RAM-bound, not GPU-bound — `--rapids` is a demonstration of the NVIDIA
+data-science stack (cuML on the RTX PRO 6000), not a large speedup. The dominant cost is the
+CPU-side chunked embedding of all 11M nodes, which `--rapids` does not change. Report the measured
+times and the accuracy together; the SVD moving to GPU is the genuine RAPIDS contribution.
