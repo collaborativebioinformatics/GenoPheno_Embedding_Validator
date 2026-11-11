@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 from sklearn.metrics import accuracy_score, average_precision_score, f1_score, roc_auc_score
 from sklearn.model_selection import train_test_split
@@ -123,6 +124,31 @@ def evaluate(model: ProLMClassifier, loader: DataLoader, device: torch.device) -
     return metrics
 
 
+def save_patient_embeddings(
+    model: ProLMClassifier, data, device: torch.device, path: Path, batch_size: int = 16
+) -> pd.DataFrame:
+    """Save one ProLM backbone vector per patient, with its eid.
+
+    The backbone splits the proteins into chunks, runs each chunk with its own [CLS] token and averages the
+    chunk [CLS] vectors, so the result has shape (n_patients, hidden_size). Evaluation mode switches dropout
+    off (the vectors are reproducible), no_grad avoids building a gradient graph, and patients are processed
+    in batches on the model's device.
+    """
+    was_training = model.training
+    model.eval()
+    expressions = torch.tensor(data.expression.values, dtype=torch.float32)
+    parts = []
+    with torch.no_grad():
+        for start in range(0, len(expressions), batch_size):
+            parts.append(model.backbone(expressions[start:start + batch_size].to(device)).cpu())
+    values = torch.cat(parts).numpy()
+    table = pd.DataFrame(values, index=data.expression.index, columns=[f"e{j}" for j in range(values.shape[1])])
+    table.index.name = "eid"
+    table.to_csv(path)
+    model.train(was_training)
+    return table
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -154,6 +180,13 @@ def main() -> None:
     test_loader = DataLoader(Subset(dataset, test_idx), batch_size=args.batch_size, shuffle=False)
 
     model = build_model(args, data, device)
+    if not args.pretrained_checkpoint:
+        # Without a checkpoint there is nothing to keep frozen: build_model always calls freeze_backbone, which
+        # would leave the encoder, the feature/expression projections and the [CLS] token at their random values.
+        for parameter in model.parameters():
+            parameter.requires_grad = True
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable parameters: {n_trainable:,} of {sum(p.numel() for p in model.parameters()):,}")
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.learning_rate)
     criterion = nn.CrossEntropyLoss()
 
@@ -180,10 +213,13 @@ def main() -> None:
         if score > best_auroc:
             best_auroc = score
             torch.save(model.state_dict(), output_dir / "best_classifier.pt")
-            # separate saving of backbone model:
+            # separate saving of the backbone (the part that makes the patient embeddings)
             torch.save(model.backbone.state_dict(), output_dir / "backbone.pt")
-            # separate saving of embeddings:
-            torch.save(model.backbone.forward(expressions=torch.tensor(data.expression.values)), output_dir / "embeddings_tensor.pt")
+
+    # Patient embeddings from the selected model (the one saved as best_classifier.pt)
+    model.load_state_dict(torch.load(output_dir / "best_classifier.pt", map_location=device))
+    embeddings = save_patient_embeddings(model, data, device, output_dir / "patient_embeddings.csv")
+    print(f"Saved patient embeddings: {embeddings.shape[0]} patients x {embeddings.shape[1]} dimensions")
 
     (output_dir / "metrics.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
     (output_dir / "protein_order.txt").write_text("\n".join(data.protein_names) + "\n", encoding="utf-8")
