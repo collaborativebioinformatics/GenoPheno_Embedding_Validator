@@ -83,3 +83,43 @@ python3 2_ancestry_labels.py --graph-dir haplograph/chr21/
 python3 3_node_embeddings.py --method node2vec --graph-dir haplograph/chr21/
 python3 4_finetune_evo2.py   --method node2vec --graph-dir haplograph/chr21/ --objective ancestry --train-blocks 0 --epochs 1
 ```
+
+### Validation
+
+`5_validate_evo2.py` checks one fine-tuned model (a .pt file) against a test set. The test set is a text file with one individual per line (--test-individuals). By default it is the set the model held out during training, and the train set is every other individual in the graph.
+
+```bash
+python 5_validate_evo2.py --model haplograph/genome/evo2_next_gnn.pt --tasks validation_tasks.txt
+python 5_validate_evo2.py --model evo2_next_gnn.pt --test-individuals test.txt --gwas height_hg38.tsv
+```
+
+The checks to run are listed in a tasks file (`validation_tasks.txt` is an example), one per line with key=value parameters. Add a line to run a check again with other settings. `--list-tasks` shows every task and its parameters.
+
+- model_info: what the model is, its stored metrics, and whether any test individual was in its training data
+- cluster_consistency: per haploblock, whether train and test individuals carry the same clusters, with the same frequencies, compared against random splits of the same size
+- gwas_enrichment: which haploblocks contain more GWAS hits than expected, plus an overall test
+
+New kinds of checks go in a Python file loaded with `--plugins` my_checks.py; the script's header shows a short example. Results are written to report.md, summary.json and one CSV per task in `<graph-dir>/validation_<model>/`.
+
+#### Getting GWAS data
+
+gwas_enrichment reads any text file with chromosome, position and p-value columns, and recognises the GIANT and GWAS Catalog column names automatically. The positions must use the same genome build as the haploblock regions.
+
+GIANT height (Yengo et al. 2022). Download a summary statistics file, e.g. Yengo.2022.height.GWAS.ALL (all ancestries) or .EUR, from the GIANT consortium data files page. The columns are SNPID RSID CHR POS EFFECT_ALLELE OTHER_ALLELE EFFECT_ALLELE_FREQ BETA SE P N, with positions in hg19/GRCh37. The file can be used directly if the haploblocks are hg19. For GRCh38, lift the positions over first, e.g. with CrossMap and the UCSC hg19ToHg38.over.chain.gz chain file:
+
+```bash
+zcat Yengo.2022.height.GWAS.ALL.gz | awk 'NR>1 {OFS="\t"; print "chr"$3, $4-1, $4, $2, $10}' > height_hg19.bed
+CrossMap bed hg19ToHg38.over.chain.gz height_hg19.bed height_hg38.bed
+(printf "CHR\tPOS\tRSID\tP\n"; awk 'BEGIN{OFS="\t"} {print $1, $3, $4, $5}' height_hg38.bed) > height_hg38.tsv
+```
+
+GWAS Catalog (any trait). Download all associations from the GWAS Catalog downloads page, e.g. gwas-catalog-associations_ontology-annotated-full.zip. It contains only reported hits, in GRCh38 coordinates (columns CHR_ID, CHR_POS, SNPS, P-VALUE), so the per-region test then uses region length as the background. Keep one trait:
+
+```python
+import pandas as pd
+cat = pd.read_csv("gwas-catalog-associations_ontology-annotated-full.zip", sep="\t", dtype=str)
+height = cat[cat["MAPPED_TRAIT"].str.contains("body height", case=False, na=False)]
+height[["CHR_ID", "CHR_POS", "SNPS", "P-VALUE"]].to_csv("gwas_catalog_height.tsv", sep="\t", index=False)
+```
+
+Full summary statistics (like GIANT) give the stronger per-region test, because each haploblock is compared against the number of SNPs tested in it.
