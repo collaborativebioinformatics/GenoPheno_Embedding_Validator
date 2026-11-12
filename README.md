@@ -56,6 +56,17 @@ python 4a_finetune_evo2_embeddings.py --method node2vec   # --objective next (de
 
 Add `--chroms chr21,chr22` to any step for a quick test run, and `--help` to see all options.
 
+### Step 4a with NVIDIA BioNeMo (experimental)
+
+`4a_finetune_evo2_embeddings_bionemo.py` does the same fine-tuning as step 4a, but loads and runs Evo 2 through NVIDIA BioNeMo (NeMo 2 / Megatron Core) instead of the evo2 package. It has not been tested on a GPU yet and may need adjusting for your BioNeMo version (the affected parts are marked VERSION-SENSITIVE in the code).
+
+It runs inside the BioNeMo Framework container (nvcr.io/nvidia/clara/bionemo-framework) and needs an Evo 2 checkpoint in NeMo2 format:
+
+```bash
+evo2_convert_to_nemo2 --model-path hf://arcinstitute/savanna_evo2_7b_base --model-size 7b --output-dir nemo2_evo2_7b_8k
+python 4a_finetune_evo2_embeddings_bionemo.py --method gnn --ckpt-dir nemo2_evo2_7b_8k
+```
+
 To fine-tune on hash-phenotype associations instead, use step 4b on its own (no steps 1–3 needed). Its input is a TSV with two columns, a genomic hash (0/1 string) and a phenotype (e.g. height).
 
 ```bash
