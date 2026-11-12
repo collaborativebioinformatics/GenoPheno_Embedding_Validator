@@ -2,6 +2,8 @@
 
 Builds a genome-wide (or per-chromosome-selection) haploblock co-occurrence graph from the [1000 Genomes haplograph](https://data.haploblocks.org/haplograph/1000G/), turns its nodes into embeddings with node2vec, a GNN or XGBoost, fine-tunes Evo 2 (7B) on those embeddings using a training half of the individuals, and validates the fine-tuned model on the held-out half.
 
+For a full reference (what the haplograph is, every script's inputs, outputs and main options, how to extend the pipeline, and its current limitations), see [DOCUMENTATION.md](DOCUMENTATION.md).
+
 ## Dependencies
 
 - Python 3.11 or 3.12, Linux, NVIDIA GPU with CUDA 12.1+ (80 GB recommended for step 4)
