@@ -34,11 +34,25 @@ INPUT
                             them. Loaded only when a task needs it (needs torch).
   --graph-dir               output folder of 1_build_graph.py: nodes.csv.gz, individuals.txt,
                             carriers.npz (formats documented in 1_build_graph.py)
-  --test-individuals FILE   text file, one individual (IND* name from individuals.txt) per line,
-                            '#' = comment; or a CSV with an "individual" column.
-                            Default: the individuals the model held out during training
-                            (val_individuals in 4a checkpoints).
-  --train-individuals FILE  same format; default: all graph individuals not in the test set
+  TRAIN / TEST SPLIT  (default: the BH_26 split, https://data.haploblocks.org/BH_26/splits/)
+    --splits DIR_OR_URL     folder (local path or URL) holding the split files; default the BH_26
+                            folder above. Train = <splits>/half_A.txt (the individuals steps 3-4 were
+                            trained on), test = <splits>/half_B.txt (the individuals Evo 2 is
+                            queried on here). Other names: --train-file / --test-file.
+                            Files given as URLs are downloaded once into <out-dir>/inputs/.
+                            Use --splits none to fall back to the model's own held-out individuals.
+    --train-individuals / --test-individuals FILE_OR_URL
+                            explicit split files; override --splits. Without a train file, train =
+                            every graph individual not in the test set.
+    Split file format: plain text, one sample ID per line, no header ('#' = comment), e.g.
+                              HG00096
+                              NA06985
+                            or a CSV with an "individual" column. half_A.txt has 1,252 and
+                            half_B.txt 1,251 1000 Genomes sample IDs. Individuals of the graph in
+                            neither file are left out of both sets (and counted in the report).
+    --sample-map CSV        only if the graph's individuals (individuals.txt) are not named by
+                            sample ID (e.g. IND1, IND2 ...): 2 columns, graph name, sample ID
+                            (same file format as for 2_ancestry_labels.py)
   --tasks FILE              tasks file (see below); default: model_info + cluster_consistency
                             (+ gwas_enrichment if --gwas is given)
   --gwas FILE               shortcut: adds "gwas_enrichment gwas=FILE"
@@ -88,9 +102,9 @@ OUTPUT  (--out-dir, default <graph-dir>/validation_<model file name>/)
   (a task that is listed twice writes its files with a _2, _3 ... suffix)
 
 USAGE
-  python 5_validate_evo2.py --model haplograph/genome/evo2_next_gnn.pt
-  python 5_validate_evo2.py --model evo2_next_gnn.pt --test-individuals test.txt \\
-         --gwas Yengo.2022.height.GWAS.ALL.gz
+  python 5_validate_evo2.py --model haplograph/genome/evo2_next_gnn.pt     # BH_26 half_A / half_B
+  python 5_validate_evo2.py --model evo2_next_gnn.pt --splits splits/ --gwas height_hg38.tsv
+  python 5_validate_evo2.py --model evo2_next_gnn.pt --sample-map ind_to_sample.csv
   python 5_validate_evo2.py --model evo2_hash_height.pt --test-individuals test.txt --tasks my_tasks.txt
   python 5_validate_evo2.py --list-tasks
 
@@ -292,6 +306,44 @@ class Model:
         v = self.meta.get("val_individuals") if isinstance(self.meta, dict) else None
         return list(v) if v else None
 
+    def trained_individuals(self):
+        """Individuals the model was trained on, if the checkpoint records them."""
+        v = self.meta.get("train_individuals") if isinstance(self.meta, dict) else None
+        return list(v) if v else None
+
+
+BH26_SPLITS = "https://data.haploblocks.org/BH_26/splits/"
+
+
+def is_url(p):
+    return str(p).startswith(("http://", "https://"))
+
+
+def join_path(base, name):
+    return base.rstrip("/") + "/" + name if is_url(base) else os.path.join(base, name)
+
+
+def fetch(path, cache_dir):
+    """Local path as is; a URL is downloaded once into cache_dir."""
+    if not is_url(path):
+        if not os.path.exists(path):
+            raise SystemExit(f"file not found: {path}")
+        return path
+    import urllib.request
+    os.makedirs(cache_dir, exist_ok=True)
+    dest = os.path.join(cache_dir, os.path.basename(path.rstrip("/")))
+    if not os.path.exists(dest):
+        log(f"  downloading {path}")
+        try:
+            tmp = dest + ".part"
+            urllib.request.urlretrieve(path, tmp)
+            os.replace(tmp, dest)
+        except Exception as e:
+            raise SystemExit(f"could not download {path} ({e}). Download the split files yourself, e.g.\n"
+                             f"  wget -r -np -nH --cut-dirs=2 -R 'index.html*' {BH26_SPLITS}\n"
+                             f"and pass the local folder with --splits splits/")
+    return dest
+
 
 def read_individual_list(path):
     if path.endswith((".csv", ".csv.gz")):
@@ -307,6 +359,14 @@ def read_individual_list(path):
     return out
 
 
+def load_sample_map(path):
+    """CSV with 2 columns (graph individual name, sample ID) -> {sample ID: graph name}."""
+    m = pd.read_csv(path, dtype=str)
+    if m.shape[1] < 2:
+        raise SystemExit(f"{path}: --sample-map needs 2 columns (graph name, sample ID)")
+    return dict(zip(m.iloc[:, 1].str.strip(), m.iloc[:, 0].str.strip()))
+
+
 class Context:
     def __init__(self, args):
         self.args = args
@@ -317,6 +377,7 @@ class Context:
         self._used = {}
         self.train_idx = self.test_idx = None
         self.test_source = None
+        self.split_info = {}
 
     def out(self, name):
         """Path for an output file; repeated names get _2, _3 ... before the extension."""
@@ -328,37 +389,96 @@ class Context:
         return os.path.join(self.out_dir, name)
 
     def setup_split(self):
+        a = self.args
         inds = self.graph.individuals
         pos = {x: i for i, x in enumerate(inds)}
-        if self.args.test_individuals:
-            test, self.test_source = read_individual_list(self.args.test_individuals), self.args.test_individuals
+        to_graph = load_sample_map(a.sample_map) if a.sample_map else {}
+        cache = os.path.join(self.out_dir, "inputs")
+
+        # where the split comes from: explicit files > split folder (default BH_26) > model held-out
+        if a.test_individuals or a.train_individuals:
+            if not a.test_individuals:
+                raise SystemExit("--train-individuals given without --test-individuals")
+            test_src, train_src = a.test_individuals, a.train_individuals
+        elif a.splits and a.splits.lower() != "none":
+            test_src, train_src = join_path(a.splits, a.test_file), join_path(a.splits, a.train_file)
+        else:
+            test_src = train_src = None
+
+        def load(src, what):
+            raw = read_individual_list(fetch(src, cache))
+            names = [to_graph.get(x, x) for x in raw]
+            found = [x for x in names if x in pos]
+            if raw and not found:
+                raise SystemExit(
+                    f"none of the {len(raw):,} {what} IDs in {src} (e.g. {raw[:2]}) match the graph's "
+                    f"individuals (e.g. {inds[:2]}). If the graph names individuals differently, pass "
+                    "--sample-map (CSV: graph name, sample ID).")
+            if len(found) < len(raw):
+                log(f"warning: {len(raw) - len(found):,} of {len(raw):,} {what} IDs are not in the graph "
+                    f"(e.g. {[x for x in names if x not in pos][:3]}), ignored")
+            return found, len(raw)
+
+        if test_src:
+            test, n_test_file = load(test_src, "test")
+            self.test_source = test_src
         else:
             test = self.model.held_out_individuals()
             if not test:
-                raise SystemExit("no --test-individuals given and the model file has no held-out "
-                                 "individuals (val_individuals); pass --test-individuals")
+                raise SystemExit("--splits none and the model file has no held-out individuals "
+                                 "(val_individuals); pass --test-individuals or --splits")
+            test, n_test_file = [x for x in test if x in pos], len(test)
             self.test_source = "held-out individuals stored in the model"
-        missing = [x for x in test if x not in pos]
-        if missing:
-            log(f"warning: {len(missing):,} test individuals are not in the graph (e.g. {missing[:3]}), ignored")
-        test_set = {x for x in test if x in pos}
-        if self.args.train_individuals:
-            train = [x for x in read_individual_list(self.args.train_individuals) if x in pos]
+        test_set = set(test)
+
+        if train_src:
+            train, n_train_file = load(train_src, "train")
             overlap = test_set & set(train)
             if overlap:
-                log(f"warning: {len(overlap):,} individuals are in both train and test; removed from train")
+                log(f"warning: {len(overlap):,} individuals are in both the train and the test file "
+                    f"(e.g. {sorted(overlap)[:3]}); removed from train")
             train_set = set(train) - test_set
+            train_source = train_src
         else:
-            train_set = set(inds) - test_set
+            train_set, n_train_file = set(inds) - test_set, None
+            train_source = "all other graph individuals"
+
+        # the graph's own training set (1_build_graph.py --train-individuals) must not contain test individuals
+        graph_train_file = os.path.join(self.graph.dir, "train_individuals.txt")
+        if os.path.exists(graph_train_file):
+            graph_train = set(read_individual_list(graph_train_file))
+            in_both = test_set & graph_train
+            self.split_info["graph_built_on"] = f"{len(graph_train):,} training individuals (train_individuals.txt)"
+            self.split_info["test_individuals_in_graph_training_set"] = len(in_both)
+            if in_both:
+                log(f"WARNING: {len(in_both):,} test individuals are in the graph's training set "
+                    f"(e.g. {sorted(in_both)[:3]}): steps 1-4 saw them. Rebuild the graph with "
+                    "--train-individuals set to the train half")
+            elif graph_train != train_set:
+                log(f"note: the graph was built on {len(graph_train):,} training individuals, the train set "
+                    f"here has {len(train_set):,} ({len(graph_train - train_set):,} / {len(train_set - graph_train):,} "
+                    "differ); test individuals are not in it")
+        else:
+            self.split_info["graph_built_on"] = "all individuals (no train_individuals.txt)"
+            log("note: the graph was built from ALL individuals (1_build_graph.py without --train-individuals), "
+                "so its edge weights include the test individuals")
+
+        excluded = len(inds) - len(train_set) - len(test_set)
         self.test_idx = np.array(sorted(pos[x] for x in test_set), dtype=np.int64)
         self.train_idx = np.array(sorted(pos[x] for x in train_set), dtype=np.int64)
         if len(self.test_idx) == 0 or len(self.train_idx) == 0:
             raise SystemExit(f"empty split: {len(self.train_idx)} train / {len(self.test_idx)} test individuals")
-        pd.DataFrame({"individual": [inds[i] for i in self.train_idx] + [inds[i] for i in self.test_idx],
-                      "set": ["train"] * len(self.train_idx) + ["test"] * len(self.test_idx)}
+        self.split_info = {**self.split_info, "train_source": train_source, "test_source": self.test_source,
+                           "train_in_file": n_train_file, "test_in_file": n_test_file,
+                           "train": int(len(self.train_idx)), "test": int(len(self.test_idx)),
+                           "graph_individuals_in_neither_set": int(excluded)}
+        neither = sorted(set(inds) - train_set - test_set)
+        pd.DataFrame({"individual": [inds[i] for i in self.train_idx] + [inds[i] for i in self.test_idx] + neither,
+                      "set": ["train"] * len(self.train_idx) + ["test"] * len(self.test_idx)
+                             + ["excluded"] * len(neither)}
                      ).to_csv(os.path.join(self.out_dir, "split.csv"), index=False)
-        log(f"split: {len(self.train_idx):,} train / {len(self.test_idx):,} test individuals "
-            f"(test set from {self.test_source})")
+        log(f"split: {len(self.train_idx):,} train ({train_source}) / {len(self.test_idx):,} test "
+            f"({self.test_source})" + (f"; {excluded:,} graph individuals in neither set, left out" if excluded else ""))
 
 
 # ===========================================================================
@@ -418,15 +538,25 @@ def model_info(ctx):
             for k, v in ((meta.get("metrics") or {}).get(phase) or {}).items():
                 if isinstance(v, (int, float)):
                     s[f"stored_val_{k}_{phase}"] = round(float(v), 4)
-        held = ctx.model.held_out_individuals()
-        if held is not None and ctx.test_idx is not None:
+        held, trained = ctx.model.held_out_individuals(), ctx.model.trained_individuals()
+        test_names = [ctx.graph.individuals[i] for i in ctx.test_idx] if ctx.test_idx is not None else []
+        if trained is not None and test_names:
+            # the checkpoint lists exactly who it was trained on
+            trained = set(trained)
+            leaked = [x for x in test_names if x in trained]
+            s["test_individuals_seen_in_training"] = len(leaked)
+            notes.append(f"WARNING: {len(leaked):,} of {len(test_names):,} test individuals are in the model's "
+                         f"training set (e.g. {leaked[:3]})" if leaked else
+                         "no leakage: no test individual is in the model's training set")
+        elif held is not None and test_names:
+            # 4a checkpoints without a training list: trained on every graph individual except val_individuals
             held = set(held)
-            test_names = [ctx.graph.individuals[i] for i in ctx.test_idx]
             leaked = [x for x in test_names if x not in held]
             s["test_individuals_seen_in_training"] = len(leaked)
             if leaked:
                 notes.append(f"WARNING: {len(leaked):,} of {len(test_names):,} test individuals were NOT held "
-                             f"out by the model (e.g. {leaked[:3]}), so they were in its training data")
+                             f"out by the model (e.g. {leaked[:3]}), so they were in its training data. "
+                             "Retrain step 4 on the train half only, so the test half stays unseen")
             else:
                 notes.append("no leakage: every test individual was held out during training")
         elif kind.startswith("4b"):
@@ -740,8 +870,12 @@ def write_report(ctx, results, path):
     lines = [f"# Evo 2 validation report", "",
              f"- model: `{ctx.model.path}`",
              f"- graph: `{ctx.graph.dir}`",
-             f"- split: {len(ctx.train_idx):,} train / {len(ctx.test_idx):,} test individuals "
-             f"(test set from {ctx.test_source})",
+             f"- train: {len(ctx.train_idx):,} individuals ({ctx.split_info.get('train_source')})",
+             f"- test: {len(ctx.test_idx):,} individuals ({ctx.split_info.get('test_source')})",
+             f"- graph individuals in neither set: {ctx.split_info.get('graph_individuals_in_neither_set', 0):,}",
+             f"- graph built on: {ctx.split_info.get('graph_built_on', 'unknown')}"
+             + (f" ({ctx.split_info['test_individuals_in_graph_training_set']:,} of them are test individuals)"
+                if ctx.split_info.get("test_individuals_in_graph_training_set") else ""),
              f"- created: {time.strftime('%Y-%m-%d %H:%M')}", ""]
     for r in results:
         params = " ".join(f"{k}={v}" for k, v in r["params"].items())
@@ -769,8 +903,14 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", help="fine-tuned model file from step 4 (.pt)")
     ap.add_argument("--graph-dir", default="haplograph/genome", help="output folder of 1_build_graph.py")
-    ap.add_argument("--test-individuals", help="file with test individuals (default: the model's held-out set)")
-    ap.add_argument("--train-individuals", help="file with train individuals (default: all others)")
+    sg = ap.add_argument_group("train / test split")
+    sg.add_argument("--splits", default=BH26_SPLITS,
+                    help="folder or URL with the split files (default: BH_26 split); 'none' = model's held-out set")
+    sg.add_argument("--train-file", default="half_A.txt", help="train file name inside --splits")
+    sg.add_argument("--test-file", default="half_B.txt", help="test file name inside --splits")
+    sg.add_argument("--train-individuals", help="explicit train file or URL (overrides --splits)")
+    sg.add_argument("--test-individuals", help="explicit test file or URL (overrides --splits)")
+    sg.add_argument("--sample-map", help="CSV: graph individual name, sample ID (if they differ)")
     ap.add_argument("--tasks", help="tasks file, one task per line")
     ap.add_argument("--task", action="append", default=[], help='one task line, e.g. "gwas_enrichment gwas=x.gz"')
     ap.add_argument("--gwas", action="append", default=[], help="shortcut for 'gwas_enrichment gwas=FILE'")
@@ -834,8 +974,7 @@ def main():
 
     with open(os.path.join(args.out_dir, "summary.json"), "w") as f:
         json.dump({"model": args.model, "graph_dir": args.graph_dir,
-                   "test_set": {"source": ctx.test_source, "n_test": int(len(ctx.test_idx)),
-                                "n_train": int(len(ctx.train_idx))},
+                   "split": ctx.split_info,
                    "tasks": results}, f, indent=2, default=lambda o: o.item() if hasattr(o, "item") else str(o))
     write_report(ctx, results, os.path.join(args.out_dir, "report.md"))
     n_fail = sum(r["status"] != "ok" for r in results)

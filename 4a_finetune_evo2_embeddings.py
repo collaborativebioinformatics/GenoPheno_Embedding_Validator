@@ -15,8 +15,11 @@ Step 4a - fine-tune Evo 2 7B on the node embeddings from 3_node_embeddings.py
                           clusters of that chromosome), mirroring Evo 2's next-token pre-training.
     --objective ancestry : predict the individual's super-population from the mean-pooled sequence
                           (needs 2_ancestry_labels.py).
-  - Individuals are split train/validation; validation loss and accuracy are reported before and
-    after training.
+  - Only TRAINING individuals are used: --train-individuals FILE_OR_URL if given, else
+    <graph-dir>/train_individuals.txt (from 1_build_graph.py --train-individuals, e.g. BH_26
+    half_A), else all individuals. They are split train/validation (--val-frac); validation loss
+    and accuracy are reported before and after training. A held-out test set (e.g. half_B) is
+    never seen; step 5 checks this.
 
 INPUT  (in --graph-dir)
   nodes.csv.gz              CSV, N rows: node, id, chrom, region, start, end, support
@@ -25,6 +28,8 @@ INPUT  (in --graph-dir)
   carriers.npz              scipy.sparse CSR uint8 [N, I], node x individual carriers
   node_emb_<method>.npy     float32 [N, dim], row i = node i of nodes.csv.gz
   individual_ancestry.csv   CSV: individual, ancestry (empty = unknown)   (--objective ancestry)
+  train_individuals.txt     (optional) training individuals, one per line (from step 1)
+  node_emb_<method>.json    training set the embeddings were made from (must match)
 
 OUTPUT  <graph-dir>/evo2_<objective>_<method>.pt   (torch.save dict)
   mode ("embeddings"), evo2_model, layer, objective, graph_method, chroms
@@ -34,7 +39,9 @@ OUTPUT  <graph-dir>/evo2_<objective>_<method>.pt   (torch.save dict)
   chrom_emb        state_dict: Embedding(n_chroms, hidden), rows in chromosome order of the graph
   head             state_dict: next -> LayerNorm + Linear(hidden -> dim);
                                ancestry -> LayerNorm + Linear(hidden -> n_classes)
-  val_individuals  held-out individuals;  metrics {before, after};  config
+  val_individuals  individuals held out for validation (from the training set)
+  train_individuals  individuals the model was trained on (read by step 5's leakage check)
+  train_set_id, train_source  the training set used;  metrics {before, after};  config
   To reuse: Evo2(evo2_model), copy trained_blocks into evo.model (load_state_dict(strict=False)),
   rebuild the new layers with the same shapes and load their state_dicts.
 
@@ -52,6 +59,7 @@ NOTE  The official Evo 2 training paths are Savanna and NVIDIA BioNeMo. This scr
       new layers and the unfrozen blocks, stopping with a clear message if they don't.
 """
 import argparse
+import json
 import os
 import re
 import time
@@ -113,6 +121,68 @@ class GenomeData:
     def candidates(self, chrom):
         s, e = self.bounds[chrom]
         return self.order[s:e]
+
+
+def is_url(p):
+    return str(p).startswith(("http://", "https://"))
+
+
+def read_individual_list(src, cache_dir):
+    """Plain text (one ID per line, '#' comments) or CSV with an 'individual' column; file or URL."""
+    if is_url(src):
+        import urllib.request
+        dest = os.path.join(cache_dir, os.path.basename(src.rstrip("/")))
+        if not os.path.exists(dest):
+            log(f"  downloading {src}")
+            urllib.request.urlretrieve(src, dest + ".part")
+            os.replace(dest + ".part", dest)
+        src = dest
+    elif not os.path.exists(src):
+        raise SystemExit(f"file not found: {src}")
+    if src.endswith((".csv", ".csv.gz")):
+        df = pd.read_csv(src, dtype=str)
+        col = "individual" if "individual" in df.columns else df.columns[0]
+        return [x.strip() for x in df[col].dropna()]
+    out = []
+    with open(src) as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if line:
+                out.append(line.split()[0])
+    return out
+
+
+def load_sample_map(path):
+    """CSV with 2 columns (graph individual name, sample ID) -> {sample ID: graph name}."""
+    m = pd.read_csv(path, dtype=str)
+    if m.shape[1] < 2:
+        raise SystemExit(f"{path}: --sample-map needs 2 columns (graph name, sample ID)")
+    return dict(zip(m.iloc[:, 1].str.strip(), m.iloc[:, 0].str.strip()))
+
+
+def train_columns(args, individuals):
+    """Training individuals as column indices into individuals.txt / carriers.npz.
+    Source: --train-individuals if given, else the graph's train_individuals.txt (written by
+    1_build_graph.py --train-individuals), else every individual.
+    Returns (indices, source description, short id of the set)."""
+    import hashlib
+    src = getattr(args, "train_individuals", None)
+    if not src and os.path.exists(os.path.join(args.graph_dir, "train_individuals.txt")):
+        src = os.path.join(args.graph_dir, "train_individuals.txt")
+    if not src:
+        return np.arange(len(individuals)), "all individuals", "all"
+    raw = read_individual_list(src, args.graph_dir)
+    to_graph = load_sample_map(args.sample_map) if getattr(args, "sample_map", None) else {}
+    names = {to_graph.get(x, x) for x in raw}
+    pos = {x: i for i, x in enumerate(individuals)}
+    idx = np.array(sorted(pos[x] for x in names if x in pos), dtype=np.int64)
+    if len(idx) == 0:
+        raise SystemExit(f"none of the training individuals in {src} (e.g. {sorted(names)[:2]}) match the "
+                         f"graph's individuals (e.g. {individuals[:2]}); pass --sample-map")
+    if len(idx) < len(names):
+        log(f"  warning: {len(names) - len(idx):,} training IDs from {src} are not in the graph, ignored")
+    set_id = hashlib.sha1("\n".join(sorted(individuals[i] for i in idx)).encode()).hexdigest()[:8]
+    return idx, src, set_id
 
 
 def load_individual_ancestry(args, individuals):
@@ -321,6 +391,16 @@ def train_embeddings(args):
     data = GenomeData(args)
     individuals = open(gfile(args, "individuals.txt")).read().split("\n")
     n_ind = len(individuals)
+    train_cols, train_src, train_id = train_columns(args, individuals)
+    in_train = np.zeros(n_ind, bool)
+    in_train[train_cols] = True
+    emb_info = gfile(args, f"node_emb_{args.method}.json")
+    if os.path.exists(emb_info):
+        emb_id = json.load(open(emb_info)).get("train_set_id", "all")
+        if emb_id != train_id:
+            raise SystemExit(f"node_emb_{args.method}.npy was made from another training set ({emb_id}) than "
+                             f"this run uses ({train_id}, {train_src}); rerun 3_node_embeddings.py with the "
+                             "same --train-individuals")
 
     y_ind, classes = None, None
     if args.objective == "ancestry":
@@ -329,9 +409,9 @@ def train_embeddings(args):
         classes = np.array(sorted(set(anc[known])))
         y_ind = np.full(n_ind, -1)
         y_ind[known] = np.searchsorted(classes, anc[known])
-        pool = np.where(known)[0]
+        pool = np.where(known & in_train)[0]
     else:
-        pool = np.arange(n_ind)
+        pool = train_cols
 
     perm = rng.permutation(pool)
     n_val = max(1, int(args.val_frac * len(perm)))
@@ -341,7 +421,8 @@ def train_embeddings(args):
     if len(val_ex) > args.val_examples:
         val_ex = [val_ex[j] for j in rng.choice(len(val_ex), args.val_examples, replace=False)]
     log(f"[evo2] embeddings={args.method}, objective={args.objective}, {len(data.chroms)} chromosome(s), "
-        f"{len(tr_inds):,} train / {len(val_inds):,} val individuals, {len(train_ex):,} training sequences")
+        f"{len(tr_inds):,} train / {len(val_inds):,} val individuals (both from the training set: {train_src}), "
+        f"{len(train_ex):,} training sequences")
 
     rnr = Evo2Runner(args)
     dev, dim = rnr.dev, data.Z.shape[1]
@@ -396,6 +477,8 @@ def train_embeddings(args):
         "trained_blocks": {n: p.detach().cpu() for n, p in rnr.trainable},
         "proj_in": proj_in.state_dict(), "chrom_emb": chrom_emb.state_dict(), "head": head.state_dict(),
         "val_individuals": [individuals[i] for i in val_inds],
+        "train_individuals": [individuals[i] for i in tr_inds],
+        "train_set_id": train_id, "train_source": train_src,
         "metrics": {"before": before, "after": after}, "config": config_of(args),
     }, out)
     log(f"  saved to {out}")
@@ -409,6 +492,9 @@ def main():
                     help="which node embeddings from 3_node_embeddings.py to use")
     ap.add_argument("--graph-dir", default="haplograph/genome", help="output folder of 1_build_graph.py")
     ap.add_argument("--chroms", help="train on these chromosomes of the graph only (default: all)")
+    ap.add_argument("--train-individuals",
+                    help="file or URL of training individuals (default: <graph-dir>/train_individuals.txt, else all)")
+    ap.add_argument("--sample-map", help="CSV: graph individual name, sample ID (if they differ)")
     ap.add_argument("--objective", choices=["next", "ancestry"], default="next")
     ap.add_argument("--max-len", type=int, default=1024, help="max clusters per training sequence")
     ap.add_argument("--temperature", type=float, default=0.1)

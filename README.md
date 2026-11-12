@@ -1,111 +1,99 @@
 # Haplograph → Evo 2
 
-Genome Cluster Engine Project
-
-Established and optimized the haploblocks method for discretizing genomic data (https://osf.io/xhkc3)
-Generated binary strings from haploblock clusters and did some basic linear modeling. Leveraged XGBoost and deep learning. Results were promising but not conclusive.
-Processed the 1000 genomes data set with the haploblocks method (paper submitted)
-Established and optimized the haplographs method (manuscript in preparation)
-
-Here’s what we are currently working on.
-
-Establishing what use cases respond better to a simpler clustering method (linclust)
-Establishing what use cases respond best to:
-Associated binary strings of haploblocks going straight into a DNA foundation model
-Using XGBoost to come up with cogent groups of haploblocks during analysis
-Building a haplograph and using node2vec to process the phenotype-genotype relationships
-Building a haplograph and using a GNN (PyTorch) to isolate subnetworks and create contextualized vectors
-Using XGBoost to come up with cogent groups of haploblocks during analysis of haplograph data
-Testing all of the above conditions in both cancer and germline disease
-Testing in what conditions early fusion or late fusion of proteomics data with genomic data and phenotype but is more effective
-
-
-## Testing pertubations of the Haplograph --> Evo2 genomic model to see what works best in particular settings.  
-
-As a POC, builds a haploblock co-occurrence graph per chromosome from the [1000 Genomes haplograph](https://data.haploblocks.org/haplograph/1000G/), turns its nodes into embeddings with a GNN or XGBoost, and fine-tunes Evo 2 (7B) on those embeddings
-
-For more see: [haploblocks.org](haploblocks.org)
+Builds a genome-wide (or per-chromosome-selection) haploblock co-occurrence graph from the [1000 Genomes haplograph](https://data.haploblocks.org/haplograph/1000G/), turns its nodes into embeddings with node2vec, a GNN or XGBoost, fine-tunes Evo 2 (7B) on those embeddings using a training half of the individuals, and validates the fine-tuned model on the held-out half.
 
 ## Dependencies
 
 - Python 3.11 or 3.12, Linux, NVIDIA GPU with CUDA 12.1+ (80 GB recommended for step 4)
 - numpy, pandas, scipy (all steps)
-- torch (node2vec and GNN embeddings, Evo 2)
+- torch (node2vec and GNN embeddings, Evo 2, reading models in step 5)
 - xgboost (XGBoost embeddings)
 - evo2 + flash-attn (step 4)
 
-## Install on Nvidia Brev
-
-`install_evo2.sh` sets up everything on an RTX PRO 6000 Blackwell or an L40S instance: the CUDA 12.8 toolkit, a Python 3.12 virtual environment at ~/evo2-env, PyTorch 2.7.1, flash-attn 2.8.0.post2, the Evo 2 light install (7B models, no Transformer Engine) and the other packages, then runs a test generation. It detects the GPU automatically; the only difference is that on the RTX PRO 6000 (sm_120) flash-attn is always compiled from source, which takes 20–40 minutes, while on the L40S (sm_89) a prebuilt wheel is usually used and the install finishes in a few minutes. The RTX PRO 6000's 96 GB is recommended for fine-tuning in step 4, since the L40S's 48 GB limits sequence length and how many blocks can be unfrozen. If the build gets killed for lack of RAM, lower MAX_JOBS.
+## Install
 
 ```bash
-bash install_evo2.sh          # auto-detect GPU (or: bash install_evo2.sh rtx / l40s)
-source ~/evo2-env/bin/activate
+pip install numpy pandas scipy torch xgboost
+pip install flash-attn==2.8.0.post2 --no-build-isolation
+pip install evo2
 ```
 
 ## Usage
 
-Run the scripts in order. Step 1 writes the graph to `haplograph/genome/`; steps 2–4 read and write there (change with `--graph-dir`).
+The pipeline uses the [BH_26 train/test split](https://data.haploblocks.org/BH_26/splits/). `half_A.txt` (1,252 individuals) is the train set, used by steps 1–4. `half_B.txt` (1,251 individuals) is the test set, which only step 5 uses. Both are plain text, one 1000 Genomes sample ID per line.
+
+Pass the train half once, to step 1. It builds the graph from those individuals only and writes `train_individuals.txt` into the graph folder, and steps 2–4a then use it automatically:
 
 ```bash
-python3 1_build_graph.py                            # whole genome (or --chroms chr21,chr22)
-python3 2_ancestry_labels.py                        # needed for xgboost or --objective ancestry
-python3 3_node_embeddings.py --method node2vec      # or gnn / xgboost
-python 4a_finetune_evo2_embeddings.py --method node2vec   # --objective next (default) or ancestry
+SPLITS=https://data.haploblocks.org/BH_26/splits
+G=haplograph/genome_train_half_A
+
+python 1_build_graph.py --train-individuals $SPLITS/half_A.txt      # whole genome (or --chroms chr21,chr22)
+python 2_ancestry_labels.py --graph-dir $G                           # needed for xgboost or --objective ancestry
+python 3_node_embeddings.py --method node2vec --graph-dir $G         # or gnn / xgboost
+python 4a_finetune_evo2_embeddings.py --method node2vec --graph-dir $G
+python 5_validate_evo2.py --model $G/evo2_next_node2vec.pt --graph-dir $G --tasks validation_tasks.txt
 ```
 
-Add `--chroms chr21,chr22` to any step for a quick test run, and `--help` to see all options.
+What each step takes from the train half:
+- **Step 1:** the edge weights, cluster support and lift come from training individuals only. The carrier matrix still holds everyone, because step 5 needs the test individuals' clusters.
+- **Step 2:** node ancestry labels.
+- **Step 3:** the carrier features for GNN and XGBoost.
+- **Step 4a:** trains and validates within the train half only. The checkpoint records which individuals it trained on.
 
-### Step 4a with NVIDIA BioNeMo (experimental)
+Each step checks that it uses the same training set as the step before and stops if not. Every script also accepts `--train-individuals` to override the graph's file. Leaving it out of step 1 builds the graph from all individuals, as before.
 
-`4a_finetune_evo2_embeddings_bionemo.py` does the same fine-tuning as step 4a, but loads and runs Evo 2 through NVIDIA BioNeMo (NeMo 2 / Megatron Core) instead of the evo2 package. It has not been tested on a GPU yet and may need adjusting for your BioNeMo version (the affected parts are marked VERSION-SENSITIVE in the code).
+If the graph names individuals differently from the sample IDs (e.g. `IND1, IND2…`), add `--sample-map map.csv` (two columns: graph name, sample ID) to the step that reads the split file.
 
-It runs inside the BioNeMo Framework container (nvcr.io/nvidia/clara/bionemo-framework) and needs an Evo 2 checkpoint in NeMo2 format:
+For a quick test, add `--chroms chr21,chr22` to step 1 and use `G=haplograph/chr21_chr22_train_half_A`. Each script's header describes its input and output file formats, and `--help` lists all options.
+
+### Optional, experimental: step 4a with NVIDIA BioNeMo
+
+`4a_finetune_evo2_embeddings_bionemo.py` does the same fine-tuning as step 4a, but loads and runs Evo 2 through [NVIDIA BioNeMo](https://docs.nvidia.com/bionemo-framework/latest/models/evo2/) (NeMo 2 / Megatron Core) instead of the `evo2` package. It uses the training set the same way. It has not been tested on a GPU yet and may need adjusting for your BioNeMo version (the affected parts are marked `VERSION-SENSITIVE` in the code).
+
+It runs inside the BioNeMo Framework container (`nvcr.io/nvidia/clara/bionemo-framework`) and needs an Evo 2 checkpoint in NeMo2 format:
 
 ```bash
 evo2_convert_to_nemo2 --model-path hf://arcinstitute/savanna_evo2_7b_base --model-size 7b --output-dir nemo2_evo2_7b_8k
-python 4a_finetune_evo2_embeddings_bionemo.py --method gnn --ckpt-dir nemo2_evo2_7b_8k
+python 4a_finetune_evo2_embeddings_bionemo.py --method gnn --graph-dir $G --ckpt-dir nemo2_evo2_7b_8k
 ```
 
-To fine-tune on hash-phenotype associations instead, use step 4b on its own (no steps 1–3 needed). Its input is a TSV with two columns, a genomic hash (0/1 string) and a phenotype (e.g. height).
+### Hash-phenotype fine-tuning
+
+To fine-tune on hash-phenotype associations instead, use step 4b on its own (no steps 1–3 needed). Its input is a TSV with two columns, a genomic hash (0/1 string) and a phenotype (e.g. height). Use a TSV built from the train half only, so the test half stays unseen.
 
 ```bash
 python 4b_finetune_evo2_hash.py --hash-pheno hash_height.tsv   # numeric -> regression, labels -> classification
 ```
 
-### Example test run
+## Step 5: validation
 
-This runs the full pipeline as a quick test on chr 21. The first command builds the haploblock co-occurrence graph for chr21 and writes it to `haplograph/chr21/`, and the second assigns 1000 Genomes ancestry labels to that graph. The third turns the graph nodes into embeddings with node2vec. The fourth fine-tunes Evo2 for one epoch to predict ancestry from those embeddings, with `--train-blocks 0` keeping all Evo2 blocks frozen so only the added layers are trained.
-
-```bash
-python3 1_build_graph.py --chroms chr21
-python3 2_ancestry_labels.py --graph-dir haplograph/chr21/
-python3 3_node_embeddings.py --method node2vec --graph-dir haplograph/chr21/
-python3 4_finetune_evo2.py   --method node2vec --graph-dir haplograph/chr21/ --objective ancestry --train-blocks 0 --epochs 1
-```
-
-### Validation
-
-`5_validate_evo2.py` checks one fine-tuned model (a .pt file) against a test set. The test set is a text file with one individual per line (--test-individuals). By default it is the set the model held out during training, and the train set is every other individual in the graph.
+`5_validate_evo2.py` checks one fine-tuned model (any `.pt` from step 4) against the test set. By default it reads `half_A.txt` (train) and `half_B.txt` (test) from the BH_26 split, downloading them automatically. Or download them once and pass the folder:
 
 ```bash
-python 5_validate_evo2.py --model haplograph/genome/evo2_next_gnn.pt --tasks validation_tasks.txt
-python 5_validate_evo2.py --model evo2_next_gnn.pt --test-individuals test.txt --gwas height_hg38.tsv
+wget -r -np -nH --cut-dirs=2 -R "index.html*" https://data.haploblocks.org/BH_26/splits/
+python 5_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --splits splits/ --gwas height_hg38.tsv
 ```
 
-The checks to run are listed in a tasks file (`validation_tasks.txt` is an example), one per line with key=value parameters. Add a line to run a check again with other settings. `--list-tasks` shows every task and its parameters.
+It also checks for leakage at two levels:
+- It warns if any test individual is in the graph's training set (step 1).
+- It warns if any test individual is in the model's training set (step 4a).
 
-- model_info: what the model is, its stored metrics, and whether any test individual was in its training data
-- cluster_consistency: per haploblock, whether train and test individuals carry the same clusters, with the same frequencies, compared against random splits of the same size
-- gwas_enrichment: which haploblocks contain more GWAS hits than expected, plus an overall test
+Graph individuals in neither half are left out and counted in the report. Other split files can be given with `--train-individuals` / `--test-individuals`, and `--splits none` uses the model's own held-out individuals instead.
 
-New kinds of checks go in a Python file loaded with `--plugins` my_checks.py; the script's header shows a short example. Results are written to report.md, summary.json and one CSV per task in `<graph-dir>/validation_<model>/`.
+The checks to run are listed in a tasks file (`validation_tasks.txt` is an example), one per line with `key=value` parameters. Add a line to run a check again with other settings. `--list-tasks` shows every task and its parameters.
 
-#### Getting GWAS data
+- `model_info`: what the model is, its stored metrics, and whether any test individual was in its training data
+- `cluster_consistency`: per haploblock, whether train and test individuals carry the same clusters, with the same frequencies, compared against random splits of the same size
+- `gwas_enrichment`: which haploblocks contain more GWAS hits than expected, plus an overall test
 
-gwas_enrichment reads any text file with chromosome, position and p-value columns, and recognises the GIANT and GWAS Catalog column names automatically. The positions must use the same genome build as the haploblock regions.
+New kinds of checks go in a Python file loaded with `--plugins my_checks.py`; the script's header shows a short example. Results are written to `report.md`, `summary.json` and one CSV per task in `<graph-dir>/validation_<model>/`.
 
-GIANT height (Yengo et al. 2022). Download a summary statistics file, e.g. Yengo.2022.height.GWAS.ALL (all ancestries) or .EUR, from the GIANT consortium data files page. The columns are SNPID RSID CHR POS EFFECT_ALLELE OTHER_ALLELE EFFECT_ALLELE_FREQ BETA SE P N, with positions in hg19/GRCh37. The file can be used directly if the haploblocks are hg19. For GRCh38, lift the positions over first, e.g. with CrossMap and the UCSC hg19ToHg38.over.chain.gz chain file:
+### Getting GWAS data
+
+`gwas_enrichment` reads any text file with chromosome, position and p-value columns, and recognises the GIANT and GWAS Catalog column names automatically. **The positions must use the same genome build as the haploblock regions.** The haplograph README doesn't state its build, so check it before running.
+
+**GIANT height (Yengo et al. 2022).** Download a summary statistics file, e.g. `Yengo.2022.height.GWAS.ALL` (all ancestries) or `.EUR`, from the [GIANT consortium data files page](https://giant-consortium.web.broadinstitute.org/GIANT_consortium_data_files). The columns are `SNPID RSID CHR POS EFFECT_ALLELE OTHER_ALLELE EFFECT_ALLELE_FREQ BETA SE P N`, with positions in **hg19/GRCh37**. The file can be used directly if the haploblocks are hg19. For GRCh38, lift the positions over first, e.g. with [CrossMap](https://crossmap.sourceforge.net/) and the UCSC `hg19ToHg38.over.chain.gz` chain file:
 
 ```bash
 zcat Yengo.2022.height.GWAS.ALL.gz | awk 'NR>1 {OFS="\t"; print "chr"$3, $4-1, $4, $2, $10}' > height_hg19.bed
@@ -113,7 +101,7 @@ CrossMap bed hg19ToHg38.over.chain.gz height_hg19.bed height_hg38.bed
 (printf "CHR\tPOS\tRSID\tP\n"; awk 'BEGIN{OFS="\t"} {print $1, $3, $4, $5}' height_hg38.bed) > height_hg38.tsv
 ```
 
-GWAS Catalog (any trait). Download all associations from the GWAS Catalog downloads page, e.g. gwas-catalog-associations_ontology-annotated-full.zip. It contains only reported hits, in GRCh38 coordinates (columns CHR_ID, CHR_POS, SNPS, P-VALUE), so the per-region test then uses region length as the background. Keep one trait:
+**GWAS Catalog (any trait).** Download all associations from the [GWAS Catalog downloads page](https://www.ebi.ac.uk/gwas/docs/file-downloads), e.g. `gwas-catalog-associations_ontology-annotated-full.zip`. It contains only reported hits, in GRCh38 coordinates (columns `CHR_ID`, `CHR_POS`, `SNPS`, `P-VALUE`), so the per-region test then uses region length as the background. Keep one trait:
 
 ```python
 import pandas as pd
