@@ -1,0 +1,353 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>ProteoOnset</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script>
+  tailwind.config = { theme: { extend: {
+    colors: { bg: 'var(--bg)', surface: 'var(--surface)', tint: 'var(--tint)', line: 'var(--line)', fg: 'var(--fg)', muted: 'var(--muted)', accent: 'var(--accent)', 'accent-soft': 'var(--accent-soft)' },
+    fontFamily: { display: ['"Instrument Sans"', 'Inter', 'system-ui', 'sans-serif'], sans: ['Inter', 'system-ui', 'sans-serif'], mono: ['"JetBrains Mono"', 'ui-monospace', 'Menlo', 'monospace'] }
+  } } };
+</script>
+<style>
+  /* Layout: disease rail on the left; three cards side by side — risk | treatments | protein drivers */
+  :root {
+    --bg: #f4f8fb; --surface: #ffffff; --tint: #eaf4fa; --line: #d8e3eb;
+    --fg: #0f1f2c; --muted: #5b6d7c; --accent: #0b7285; --accent-soft: #dff1f6;
+    --ok: #2f855a; --ok-soft: #e3f4ea; --warn: #b7791f; --warn-soft: #fbf0db; --crit: #c53b5a; --crit-soft: #fbe6ec; --grid: #e6edf2;
+  }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+    --bg: #0b141b; --surface: #101c25; --tint: #13242f; --line: #22343f; --fg: #e2ecf2; --muted: #8fa3b2; --accent: #3cc3d9; --accent-soft: #10303a;
+    --ok: #5fd08f; --ok-soft: #12301f; --warn: #f2c25b; --warn-soft: #33270f; --crit: #f57f9a; --crit-soft: #3a1621; --grid: #1b2a34; color-scheme: dark; } }
+  :root[data-theme="dark"] {
+    --bg: #0b141b; --surface: #101c25; --tint: #13242f; --line: #22343f; --fg: #e2ecf2; --muted: #8fa3b2; --accent: #3cc3d9; --accent-soft: #10303a;
+    --ok: #5fd08f; --ok-soft: #12301f; --warn: #f2c25b; --warn-soft: #33270f; --crit: #f57f9a; --crit-soft: #3a1621; --grid: #1b2a34; color-scheme: dark; }
+  body { background: var(--bg); color: var(--fg); font-family: Inter, system-ui, sans-serif; font-size: 14px; line-height: 1.5; }
+  .wrap { padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+  h1, h2 { font-family: "Instrument Sans", Inter, sans-serif; text-wrap: balance; }
+  .num { font-variant-numeric: tabular-nums; }
+  .eyebrow { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; border-radius: 999px; padding: 2px 10px; white-space: nowrap; }
+  .t-low { color: var(--ok); background: var(--ok-soft); } .t-mid { color: var(--warn); background: var(--warn-soft); } .t-high { color: var(--crit); background: var(--crit-soft); }
+  .link { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; text-decoration-thickness: 1px; }
+  .mock-stripe { background: repeating-linear-gradient(135deg, var(--tint) 0 10px, transparent 10px 20px); }
+  button:focus-visible, select:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  svg text { font-family: "JetBrains Mono", ui-monospace, monospace; }
+</style>
+
+<div id="root"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useMemo } = React;
+
+/* ---------------- MOCK DATA (synthetic, hand-written, not fetched) ----------------
+   major: shown as tiles in the left rail; all others only in the dropdown
+   pop  : baseline 10-y risk in the reference population
+   cidx : mock held-out C-index of the per-disease model
+   ciw  : relative half-width of the 95% CI
+   tx   : [type, drug, target, linked proteins]  A = approved, T = trial, R = repurposing */
+const CONDITIONS = {
+  cad: { name: 'Coronary artery disease', major: true, pop: .06, cidx: .81, ciw: .28,
+    proteins: [['NT-proBNP', .9], ['GDF15', .8], ['MMP12', .6], ['PCSK9', .55], ['Lp(a)', .5], ['IL-6', .45], ['APOM', -.4]],
+    tx: [['A', 'Atorvastatin', 'HMGCR', ['PCSK9']], ['A', 'Evolocumab', 'PCSK9', ['PCSK9']], ['T', 'Ziltivekimab', 'IL6', ['IL-6']], ['T', 'Pelacarsen', 'LPA', ['Lp(a)']], ['R', 'Canakinumab', 'IL1B', ['IL-6']]] },
+  t2d: { name: 'Type 2 diabetes', major: true, pop: .08, cidx: .84, ciw: .22,
+    proteins: [['Leptin', .85], ['FABP4', .7], ['FGF21', .5], ['IL-1RA', .45], ['SHBG', -.5], ['IGFBP2', -.6]],
+    tx: [['A', 'Metformin', 'AMPK', ['FGF21']], ['A', 'Semaglutide', 'GLP1R', ['Leptin', 'FABP4']], ['T', 'Tirzepatide', 'GIPR / GLP1R', ['Leptin', 'FABP4']], ['R', 'Anakinra', 'IL1R1', ['IL-1RA']]] },
+  ad: { name: "Alzheimer's disease", major: true, pop: .05, cidx: .86, ciw: .25,
+    proteins: [['p-tau217', 1.0], ['NfL', .65], ['GFAP', .6], ['YKL-40', .35], ['Aβ42/40', -.7], ['NPTX2', -.45]],
+    tx: [['A', 'Lecanemab', 'APP', ['Aβ42/40', 'p-tau217']], ['A', 'Donanemab', 'APP', ['Aβ42/40', 'p-tau217']], ['T', 'Lecanemab (preclinical AD)', 'APP', ['p-tau217']], ['R', 'Semaglutide', 'GLP1R', ['GFAP', 'YKL-40']]] },
+  ckd: { name: 'Chronic kidney disease', major: true, pop: .07, cidx: .79, ciw: .30,
+    proteins: [['KIM-1', .85], ['TNFR1', .75], ['TNFR2', .6], ['Cystatin C', .6], ['EGF', -.55], ['Uromodulin', -.4]],
+    tx: [['A', 'Dapagliflozin', 'SLC5A2', ['KIM-1', 'Cystatin C']], ['A', 'Finerenone', 'NR3C2', ['TNFR1', 'TNFR2']], ['T', 'Baricitinib', 'JAK1/2', ['TNFR1']], ['R', 'Pentoxifylline', 'PDE / TNF', ['TNFR1', 'TNFR2']]] },
+  hf: { name: 'Heart failure', pop: .05, cidx: .83, ciw: .26,
+    proteins: [['NT-proBNP', .95], ['GDF15', .7], ['ST2', .5], ['Galectin-3', .4], ['IGFBP7', .35]],
+    tx: [['A', 'Dapagliflozin', 'SLC5A2', ['NT-proBNP']], ['A', 'Sacubitril/valsartan', 'MME / AGTR1', ['NT-proBNP']]] },
+  af: { name: 'Atrial fibrillation', pop: .06, cidx: .77, ciw: .32,
+    proteins: [['NT-proBNP', .8], ['BMP10', .6], ['ANGPT2', .5], ['IGFBP7', .4]],
+    tx: [['A', 'Apixaban', 'F10', []]] },
+  stroke: { name: 'Ischaemic stroke', pop: .04, cidx: .72, ciw: .38,
+    proteins: [['NT-proBNP', .6], ['GDF15', .5], ['MMP12', .45], ['IL-6', .4]],
+    tx: [['A', 'Atorvastatin', 'HMGCR', []], ['R', 'Colchicine', 'Tubulin', ['IL-6']]] },
+  copd: { name: 'COPD', pop: .04, cidx: .75, ciw: .34,
+    proteins: [['SFTPD', .6], ['IL-6', .3], ['sRAGE', -.5], ['CC16', -.6]],
+    tx: [['T', 'Dupilumab', 'IL4R', []]] },
+  masld: { name: 'MASLD / liver fibrosis', pop: .05, cidx: .80, ciw: .29,
+    proteins: [['ADAMTSL2', .7], ['FGF21', .5], ['IGFBP7', .45], ['Leptin', .3]],
+    tx: [['A', 'Resmetirom', 'THRB', []], ['T', 'Semaglutide', 'GLP1R', ['Leptin']]] },
+  pd: { name: "Parkinson's disease", pop: .02, cidx: .74, ciw: .40,
+    proteins: [['DDC', .7], ['NfL', .6], ['GDF15', .3]],
+    tx: [['T', 'Prasinezumab', 'SNCA', []]] },
+  ra: { name: 'Rheumatoid arthritis', pop: .02, cidx: .73, ciw: .40,
+    proteins: [['CXCL13', .6], ['MMP3', .5], ['IL-6', .5]],
+    tx: [['A', 'Methotrexate', 'DHFR', []], ['A', 'Tocilizumab', 'IL6R', ['IL-6']]] },
+  osteo: { name: 'Osteoporosis', pop: .06, cidx: .76, ciw: .31,
+    proteins: [['SOST', .5], ['CTSK', .4], ['OPG', .4]],
+    tx: [['A', 'Alendronate', 'FDPS', []], ['A', 'Denosumab', 'TNFSF11', ['OPG']]] },
+  crc: { name: 'Colorectal cancer', pop: .02, cidx: .70, ciw: .45,
+    proteins: [['CEACAM5', .7], ['GDF15', .4], ['TFF3', .4]], tx: [] },
+  lungca: { name: 'Lung cancer', pop: .015, cidx: .78, ciw: .42,
+    proteins: [['CEACAM5', .6], ['WFDC2', .6], ['CXCL17', .5]], tx: [] }
+};
+const KEYS = Object.keys(CONDITIONS);
+const MAJOR = KEYS.filter(k => CONDITIONS[k].major);
+
+const PATIENTS = [
+  { id: 'SYN-0142', sex: 'F', age: 58, risk: { cad: .14, t2d: .31, ad: .06, ckd: .09 } },
+  { id: 'SYN-0377', sex: 'M', age: 64, risk: { cad: .27, t2d: .12, ad: .11, ckd: .18 } },
+  { id: 'SYN-0519', sex: 'F', age: 71, risk: { cad: .09, t2d: .07, ad: .24, ckd: .13 } },
+  { id: 'SYN-0804', sex: 'M', age: 49, risk: { cad: .19, t2d: .42, ad: .02, ckd: .05 } }
+];
+
+const TX_TYPE = { A: 'Approved', T: 'Clinical trial', R: 'Repurposing' };
+
+/* ---------------- helpers ---------------- */
+function seeded(s) {
+  let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return () => { h += 0x6D2B79F5; let t = h; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+// hand-set risk for major diseases; seeded mock for the rest
+function riskOf(p, k) {
+  if (p.risk[k] != null) return p.risk[k];
+  const rnd = seeded(p.id + k), c = CONDITIONS[k];
+  return Math.min(.6, c.pop * Math.exp((rnd() + rnd() - 1) * 1.6));
+}
+const pct = (v, d = 0) => (v * 100).toFixed(d) + '%';
+const tier = r => r < .10 ? ['t-low', 'Low'] : r < .20 ? ['t-mid', 'Elevated'] : ['t-high', 'High'];
+const oddsRatio = (r, pop) => (r / (1 - r)) / (pop / (1 - pop));
+const percentile = (r, pop) => Math.min(99, Math.max(1, Math.round(100 * (1 - Math.exp(-.75 * r / pop)))));
+const confidence = c => c >= .80 ? ['t-low', 'High'] : c >= .74 ? ['t-mid', 'Moderate'] : ['t-high', 'Low'];
+
+function drivers(p, k) {
+  const c = CONDITIONS[k], rnd = seeded(p.id + k), lift = Math.log(riskOf(p, k) / c.pop);
+  return c.proteins.map(([name, w]) => {
+    const flip = lift < 0 && rnd() < .5 ? -1 : 1;
+    return { name, v: w * (.55 + rnd() * .9) * (.4 + Math.max(lift, -.6) * .5) * flip };
+  }).sort((a, b) => Math.abs(b.v) - Math.abs(a.v));
+}
+
+function useWidth(ref) {
+  const [w, setW] = useState(340);
+  useEffect(() => {
+    const ro = new ResizeObserver(e => setW(Math.max(240, e[0].contentRect.width)));
+    ro.observe(ref.current); return () => ro.disconnect();
+  }, []);
+  return w;
+}
+
+/* ---------------- cards ---------------- */
+function Card({ eyebrow, title, aside, children }) {
+  return (
+    <section className="card p-4 min-w-0 flex flex-col">
+      <header className="flex items-start justify-between gap-2 mb-3">
+        <div className="min-w-0"><div className="eyebrow">{eyebrow}</div><h2 className="text-[16px] font-semibold leading-snug">{title}</h2></div>
+        {aside}
+      </header>
+      {children}
+    </section>
+  );
+}
+
+function RiskCard({ p, k }) {
+  const c = CONDITIONS[k], r = riskOf(p, k);
+  const lo = r * (1 - c.ciw), hi = Math.min(.95, r * (1 + c.ciw * 1.3));
+  const [tc, tl] = tier(r), [cc, cl] = confidence(c.cidx);
+  const or = oddsRatio(r, c.pop);
+  // 95% CI strip on a 0–50% scale
+  const s = v => `${Math.min(100, v / .5 * 100)}%`;
+  return (
+    <Card eyebrow="10-year risk" title={c.name} aside={<span className={`pill ${tc}`}>{tl}</span>}>
+      <div className="font-mono num text-[40px] font-medium leading-none">{pct(r, 1)}</div>
+      <div className="mt-4">
+        <div className="relative h-2.5 rounded-full bg-tint">
+          <span className="absolute inset-y-0 rounded-full" style={{ left: s(lo), width: `calc(${s(hi)} - ${s(lo)})`, background: 'var(--accent)', opacity: .3 }}></span>
+          <span className="absolute -top-1 w-[3px] h-[18px] rounded" style={{ left: `calc(${s(r)} - 1px)`, background: 'var(--accent)' }}></span>
+          <span className="absolute -top-1 w-px h-[18px]" style={{ left: s(c.pop), background: 'var(--muted)' }} title="Population baseline"></span>
+        </div>
+        <div className="flex justify-between text-[10px] text-muted font-mono mt-1"><span>0%</span><span>25%</span><span>50%</span></div>
+        <div className="text-[11px] text-muted mt-1">Shaded band: 95% CI · thin mark: population baseline</div>
+      </div>
+      <dl className="mt-4 flex flex-col text-[13px]">
+        {[
+          ['95% confidence interval', `${pct(lo, 1)} – ${pct(hi, 1)}`],
+          ['Odds ratio vs. population', `${or.toFixed(2)}`, `baseline ${pct(c.pop, 1)}`],
+          ['Cohort percentile', `${percentile(r, c.pop)}th`]
+        ].map(([a, b, sub]) =>
+          <div key={a} className="flex justify-between gap-3 border-b border-line py-2">
+            <dt className="text-muted">{a}{sub && <span className="block text-[11px]">{sub}</span>}</dt>
+            <dd className="font-mono num text-right">{b}</dd>
+          </div>)}
+        <div className="flex justify-between items-center gap-3 py-2">
+          <dt className="text-muted">Model confidence<span className="block text-[11px]">C-index on held-out data</span></dt>
+          <dd className="text-right flex items-center gap-2"><span className="font-mono num">{c.cidx.toFixed(2)}</span><span className={`pill ${cc}`}>{cl}</span></dd>
+        </div>
+      </dl>
+    </Card>
+  );
+}
+
+function TreatmentCard({ k, prot, setProt }) {
+  const c = CONDITIONS[k];
+  const tx = prot ? c.tx.filter(t => t[3].includes(prot)) : c.tx;
+  const link = (t, drug) => t === 'T'
+    ? `https://clinicaltrials.gov/search?cond=${encodeURIComponent(c.name)}&intr=${encodeURIComponent(drug.split(' ')[0])}`
+    : `https://drugcentral.org/?q=${encodeURIComponent(drug.split(/[ /]/)[0])}`;
+  return (
+    <Card eyebrow="Proposed pharmaceuticals" title="Treatment options"
+      aside={prot && <button className="text-xs link shrink-0" onClick={() => setProt(null)}>Clear filter</button>}>
+      {prot && <p className="text-xs text-muted -mt-1 mb-2">Linked to <span className="font-mono text-accent">{prot}</span></p>}
+      {tx.length === 0
+        ? <p className="text-[13px] text-muted rounded-xl border border-dashed border-line p-3">{prot ? `No treatment linked to ${prot}.` : 'No drug, trial or repurposing candidate linked for this disease.'}</p>
+        : <ul className="flex flex-col gap-2">
+            {tx.map(([t, drug, target, hits]) =>
+              <li key={t + drug} className="rounded-xl border border-line p-3">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="font-semibold text-[13px]">{drug}</div>
+                    <div className="font-mono text-[11px] text-muted">{target}</div>
+                  </div>
+                  <span className={`pill ${t === 'A' ? 't-low' : 'bg-tint text-muted'}`}>{TX_TYPE[t]}</span>
+                </div>
+                <div className="flex items-center justify-between gap-2 mt-2">
+                  <div className="flex flex-wrap gap-1">
+                    {hits.length ? hits.map(h =>
+                      <button key={h} onClick={() => setProt(prot === h ? null : h)}
+                        className={`font-mono text-[11px] px-1.5 rounded border ${prot === h ? 'border-accent text-accent bg-accent-soft' : 'border-line text-muted hover:text-fg'}`}>{h}</button>)
+                      : <span className="text-[11px] text-muted">No linked driver</span>}
+                  </div>
+                  <a className="link text-xs shrink-0" href={link(t, drug)} target="_blank" rel="noopener">{t === 'T' ? 'Trials ↗' : 'DrugCentral ↗'}</a>
+                </div>
+              </li>)}
+          </ul>}
+    </Card>
+  );
+}
+
+function DriversCard({ p, k, prot, setProt }) {
+  const ref = useRef(null), w = useWidth(ref);
+  const list = useMemo(() => drivers(p, k), [p.id, k]);
+  const linked = new Set(CONDITIONS[k].tx.flatMap(t => t[3]));
+  const rowH = 26, m = { t: 6, r: 12, b: 44, l: 92 };
+  const H = m.t + list.length * rowH + m.b;
+  const ext = d3.max(list, d => Math.abs(d.v)) * 1.1;
+  const x = d3.scaleLinear().domain([-ext, ext]).range([m.l, w - m.r]).nice();
+  const ticks = x.ticks(5);
+  const y0 = m.t, yEnd = m.t + list.length * rowH;
+  return (
+    <Card eyebrow="Why this score" title="Protein drivers"
+      aside={<span className="text-[11px] text-muted inline-flex items-center gap-1.5 shrink-0"><span className="inline-block w-2 h-2 rounded-full bg-accent"></span>has treatment</span>}>
+      <p className="text-xs text-muted -mt-1 mb-2">Click a protein to filter treatments.</p>
+      <div ref={ref} className="w-full">
+        <svg width={w} height={H} viewBox={`0 0 ${w} ${H}`} role="img" aria-label="Protein contributions to risk">
+          {ticks.map(t => <g key={t}>
+            <line x1={x(t)} x2={x(t)} y1={y0} y2={yEnd} style={{ stroke: t === 0 ? 'var(--muted)' : 'var(--grid)', strokeWidth: t === 0 ? 1 : 1 }} />
+            <line x1={x(t)} x2={x(t)} y1={yEnd} y2={yEnd + 4} style={{ stroke: 'var(--muted)' }} />
+            <text x={x(t)} y={yEnd + 15} textAnchor="middle" fontSize="10" style={{ fill: 'var(--muted)' }}>{t > 0 ? '+' : ''}{t.toFixed(1)}</text>
+          </g>)}
+          <line x1={m.l} x2={w - m.r} y1={yEnd} y2={yEnd} style={{ stroke: 'var(--line)' }} />
+          <line x1={m.l} x2={m.l} y1={y0} y2={yEnd} style={{ stroke: 'var(--line)' }} />
+          <text x={(m.l + w - m.r) / 2} y={H - 6} textAnchor="middle" fontSize="10" style={{ fill: 'var(--fg)' }}>SHAP value (Δ log-hazard)</text>
+          <text x={m.l + 2} y={H - 18} fontSize="9" style={{ fill: 'var(--ok)' }}>← lowers</text>
+          <text x={w - m.r - 2} y={H - 18} textAnchor="end" fontSize="9" style={{ fill: 'var(--crit)' }}>raises →</text>
+          {list.map((d, i) => {
+            const yy = m.t + i * rowH, on = prot === d.name, up = d.v > 0;
+            return (
+              <g key={d.name} transform={`translate(0,${yy})`} onClick={() => setProt(on ? null : d.name)} style={{ cursor: 'pointer' }}>
+                <rect x="0" y="1" width={w} height={rowH - 2} rx="5" style={{ fill: on ? 'var(--accent-soft)' : 'transparent' }} />
+                <text x={m.l - 8} y={rowH / 2 + 4} textAnchor="end" fontSize="11" style={{ fill: 'var(--fg)', fontWeight: on ? 600 : 400 }}>{d.name}</text>
+                {linked.has(d.name) && <circle cx="6" cy={rowH / 2} r="3.5" style={{ fill: 'var(--accent)' }} />}
+                <rect x={Math.min(x(0), x(d.v))} y="6" height={rowH - 12} rx="2" width={Math.abs(x(d.v) - x(0))}
+                  style={{ fill: up ? 'var(--crit)' : 'var(--ok)', opacity: prot && !on ? .35 : .85 }} />
+              </g>);
+          })}
+        </svg>
+      </div>
+      <p className="text-[11px] text-muted mt-1">Y axis: plasma protein (Olink NPX). X axis: contribution of each protein to this patient’s log-hazard relative to the cohort mean.</p>
+    </Card>
+  );
+}
+
+/* ---------------- app ---------------- */
+function App() {
+  const [pid, setPid] = useState(PATIENTS[1].id);
+  const [k, setK] = useState('cad');
+  const [prot, setProt] = useState(null);
+  const p = PATIENTS.find(x => x.id === pid);
+  useEffect(() => setProt(null), [pid, k]);
+  const others = KEYS.filter(x => !CONDITIONS[x].major);
+
+  return (
+    <div>
+      <div className="mock-stripe border-b border-line">
+        <div className="wrap max-w-[1400px] mx-auto py-1.5 text-xs text-muted"><b className="text-fg">Prototype.</b> Synthetic data. Not for clinical use.</div>
+      </div>
+
+      <header className="border-b border-line bg-surface">
+        <div className="wrap max-w-[1400px] mx-auto py-3 flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="font-display text-[18px] font-bold leading-none">ProteoOnset</div>
+            <div className="text-[11px] text-muted mt-0.5">Plasma proteomics → onset risk → treatment options</div>
+          </div>
+          <label htmlFor="patient" className="flex items-center gap-2 text-[13px] text-muted">
+            Patient
+            <select id="patient" value={pid} onChange={e => setPid(e.target.value)}
+              className="font-mono text-[13px] text-fg bg-surface border border-line rounded-lg px-2 py-1.5">
+              {PATIENTS.map(x => <option key={x.id} value={x.id}>{x.id} · {x.sex} {x.age}</option>)}
+            </select>
+          </label>
+        </div>
+      </header>
+
+      <main className="wrap max-w-[1400px] mx-auto py-5 grid gap-5 lg:grid-cols-[220px_minmax(0,1fr)]">
+        <aside className="min-w-0 flex flex-col gap-3">
+          <div className="eyebrow">Major diseases</div>
+          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-1 gap-2" role="tablist" aria-label="Major diseases">
+            {MAJOR.map(key => {
+              const c = CONDITIONS[key], r = riskOf(p, key), on = key === k, [tc, tl] = tier(r);
+              return (
+                <button key={key} role="tab" aria-selected={on} onClick={() => setK(key)}
+                  className={`text-left rounded-xl border p-3 transition ${on ? 'border-accent bg-surface shadow-sm' : 'border-line bg-surface/60 hover:border-muted'}`}>
+                  <div className="text-[13px] font-semibold truncate">{c.name}</div>
+                  <div className="flex items-center justify-between mt-1">
+                    <span className="font-mono num text-[17px]">{pct(r)}</span>
+                    <span className={`pill ${tc}`}>{tl}</span>
+                  </div>
+                </button>);
+            })}
+          </div>
+          <label htmlFor="all-diseases" className="eyebrow mt-2">All tested diseases · {KEYS.length}</label>
+          <select id="all-diseases" value={k} onChange={e => setK(e.target.value)}
+            className="w-full text-[13px] text-fg bg-surface border border-line rounded-lg px-2 py-2">
+            <optgroup label="Major">
+              {MAJOR.map(key => <option key={key} value={key}>{CONDITIONS[key].name} · {pct(riskOf(p, key))}</option>)}
+            </optgroup>
+            <optgroup label="Other tested">
+              {others.map(key => <option key={key} value={key}>{CONDITIONS[key].name} · {pct(riskOf(p, key))}</option>)}
+            </optgroup>
+          </select>
+        </aside>
+
+        <div className="min-w-0 grid gap-5 md:grid-cols-2 xl:grid-cols-3 items-start">
+          <RiskCard p={p} k={k} />
+          <TreatmentCard k={k} prot={prot} setProt={setProt} />
+          <DriversCard key={pid + k} p={p} k={k} prot={prot} setProt={setProt} />
+        </div>
+      </main>
+
+      <footer className="wrap max-w-[1400px] mx-auto text-xs text-muted flex flex-wrap gap-x-4 gap-y-1 pb-6">
+        <span>Hackathon prototype</span>
+        <a className="link" href="https://github.com/collaborativebioinformatics" target="_blank" rel="noopener">Project repository ↗</a>
+      </footer>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+
+</body></html>
