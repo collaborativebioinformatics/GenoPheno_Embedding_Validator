@@ -109,6 +109,8 @@ USAGE
   python 5_validate_evo2.py --list-tasks
 
 REQUIRES  numpy, pandas, scipy; torch to read the model file.
+          optional: RAPIDS cuDF (pip install cudf-cu12) for --cudf, which runs the pandas parts (mainly
+          reading GWAS summary statistics) on the GPU
 """
 import argparse
 import inspect
@@ -116,9 +118,19 @@ import json
 import os
 import re
 import shlex
-import sys
 import time
 import traceback
+
+import sys
+
+if "--cudf" in sys.argv:
+    # GPU dataframes: cuDF's pandas accelerator must be switched on BEFORE pandas is imported.
+    # pandas code then runs on the GPU where cuDF supports it and falls back to the CPU elsewhere.
+    try:
+        import cudf.pandas
+        cudf.pandas.install()
+    except ImportError:
+        sys.exit("--cudf needs RAPIDS cuDF (pip install cudf-cu12); run without --cudf to use plain pandas")
 
 import numpy as np
 import pandas as pd
@@ -918,6 +930,8 @@ def main():
     ap.add_argument("--out-dir", help="default <graph-dir>/validation_<model file name>")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--list-tasks", action="store_true", help="print available tasks and their parameters")
+    ap.add_argument("--cudf", action="store_true",
+                    help="run the pandas parts (e.g. reading GWAS files) on the GPU with RAPIDS cuDF")
     args = ap.parse_args()
 
     for p in args.plugins:

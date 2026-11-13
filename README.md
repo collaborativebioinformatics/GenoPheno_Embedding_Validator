@@ -20,6 +20,8 @@ pip install flash-attn==2.8.0.post2 --no-build-isolation
 pip install evo2
 ```
 
+Optional: `pip install cudf-cu12` (RAPIDS cuDF) enables `--cudf` in steps 1 and 5, which reads and processes their tables on the GPU. In step 1, add `--chunksize 0` so the edge files are also parsed on the GPU.
+
 ## Usage
 
 The pipeline uses the [BH_26 train/test split](https://data.haploblocks.org/BH_26/splits/). `half_A.txt` (1,252 individuals) is the train set, used by steps 1–4. `half_B.txt` (1,251 individuals) is the test set, which only step 5 uses. Both are plain text, one 1000 Genomes sample ID per line.

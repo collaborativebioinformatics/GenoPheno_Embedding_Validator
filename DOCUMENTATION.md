@@ -61,6 +61,8 @@ pip install evo2
 
 The BioNeMo variant of step 4a runs inside the BioNeMo Framework container (`nvcr.io/nvidia/clara/bionemo-framework`) instead.
 
+Optional: `pip install cudf-cu12` (RAPIDS cuDF) enables `--cudf` in steps 1 and 5. This runs their pandas code on the GPU, falling back to the CPU for anything cuDF doesn't support.
+
 ## 4. Usage
 
 ```bash
@@ -147,6 +149,8 @@ Downloads `nodes.csv.gz` and `edges.csv.gz` for each chromosome and merges them 
 | `--min-lift` | `2.0` | drop weaker edges |
 | `--edges` | `all` | `lift5` = small pre-filtered file (not train-only) |
 | `--workdir`, `--out` | `haplograph`, automatic | output locations |
+| `--cudf` | off | read and match nodes/edges on the GPU with RAPIDS cuDF |
+| `--chunksize` | `2000000` | edge rows read at a time; `0` = whole file (with `--cudf`, needed for GPU parsing) |
 
 ### Step 2: `2_ancestry_labels.py`
 
@@ -192,12 +196,15 @@ If XGBoost runs out of memory, lower `--chunk-nodes`, `--xgb-svd-nodes`, `--xgb-
 
 Fine-tunes Evo 2 7B on node embeddings, with no DNA involved. One example is one individual on one chromosome: their clusters in genomic order, each replaced by its embedding.
 - The embeddings are projected into Evo 2 in place of its DNA-letter embeddings.
-- Evo 2 runs up to `--layer`, and its last `--train-blocks` blocks are fine-tuned.
+- Evo 2 runs up to `--layer`. Its last `--train-blocks` blocks are adapted with LoRA by default (small trainable adapters on their linear layers, original weights frozen), or fully fine-tuned with `--lora-rank 0`.
+- Several sequences from the same chromosome go through Evo 2 together (`--micro-batch`), padded to the same length.
+- Activation checkpointing saves memory by recomputing intermediate results during the backward pass.
 - Only training individuals are used, split again into train and validation.
 
 - **In:** `nodes.csv.gz`, `individuals.txt`, `carriers.npz`, `node_emb_<method>.npy` + `.json`, and `individual_ancestry.csv` (ancestry objective).
 - **Out:** `evo2_<objective>_<method>.pt`, a torch dict containing:
-  - `trained_blocks`: the fine-tuned Evo 2 weights;
+  - `trained_blocks`: the fine-tuned Evo 2 weights (with LoRA, the adapters merged into the weights, so loading works the same either way);
+  - `lora`, `lora_config`: the adapters themselves and their settings (`None` with `--lora-rank 0`);
   - `proj_in`, `chrom_emb`, `head`: the new layers;
   - `train_individuals`, `val_individuals`;
   - `metrics` (before / after training) and `config`.
@@ -206,11 +213,17 @@ Fine-tunes Evo 2 7B on node embeddings, with no DNA involved. One example is one
 |---|---|---|
 | `--method` | required | which embeddings |
 | `--objective` | `next` | `next` = predict the next cluster; `ancestry` = predict the population |
-| `--train-blocks` | `4` | Evo 2 blocks to fine-tune; `0` = frozen baseline |
+| `--train-blocks` | `4` | Evo 2 blocks to adapt; `0` = frozen baseline. With LoRA, more is cheap, e.g. `29` = every block up to `--layer` |
+| `--lora-rank` | `16` | adapter size; `0` = full fine-tuning of the blocks |
+| `--lora-lr` | `2e-4` | learning rate for the adapters (`--lr`, default `1e-5`, applies with `--lora-rank 0`) |
+| `--lora-targets` | all linear layers | regex to adapt only some layers, e.g. `mlp` |
+| `--micro-batch` | `4` | sequences per forward pass; lower it if GPU memory runs out |
+| `--batch` | `8` | sequences per optimizer step |
+| `--grad-checkpointing` | on | `--no-grad-checkpointing` is faster but needs more memory |
 | `--evo2-model` | `evo2_7b_base` | or `evo2_7b` (1M context) |
 | `--layer` | `blocks.28.mlp.l3` | read-out layer |
 | `--max-len` | `1024` | max clusters per sequence |
-| `--epochs`, `--batch`, `--lr` | `1`, `8`, `1e-5` | training settings |
+| `--epochs` | `1` | passes over the training sequences |
 
 ### Step 4a (BioNeMo): `4a_finetune_evo2_embeddings_bionemo.py`
 
@@ -224,7 +237,8 @@ python 4a_finetune_evo2_embeddings_bionemo.py --method gnn --graph-dir $G --ckpt
 It differs from 4a in a few options:
 - `--ckpt-dir` (required) points to the checkpoint;
 - `--model-size` (default `7b`) must match it;
-- `--layer-index` (default `28`) replaces `--layer`.
+- `--layer-index` (default `28`) replaces `--layer`;
+- it has no LoRA, micro-batching or activation checkpointing yet: it fine-tunes whole blocks, one sequence at a time.
 
 The output is `evo2_bionemo_<objective>_<method>.pt`. Code that may need adjusting for your BioNeMo version is marked `VERSION-SENSITIVE`.
 
@@ -272,6 +286,7 @@ gwas_enrichment gwas=height_hg38.tsv pvalue=5e-8 label=height
 | `--gwas` | none | shortcut adding a `gwas_enrichment` line |
 | `--splits` | BH_26 URL | folder or URL with `half_A.txt` / `half_B.txt`; `none` = model's own held-out set |
 | `--plugins` | none | Python file(s) with extra tasks |
+| `--cudf` | off | read GWAS files and other tables on the GPU with RAPIDS cuDF |
 
 `--list-tasks` shows every task with its parameters. The README explains how to get GIANT and GWAS Catalog data.
 
@@ -363,5 +378,8 @@ Everything else (graph building, labels, the train-only logic, XGBoost leaf embe
 - **Data size.** The full edge files are about 1 GB per chromosome; genome-wide graphs need lots of memory and disk. Use `--min-lift` to shrink the graph, and `--chunksize` if memory runs out while reading edges.
 - **GNN memory.** The GNN runs on the whole graph at once on one GPU; very large graphs may not fit.
 - **node2vec speed.** Its walks run on CPU (numpy), which can be slow for genome-wide graphs; lower `--walks-per-node` or `--walk-length`.
-- **Step 4a speed.** It processes one sequence at a time (batches are built by accumulating gradients), uses one GPU, and can't resume an interrupted run.
+- **Step 4a.**
+  - It uses one GPU and can't resume an interrupted run.
+  - LoRA, micro-batching and activation checkpointing are untested on a GPU. If the `evo2` package uses other layer types than standard linear layers (e.g. with FP8), those layers aren't adapted; the script warns when adapters receive no gradient.
+  - With `--objective next`, memory grows with `--micro-batch` × the number of clusters on the chromosome (each position is scored against all of them); lower `--micro-batch` for large chromosomes.
 - **Permutation cost.** Step 5's permutations multiply runtime; lower `permutations` for quick runs.

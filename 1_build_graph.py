@@ -67,15 +67,27 @@ USAGE
   python 1_build_graph.py --edges lift5                    # small pre-filtered edge files
 
 REQUIRES  numpy, pandas, scipy
+          optional: RAPIDS cuDF (pip install cudf-cu12) for --cudf, which runs the pandas parts (reading
+          and matching nodes/edges) on the GPU; add --chunksize 0 so the edge files are parsed on the GPU too
 """
 import argparse
 import hashlib
 import json
 import os
 import re
-import sys
 import time
 import urllib.request
+
+import sys
+
+if "--cudf" in sys.argv:
+    # GPU dataframes: cuDF's pandas accelerator must be switched on BEFORE pandas is imported.
+    # pandas code then runs on the GPU where cuDF supports it and falls back to the CPU elsewhere.
+    try:
+        import cudf.pandas
+        cudf.pandas.install()
+    except ImportError:
+        sys.exit("--cudf needs RAPIDS cuDF (pip install cudf-cu12); run without --cudf to use plain pandas")
 
 import numpy as np
 import pandas as pd
@@ -218,9 +230,10 @@ def read_edges(edges_path, ids, support, n_ind, min_lift, chunksize, packed=None
     index = pd.Index(ids)
     S, T, L = [], [], []
     n_read = n_unknown = 0
-    for chunk in pd.read_csv(edges_path, usecols=["source", "target", "weight"],
-                             dtype={"source": str, "target": str, "weight": np.float64},
-                             chunksize=chunksize):
+    reader = pd.read_csv(edges_path, usecols=["source", "target", "weight"],
+                         dtype={"source": str, "target": str, "weight": np.float64},
+                         chunksize=chunksize or None)          # 0 = whole file at once
+    for chunk in (reader if chunksize else [reader]):
         s = index.get_indexer(chunk["source"])
         t = index.get_indexer(chunk["target"])
         w = chunk["weight"].to_numpy()
@@ -393,9 +406,13 @@ def main():
     ap.add_argument("--edges", choices=["all", "lift5"], default="all",
                     help="all = edges.csv.gz (~1 GB per chromosome); lift5 = pre-filtered lift>=5 file")
     ap.add_argument("--min-lift", type=float, default=2.0, help="keep edges with lift >= this")
-    ap.add_argument("--chunksize", type=int, default=2_000_000, help="edge rows read at a time")
+    ap.add_argument("--chunksize", type=int, default=2_000_000,
+                    help="edge rows read at a time; 0 = whole file at once (with --cudf, chunked reading "
+                         "runs on the CPU, so 0 puts the parsing on the GPU if the file fits in GPU memory)")
     ap.add_argument("--local-dir", help="folder with already-downloaded <chrom>/nodes.csv.gz etc.")
     ap.add_argument("--force", action="store_true", help="re-parse cached chromosomes and rebuild")
+    ap.add_argument("--cudf", action="store_true",
+                    help="run the pandas parts (reading and matching nodes/edges) on the GPU with RAPIDS cuDF")
     args = ap.parse_args()
 
     if args.chroms:
