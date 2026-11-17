@@ -1,6 +1,12 @@
 """
-Step 3 of 4 - node embeddings for the graph built by 1_build_graph.py (genome-wide, or whichever
+Step 3 of 5 - node embeddings for the graph built by 1_build_graph.py (genome-wide, or whichever
 chromosome selection that graph was built from). One model is trained on the whole graph.
+
+TRAINING INDIVIDUALS  carrier-profile features (gnn, xgboost) use only these individuals, so a
+held-out test set never shapes the embeddings: --train-individuals FILE_OR_URL if given, else
+<graph-dir>/train_individuals.txt (written by 1_build_graph.py --train-individuals), else all
+individuals. The graph itself (node2vec) is train-only when step 1 was run with
+--train-individuals, and the xgboost labels when step 2 used the same training set (checked).
 
 METHODS (--method)
   node2vec  Uses the graph only. Biased random walks (return parameter --p, in-out parameter --q,
@@ -12,6 +18,11 @@ METHODS (--method)
             predicts each node's ancestry label from [own carrier profile, neighbourhood-averaged
             profile over the graph]; the leaves each node falls into (across all trees) are one-hot
             encoded and compressed with SVD.
+            Memory-bounded for large graphs: trains on at most --xgb-train-nodes labelled nodes
+            (compressed QuantileDMatrix), fits the leaf SVD on --xgb-svd-nodes sampled nodes, then
+            embeds all nodes in chunks of --chunk-nodes (embedding = one-hot leaves @ SVD basis,
+            identical to the SVD scores on the sampled nodes). Still OOM? Lower those three
+            options, --xgb-max-bin, or --xgb-trees, or use --device cpu.
 
 Note: the data has only within-chromosome edges, so a genome-wide graph is one disconnected block
 per chromosome. node2vec walks never leave their chromosome, so node2vec vectors are comparable
@@ -20,21 +31,24 @@ use one shared feature space (carrier profiles), so their vectors are comparable
 
 INPUT  (in --graph-dir, from 1_build_graph.py / 2_ancestry_labels.py)
   graph.npz        scipy.sparse CSR float32 [N, N], symmetric adjacency      (all methods)
+  individuals.txt  I lines, one individual per line (columns of carriers.npz)
+  train_individuals.txt  (optional) training individuals, one per line (from step 1)
   carriers.npz     scipy.sparse CSR uint8 [N, I], node x individual carriers  (gnn, xgboost)
   labels.npz       labels int64 [N] (index into classes, -1 = unlabelled),
-                   classes str [P]                                            (xgboost)
+                   classes str [P], train_set_id str                         (xgboost)
   nodes.csv.gz     node, id, chrom, ...                                       (only for --csv)
 
 OUTPUT (in --graph-dir)
   node_emb_<method>.npy       float32 [N, --dim]; row i = embedding of node i in nodes.csv.gz
                               load with numpy.load("node_emb_gnn.npy")
-  node_emb_<method>.json      method, dim, settings and training summary
+  node_emb_<method>.json      method, dim, settings, training summary, and the training set used
+                              (train_source, n_train, train_set_id)
   node_emb_<method>.csv.gz    (with --csv) gzipped CSV: id, chrom, e0 ... e<dim-1>
-  features_svd<k>.npy         cached SVD carrier features float32 [N, k]      (gnn, xgboost)
+  features_svd<k>_<set id>.npy  cached SVD carrier features float32 [N, k]   (gnn, xgboost)
 
 USAGE
-  python 3_node_embeddings.py --method node2vec
-  python 3_node_embeddings.py --method gnn
+  python 3_node_embeddings.py --method node2vec --graph-dir haplograph/genome_train_half_A
+  python 3_node_embeddings.py --method gnn --graph-dir haplograph/genome_train_half_A
   python 3_node_embeddings.py --method xgboost --graph-dir haplograph/chr21_chr22 --csv
 
 REQUIRES  numpy, pandas, scipy; torch (node2vec, gnn); xgboost (xgboost).
@@ -65,6 +79,68 @@ def require(args, *names, hint):
         raise SystemExit(f"missing {', '.join(missing)} in {args.graph_dir} - run {hint} first")
 
 
+def is_url(p):
+    return str(p).startswith(("http://", "https://"))
+
+
+def read_individual_list(src, cache_dir):
+    """Plain text (one ID per line, '#' comments) or CSV with an 'individual' column; file or URL."""
+    if is_url(src):
+        import urllib.request
+        dest = os.path.join(cache_dir, os.path.basename(src.rstrip("/")))
+        if not os.path.exists(dest):
+            log(f"  downloading {src}")
+            urllib.request.urlretrieve(src, dest + ".part")
+            os.replace(dest + ".part", dest)
+        src = dest
+    elif not os.path.exists(src):
+        raise SystemExit(f"file not found: {src}")
+    if src.endswith((".csv", ".csv.gz")):
+        df = pd.read_csv(src, dtype=str)
+        col = "individual" if "individual" in df.columns else df.columns[0]
+        return [x.strip() for x in df[col].dropna()]
+    out = []
+    with open(src) as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if line:
+                out.append(line.split()[0])
+    return out
+
+
+def load_sample_map(path):
+    """CSV with 2 columns (graph individual name, sample ID) -> {sample ID: graph name}."""
+    m = pd.read_csv(path, dtype=str)
+    if m.shape[1] < 2:
+        raise SystemExit(f"{path}: --sample-map needs 2 columns (graph name, sample ID)")
+    return dict(zip(m.iloc[:, 1].str.strip(), m.iloc[:, 0].str.strip()))
+
+
+def train_columns(args, individuals):
+    """Training individuals as column indices into individuals.txt / carriers.npz.
+    Source: --train-individuals if given, else the graph's train_individuals.txt (written by
+    1_build_graph.py --train-individuals), else every individual.
+    Returns (indices, source description, short id of the set)."""
+    import hashlib
+    src = getattr(args, "train_individuals", None)
+    if not src and os.path.exists(os.path.join(args.graph_dir, "train_individuals.txt")):
+        src = os.path.join(args.graph_dir, "train_individuals.txt")
+    if not src:
+        return np.arange(len(individuals)), "all individuals", "all"
+    raw = read_individual_list(src, args.graph_dir)
+    to_graph = load_sample_map(args.sample_map) if getattr(args, "sample_map", None) else {}
+    names = {to_graph.get(x, x) for x in raw}
+    pos = {x: i for i, x in enumerate(individuals)}
+    idx = np.array(sorted(pos[x] for x in names if x in pos), dtype=np.int64)
+    if len(idx) == 0:
+        raise SystemExit(f"none of the training individuals in {src} (e.g. {sorted(names)[:2]}) match the "
+                         f"graph's individuals (e.g. {individuals[:2]}); pass --sample-map")
+    if len(idx) < len(names):
+        log(f"  warning: {len(names) - len(idx):,} training IDs from {src} are not in the graph, ignored")
+    set_id = hashlib.sha1("\n".join(sorted(individuals[i] for i in idx)).encode()).hexdigest()[:8]
+    return idx, src, set_id
+
+
 def torch_device(name=None):
     import torch
     return torch.device(name or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -75,13 +151,13 @@ def torch_device(name=None):
 # ---------------------------------------------------------------------------
 
 def carrier_features(args):
-    """SVD-compressed, standardized carrier profiles [N, svd_dim] (cached)."""
-    f = gfile(args, f"features_svd{args.svd_dim}.npy")
+    """SVD-compressed, standardized carrier profiles of the TRAINING individuals [N, svd_dim] (cached)."""
+    f = gfile(args, f"features_svd{args.svd_dim}_{args.train_id}.npy")
     if os.path.exists(f) and not args.force:
         return np.load(f)
-    C = sp.load_npz(gfile(args, "carriers.npz")).astype(np.float32)
+    C = sp.load_npz(gfile(args, "carriers.npz")).tocsc()[:, args.train_idx].tocsr().astype(np.float32)
     k = min(args.svd_dim, min(C.shape) - 1)
-    log(f"  SVD of carrier matrix {C.shape} -> {k} features")
+    log(f"  SVD of carrier matrix {C.shape} (training individuals) -> {k} features")
     U, S, _ = svds(C, k=k, random_state=args.seed)
     X = (U * S).astype(np.float32)
     X = (X - X.mean(0)) / (X.std(0) + 1e-6)
@@ -286,51 +362,94 @@ def embed_gnn(args, A):
 # XGBoost (leaf embeddings)
 # ---------------------------------------------------------------------------
 
-def leaf_embedding(leaves, dim, seed=0):
-    """One-hot encode leaf indices per tree ([N, n_trees]) and compress with SVD -> [N, dim]."""
+def propagate(A, X):
+    """D^-1/2 (A + I) D^-1/2 @ X (GCN-normalized neighbourhood average) without copying A."""
+    d = np.asarray(A.sum(axis=1)).ravel() + 1.0
+    s = (1.0 / np.sqrt(d)).astype(np.float32)[:, None]
+    Y = s * X
+    return s * (A @ Y + Y)
+
+
+def leaf_onehot(leaves, width):
+    """[n, n_trees] leaf ids -> sparse one-hot [n, n_trees * width] (tree j uses columns j*width...)."""
     n, n_trees = leaves.shape
-    cols, offset = np.empty_like(leaves, dtype=np.int64), 0
-    for j in range(n_trees):
-        _, inv = np.unique(leaves[:, j], return_inverse=True)
-        cols[:, j] = inv + offset
-        offset += inv.max() + 1
-    rows = np.repeat(np.arange(n), n_trees)
-    M = sp.csr_matrix((np.ones(rows.size, np.float32), (rows, cols.ravel())), shape=(n, offset))
+    cols = (np.arange(n_trees, dtype=np.int64) * width)[None, :] + leaves
+    rows = np.repeat(np.arange(n, dtype=np.int64), n_trees)
+    return sp.csr_matrix((np.ones(rows.size, np.float32), (rows, cols.ravel())),
+                         shape=(n, n_trees * width))
+
+
+def leaf_basis(M, dim, seed=0):
+    """SVD of a (sampled) one-hot leaf matrix -> basis V [n_cols, k], largest component first.
+    For the sampled rows, M @ V equals the usual SVD scores U * S."""
     k = min(dim, min(M.shape) - 1)
-    U, S, _ = svds(M, k=k, random_state=seed)
-    return (U * S)[:, ::-1].astype(np.float32).copy()
+    _, S, Vt = svds(M, k=k, random_state=seed)
+    return Vt[np.argsort(S)[::-1]].T.astype(np.float32).copy()
 
 
 def embed_xgboost(args, A):
     import xgboost as xgb
+    rng = np.random.default_rng(args.seed)
     lab = np.load(gfile(args, "labels.npz"), allow_pickle=True)
     y, classes = lab["labels"], lab["classes"]
+    lab_id = str(lab["train_set_id"]) if "train_set_id" in lab.files else "all"
+    if lab_id != args.train_id:
+        raise SystemExit(f"labels.npz was made from another training set ({lab_id}) than this run uses "
+                         f"({args.train_id}, {args.train_src}); rerun 2_ancestry_labels.py with the same "
+                         "--train-individuals")
     X = carrier_features(args)
-    feats = np.hstack([X, normalized_adjacency(A) @ X])    # own profile + graph neighbourhood
-    idx = np.where(y >= 0)[0]
-    rng = np.random.default_rng(args.seed)
-    rng.shuffle(idx)
-    n_val = max(1, int(0.1 * len(idx)))
-    val, tr = idx[:n_val], idx[n_val:]
+    H = propagate(A, X)                                   # graph neighbourhood average
+    n = len(X)
+
+    def feats(idx):                                       # own profile + neighbourhood, built per batch
+        return np.hstack([X[idx], H[idx]])
+
+    labelled = np.where(y >= 0)[0]
+    rng.shuffle(labelled)
+    n_val = min(max(1, int(0.1 * len(labelled))), args.xgb_val_nodes)
+    val, tr = labelled[:n_val], labelled[n_val:n_val + args.xgb_train_nodes]
 
     try:
         device = "cuda" if torch_device(args.device).type == "cuda" else "cpu"
     except ImportError:
-        device = "cpu"
-    clf = xgb.XGBClassifier(
-        n_estimators=args.xgb_trees, max_depth=args.xgb_depth, learning_rate=0.1,
-        subsample=0.8, colsample_bytree=0.8, tree_method="hist", device=device,
-        objective="multi:softprob", eval_metric="mlogloss", random_state=args.seed,
-    )
-    log(f"  XGBoost on {device}: {len(tr):,} train / {len(val):,} val nodes, "
-        f"{feats.shape[1]} features, classes {classes.tolist()}")
-    clf.fit(feats[tr], y[tr], eval_set=[(feats[val], y[val])], verbose=False)
-    acc = float((clf.predict(feats[val]) == y[val]).mean())
+        device = args.device or "cpu"
+    params = {
+        "objective": "multi:softprob", "num_class": len(classes), "eval_metric": "mlogloss",
+        "max_depth": args.xgb_depth, "eta": 0.1, "subsample": 0.8, "colsample_bytree": 0.8,
+        "tree_method": "hist", "max_bin": args.xgb_max_bin, "device": device, "seed": args.seed,
+    }
+    log(f"  XGBoost on {device}: {len(tr):,} train / {len(val):,} val nodes "
+        f"(of {len(labelled):,} labelled, {n:,} total), {2 * X.shape[1]} features, "
+        f"classes {classes.tolist()}")
+    dtrain = xgb.QuantileDMatrix(feats(tr), label=y[tr], max_bin=args.xgb_max_bin)
+    dval = xgb.QuantileDMatrix(feats(val), label=y[val], ref=dtrain, max_bin=args.xgb_max_bin)
+    booster = xgb.train(params, dtrain, num_boost_round=args.xgb_trees,
+                        evals=[(dval, "val")], verbose_eval=False)
+    acc = float((np.asarray(booster.predict(dval)).reshape(len(val), -1).argmax(1) == y[val]).mean())
     base = float(np.bincount(y[tr]).max() / len(tr))
     log(f"  node-ancestry accuracy on held-out nodes {acc:.3f} (majority-class baseline {base:.3f})")
-    leaves = clf.apply(feats)                          # leaf index per tree, for every node
-    Z = leaf_embedding(leaves.reshape(len(feats), -1), args.dim, args.seed)
-    return Z, {"val_accuracy": acc, "baseline_accuracy": base, "n_trees_total": int(leaves.reshape(len(feats), -1).shape[1])}
+    del dtrain, dval
+
+    width = 2 ** (args.xgb_depth + 1)                     # depth-d tree node ids are < 2^(d+1) - 1
+
+    def leaves(idx):
+        L = np.asarray(booster.predict(xgb.DMatrix(feats(idx)), pred_leaf=True)).astype(np.int64)
+        L = L.reshape(len(idx), -1)
+        if L.size and L.max() >= width:
+            raise RuntimeError(f"leaf id {L.max()} >= {width}; trees are deeper than --xgb-depth")
+        return L
+
+    sample = np.sort(rng.choice(n, min(n, args.xgb_svd_nodes), replace=False))
+    V = leaf_basis(leaf_onehot(leaves(sample), width), args.dim, args.seed)
+    log(f"  leaf SVD fitted on {len(sample):,} nodes ({V.shape[0]:,} leaf columns -> {V.shape[1]} dims)")
+    Z = np.empty((n, V.shape[1]), np.float32)
+    for b in range(0, n, args.chunk_nodes):
+        idx = np.arange(b, min(b + args.chunk_nodes, n))
+        Z[idx] = leaf_onehot(leaves(idx), width) @ V
+        if (b // args.chunk_nodes) % 20 == 0:
+            log(f"    embedded {idx[-1] + 1:,}/{n:,} nodes")
+    return Z, {"val_accuracy": acc, "baseline_accuracy": base, "train_nodes": int(len(tr)),
+               "svd_nodes": int(len(sample)), "n_trees_total": int(V.shape[0] // width)}
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +463,9 @@ def main():
     ap.add_argument("--device", help="cpu / cuda (default: cuda if available)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--force", action="store_true", help="recompute existing embeddings")
+    ap.add_argument("--train-individuals",
+                    help="file or URL of training individuals (default: <graph-dir>/train_individuals.txt, else all)")
+    ap.add_argument("--sample-map", help="CSV: graph individual name, sample ID (if they differ)")
 
     n = ap.add_argument_group("node2vec")
     n.add_argument("--p", type=float, default=1.0, help="return parameter (low = walks stay local)")
@@ -366,28 +488,43 @@ def main():
     g.add_argument("--edge-batch", type=int, default=500_000)
     g.add_argument("--xgb-trees", type=int, default=100)
     g.add_argument("--xgb-depth", type=int, default=6)
+    g.add_argument("--xgb-train-nodes", type=int, default=1_000_000, help="max labelled nodes to train on")
+    g.add_argument("--xgb-val-nodes", type=int, default=100_000, help="max held-out nodes for accuracy")
+    g.add_argument("--xgb-svd-nodes", type=int, default=300_000, help="nodes sampled to fit the leaf SVD")
+    g.add_argument("--xgb-max-bin", type=int, default=256, help="histogram bins (lower = less memory)")
+    g.add_argument("--chunk-nodes", type=int, default=200_000, help="nodes embedded per chunk")
     args = ap.parse_args()
 
-    out = gfile(args, f"node_emb_{args.method}.npy")
-    if os.path.exists(out) and not args.force:
-        log(f"{out} already exists (use --force to recompute)")
-        return
-    require(args, "graph.npz", hint="1_build_graph.py")
+    require(args, "graph.npz", "individuals.txt", hint="1_build_graph.py")
     if args.method in ("gnn", "xgboost"):
         require(args, "carriers.npz", hint="1_build_graph.py")
     if args.method == "xgboost":
         require(args, "labels.npz", hint="2_ancestry_labels.py")
+    individuals = open(gfile(args, "individuals.txt")).read().split("\n")
+    args.train_idx, args.train_src, args.train_id = train_columns(args, individuals)
+
+    out = gfile(args, f"node_emb_{args.method}.npy")
+    info_file = gfile(args, f"node_emb_{args.method}.json")
+    if os.path.exists(out) and not args.force:
+        old = json.load(open(info_file)).get("train_set_id", "all") if os.path.exists(info_file) else "all"
+        if old == args.train_id:
+            log(f"{out} already exists for this training set (use --force to recompute)")
+            return
+        log(f"existing {os.path.basename(out)} was made with another training set ({old}); recomputing")
 
     t0 = time.time()
     A = sp.load_npz(gfile(args, "graph.npz")).astype(np.float32).tocsr()
-    log(f"[{args.method}] graph {args.graph_dir}: {A.shape[0]:,} nodes, {A.nnz // 2:,} edges")
+    log(f"[{args.method}] graph {args.graph_dir}: {A.shape[0]:,} nodes, {A.nnz // 2:,} edges; "
+        f"training individuals: {len(args.train_idx):,} ({args.train_src})")
     fn = {"node2vec": embed_node2vec, "gnn": embed_gnn, "xgboost": embed_xgboost}[args.method]
     Z, summary = fn(args, A)
 
     np.save(out, Z)
-    settings = {k: v for k, v in vars(args).items() if k not in ("force", "csv")}
-    with open(gfile(args, f"node_emb_{args.method}.json"), "w") as f:
+    settings = {k: v for k, v in vars(args).items() if k not in ("force", "csv", "train_idx")}
+    with open(info_file, "w") as f:
         json.dump({"method": args.method, "shape": list(Z.shape), "settings": settings,
+                   "train_source": args.train_src, "n_train": int(len(args.train_idx)),
+                   "train_set_id": args.train_id,
                    "summary": summary, "seconds": round(time.time() - t0)}, f, indent=2)
     if args.csv:
         nodes = pd.read_csv(gfile(args, "nodes.csv.gz"), usecols=["id", "chrom"])
