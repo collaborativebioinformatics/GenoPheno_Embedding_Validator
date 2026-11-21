@@ -1,0 +1,14 @@
+# Tasks for 5_validate_evo2.py - one task per line: <task name> [key=value ...]
+# '#' starts a comment; quote values that contain spaces.
+# List all tasks and their parameters with:  python 5_validate_evo2.py --list-tasks
+
+# what the model is, its stored metrics, and whether test individuals were seen in training
+model_info
+
+# 1. train vs test consistency of the haploblock clusters (data-level)
+cluster_consistency min_carriers=1 permutations=200
+
+# 2. GWAS enrichment of haploblocks (data-level); positions must use the same genome build
+#    as the haploblock regions. Add one line per trait or threshold.
+# gwas_enrichment gwas=Yengo.2022.height.GWAS.ALL.gz pvalue=5e-8 label=height
+# gwas_enrichment gwas=gwas_catalog_height.tsv pvalue=5e-8 window=10000 label=height_catalog

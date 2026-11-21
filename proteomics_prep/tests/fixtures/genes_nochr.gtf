@@ -1,0 +1,11 @@
+##description: tiny made-up annotation for tests
+1	TEST	gene	101	300	.	+	.	gene_id "G1.1"; gene_type "protein_coding"; gene_name "GENE_A";
+1	TEST	gene	801	1100	.	-	.	gene_id "G2.1"; gene_type "protein_coding"; gene_name "GENE_B";
+1	TEST	gene	1001	1200	.	+	.	gene_id "G3.1"; gene_type "protein_coding"; gene_name "GENE_C";
+1	TEST	gene	901	1000	.	-	.	gene_id "G4.1"; gene_type "protein_coding"; gene_name "GENE_D";
+2	TEST	gene	101	300	.	+	.	gene_id "G5.1"; gene_type "protein_coding"; gene_name "AMB";
+2	TEST	gene	501	700	.	+	.	gene_id "G6.1"; gene_type "protein_coding"; gene_name "AMB";
+2	TEST	gene	801	900	.	+	.	gene_id "G7.1"; gene_type "protein_coding"; gene_name "GENE_E";
+1	TEST	transcript	101	300	.	+	.	gene_id "G1.1"; gene_type "protein_coding"; gene_name "GENE_A";
+KI270706.1	TEST	gene	1	100	.	+	.	gene_id "G8.1"; gene_type "protein_coding"; gene_name "GENE_F";
+MT	TEST	gene	1	100	.	+	.	gene_id "G9.1"; gene_type "Mt_tRNA"; gene_name "MT_TEST";

@@ -1,0 +1,5 @@
+CHROM	START	END
+chr1	0	1000
+chr1	1000	2000
+chr2	0	1000
+chrUn_example	0	500
