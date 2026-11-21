@@ -210,7 +210,7 @@ wget -r -np -nH --cut-dirs=2 -R "index.html*" https://data.haploblocks.org/BH_26
 python 5_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --splits splits/ --gwas height_hg38.tsv
 ```
 
-> Now: by default step 5 uses the graph folder's own `train_individuals.txt` / `test_individuals.txt` (written by step 1 from `download_haplograph.py`), and falls back to the BH_26 URL when the graph has no test file.
+> Now: by default step 5 uses the graph folder's own `train_individuals.txt` / `test_individuals.txt` (written by step 1 from `download_haplograph.py`). It falls back to the BH_26 URL only for a graph built without a split (`--no-split`); a graph with a training set but no test file needs `--test-individuals` or `--splits`.
 
 It also checks for leakage at two levels:
 - It warns if any test individual is in the graph's training set (step 1).

@@ -72,16 +72,30 @@ def load_checksums(workdir):
 
 
 def fetch_chromosome(workdir, chrom, files, checksums):
+    """Download missing files and check their MD5. Files already verified (same size and modification
+    time as when they passed, recorded in raw/verified.json) are not hashed again."""
+    record_path = Path(workdir) / "raw" / "verified.json"
+    record = json.loads(record_path.read_text()) if record_path.exists() else {}
     for name in files:
+        key = f"{chrom}/{name}"
         dest = Path(workdir) / "raw" / chrom / name
         download(f"{BASE_URL}/{chrom}/{name}", dest)
-        expected = checksums.get(f"{chrom}/{name}") if checksums else None
-        if expected:
-            got = md5(dest)
-            if got != expected:
-                dest.unlink()
-                die(f"checksum mismatch for {dest} (got {got}, expected {expected}); the file was deleted, "
-                    "run again to re-download it")
+        expected = checksums.get(key) if checksums else None
+        if not expected:
+            continue
+        st = dest.stat()
+        stamp = [st.st_size, st.st_mtime_ns, expected]
+        if record.get(key) == stamp:
+            continue
+        got = md5(dest)
+        if got != expected:
+            dest.unlink()
+            record.pop(key, None)
+            record_path.write_text(json.dumps(record, indent=1))
+            die(f"checksum mismatch for {dest} (got {got}, expected {expected}); the file was deleted, "
+                "run again to re-download it")
+        record[key] = stamp
+        record_path.write_text(json.dumps(record, indent=1))
 
 
 def haplograph_individuals(nodes_path):

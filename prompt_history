@@ -82,3 +82,37 @@ Changes:
     - The rebuilt model in step 5 reproduces the stored validation accuracy exactly.
     - Not run (no GPU): Evo 2, BioNeMo, RAPIDS, CUDA XGBoost; Nemotron only against a local fake
       endpoint.
+
+Prompt 2 - Commit the cleanup
+-----------------------------
+Request: commit this with a short message summing up the cleanup.
+Changes: committed everything on branch post-hack-cleanup (45458ee).
+
+Prompt 3 - Code review of part 1 (/code-review), then fix all findings
+---------------------------------------------------------------------
+Request: review the code of part 1 only (no changes to part 2 / proteomics); then "fix all ten,
+rerun the tests and commit".
+Findings and fixes (all in part1_haplograph/):
+  1. Evo 2 is kept in bf16, so in-place AdamW updates at lr 1e-5 round away and "fine-tuned"
+     blocks never change. evo2_model.fit now optimizes fp32 master copies (MasterWeights) and
+     writes them back each step. Checked: after 160 steps a bf16 layer changed 208/256 weights
+     with master copies vs 0/256 with in-place updates.
+  2. Step 3 reused embeddings / SVD caches after a graph rebuild in the same folder. Outputs now
+     record graph_id (hash of graph_info.json); caches include it; step 4 refuses stale embeddings.
+  3. Step 1 silently kept an existing graph built with other settings. It now compares chromosomes,
+     --edges, --min-lift and train/test set ids with graph_info.json and stops on a mismatch
+     (--force rebuilds, --out writes elsewhere).
+  4. 4b did not validate --val-frac (crash with 1.0). Added the check and an empty-train guard.
+  5. Step 1 with --train-individuals wrote no test file, so step 5 fell back to BH_26 half_B
+     (possible overlap). Step 1 now takes the split's test file when the train file is the split's
+     own and warns otherwise; step 5 refuses a graph with a training set but no test file.
+  6. URL downloads were cached by file name and could resolve to a local file of the same name.
+     Now cached under downloads/<hash of URL>/ (haplo_common.url_cache_path).
+  7. Step 4 --chroms 21,22 failed (no chr prefix). Uses parse_chroms like the other scripts.
+  8. Step 5 loaded the checkpoint twice; it now creates the Model once and shares it.
+  9. Step 0 re-hashed every cached file on each run; verified files are recorded (size, mtime) in
+     raw/verified.json and skipped.
+  10. Duplicated code: 4a and 4b now share evo2_model.fit / config_of; step 5 uses haplo_common's
+      log, is_url, download and read_graph_individuals.
+Docs: README (own "Now:" note on the step-5 fallback) and DOCUMENTATION updated for 1, 2, 3, 5, 9.
+Tests: all six --test flags pass; targeted checks for every fix; the real chr21 pipeline rerun on CPU.

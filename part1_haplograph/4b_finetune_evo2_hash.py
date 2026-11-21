@@ -56,12 +56,11 @@ NOTE  The official Evo 2 training paths are Savanna and NVIDIA BioNeMo. This scr
 import argparse
 import os
 import re
-import time
 
 import numpy as np
 import pandas as pd
 
-from evo2_model import Evo2Runner, MockEvo2Runner
+from evo2_model import Evo2Runner, MockEvo2Runner, config_of, fit
 from haplo_common import die, log, test_workdir
 
 
@@ -94,65 +93,6 @@ def load_hash_pheno(path, task="auto"):
     return hashes, np.searchsorted(classes, v.to_numpy()).astype(np.int64), task, classes, name, n_skipped
 
 
-def fit(args, rnr, train_ex, example_loss, evaluate, describe, new_modules, grad_check):
-    """Shared training loop. example_loss(ex, train_mode) -> (loss, info); evaluate() -> metrics."""
-    torch = rnr.torch
-    rng = np.random.default_rng(args.seed + 1)
-    new_params = [p for m in new_modules for p in m.parameters()]
-    opt = torch.optim.AdamW([
-        {"params": [p for _, p in rnr.trainable], "lr": args.lr},
-        {"params": new_params, "lr": args.head_lr},
-    ], weight_decay=0.01)
-
-    def run_eval():
-        rnr.net.eval()
-        for m in new_modules:
-            m.eval()
-        with torch.no_grad():
-            res = evaluate()
-        rnr.net.train()
-        for m in new_modules:
-            m.train()
-        return res
-
-    before = run_eval()
-    log(f"  before training: {describe(before)}")
-    step, t0 = 0, time.time()
-    for epoch in range(args.epochs):
-        order = rng.permutation(len(train_ex))
-        batch = min(args.batch, len(train_ex))
-        for b in range(0, len(order) - batch + 1, batch):
-            opt.zero_grad()
-            batch_loss = 0.0
-            for j in order[b:b + batch]:                 # gradient accumulation over the batch
-                loss = example_loss(train_ex[j], True)[0]
-                (loss / batch).backward()
-                batch_loss += loss.item() / batch
-            if step == 0:
-                what, params = grad_check
-                if all(p.grad is None for p in params):
-                    raise RuntimeError(f"No gradient reached {what}: this evo2 version's forward pass is "
-                                       "not differentiable. Fine-tune via BioNeMo instead.")
-                if rnr.trainable and all(p.grad is None for _, p in rnr.trainable):
-                    raise RuntimeError("No gradient reached the unfrozen Evo 2 blocks; try --train-blocks 0 "
-                                       "(trains only the new layers through frozen Evo 2).")
-            torch.nn.utils.clip_grad_norm_([p for _, p in rnr.trainable] + new_params, 1.0)
-            opt.step()
-            step += 1
-            if step % args.log_every == 0:
-                log(f"  epoch {epoch + 1} step {step}: loss {batch_loss:.4f}  {(time.time() - t0) / step:.1f}s/step")
-            if step % args.eval_every == 0:
-                log(f"  [eval] {describe(run_eval())}")
-    after = run_eval()
-    log(f"  final: {describe(after)}")
-    log(f"  (before training: {describe(before)})")
-    return before, after
-
-
-def config_of(args):
-    return {k: v for k, v in vars(args).items() if isinstance(v, (int, float, str, list, type(None)))}
-
-
 def train_hash(args):
     import torch
     import torch.nn as nn
@@ -165,6 +105,8 @@ def train_hash(args):
     perm = rng.permutation(n)
     n_val = max(1, int(args.val_frac * n))
     val, tr = perm[:n_val], perm[n_val:]
+    if len(tr) == 0:
+        die(f"only {n} valid rows: too few to hold out {n_val} for validation and still train; lower --val-frac")
     val_eval = val if len(val) <= args.val_examples else np.sort(rng.choice(val, args.val_examples, replace=False))
     lengths = np.array([len(h) for h in hashes])
     windows = np.ceil(lengths / args.hash_window).astype(int)
@@ -233,8 +175,13 @@ def train_hash(args):
     else:
         describe = lambda r: (f"val loss {r['loss']:.4f}, accuracy {r['accuracy']:.3f} "
                               f"(majority-class baseline {r['baseline']:.3f})")
-    before, after = fit(args, rnr, list(tr), example_loss, evaluate, describe,
-                        [head], ("the phenotype head", list(head.parameters())))
+    def set_train(mode):
+        rnr.net.train(mode)
+        head.train(mode)
+
+    before, after = fit(args, [p for _, p in rnr.trainable], [head], len(tr),
+                        lambda j: example_loss(tr[j], True)[0], evaluate, describe, set_train,
+                        np.random.default_rng(args.seed + 1), ("the phenotype head", list(head.parameters())))
 
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_") or "phenotype"
     out = args.out or os.path.join(os.path.dirname(os.path.abspath(args.hash_pheno)), f"evo2_hash_{safe}.pt")
@@ -302,6 +249,10 @@ def main(argv=None):
         ap.error("--hash-pheno is required")
     if not os.path.exists(args.hash_pheno):
         die(f"{args.hash_pheno} not found")
+    if not 0 < args.val_frac < 1:
+        die("--val-frac must be between 0 and 1")
+    if args.train_blocks < 0:
+        die("--train-blocks must be >= 0")
     for name in ("hash_window", "batch", "epochs", "val_examples", "log_every", "eval_every"):
         if getattr(args, name) < 1:
             die(f"--{name.replace('_', '-')} must be >= 1")

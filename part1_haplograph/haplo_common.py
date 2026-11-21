@@ -5,6 +5,7 @@ synthetic haplograph used by every script's --test flag.
 """
 import gzip
 import hashlib
+import json
 import os
 import re
 import sys
@@ -50,7 +51,14 @@ def is_url(p):
     return str(p).startswith(("http://", "https://"))
 
 
-def download(url, dest, quiet=False):
+def url_cache_path(url, cache_dir=None):
+    """Where a downloaded URL is cached: <cache_dir>/downloads/<hash of the URL>/<file name>, so two
+    URLs with the same file name (or a local file of that name) never stand in for each other."""
+    key = hashlib.sha1(url.encode()).hexdigest()[:12]
+    return Path(cache_dir or tempfile.gettempdir()) / "downloads" / key / os.path.basename(url.rstrip("/"))
+
+
+def download(url, dest, quiet=False, hint=""):
     """Download url to dest (atomic, skipped if dest exists). Returns dest as str."""
     dest = Path(dest)
     if dest.exists():
@@ -70,7 +78,7 @@ def download(url, dest, quiet=False):
     except Exception as e:
         if tmp.exists():
             tmp.unlink()
-        die(f"could not download {url} ({type(e).__name__}: {e})")
+        die(f"could not download {url} ({type(e).__name__}: {e})" + (f"\n{hint}" if hint else ""))
     os.replace(tmp, dest)
     if not quiet:
         log()
@@ -80,7 +88,7 @@ def download(url, dest, quiet=False):
 def read_individual_list(src, cache_dir=None):
     """Plain text (one ID per line, '#' comments) or CSV with an 'individual' column; file or URL."""
     if is_url(src):
-        src = download(src, Path(cache_dir or tempfile.gettempdir()) / os.path.basename(src.rstrip("/")))
+        src = download(src, url_cache_path(src, cache_dir))
     elif not os.path.exists(src):
         die(f"file not found: {src}")
     src = str(src)
@@ -147,6 +155,17 @@ def train_columns(args, individuals):
     if len(idx) < len(names):
         log(f"  warning: {len(names) - len(idx):,} training IDs from {src} are not in the graph, ignored")
     return idx, src, set_id(individuals[i] for i in idx)
+
+
+def graph_id(graph_dir):
+    """Short id of a graph build (its graph_info.json: chromosomes, edge file, min lift, counts,
+    training set). Stored by steps 3 and 4 so outputs of an older graph in the same folder are
+    never reused."""
+    p = Path(graph_dir) / "graph_info.json"
+    if not p.exists():
+        return "unknown"
+    info = json.loads(p.read_text())
+    return hashlib.sha1(json.dumps(info, sort_keys=True).encode()).hexdigest()[:8]
 
 
 def torch_device(name=None):

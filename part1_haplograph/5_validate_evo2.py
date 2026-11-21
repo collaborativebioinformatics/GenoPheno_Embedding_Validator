@@ -164,11 +164,8 @@ import pandas as pd
 import scipy.sparse as sp
 from scipy import stats
 
-from haplo_common import BH26_SPLITS, die, load_sample_map, read_individual_list, selftest_graph_dir
-
-
-def log(msg=""):
-    print(msg, flush=True)
+from haplo_common import (BH26_SPLITS, die, download, is_url, load_sample_map, log, read_graph_individuals,
+                          read_individual_list, selftest_graph_dir, url_cache_path)
 
 
 GRAPH_SPLIT = "graph"
@@ -284,7 +281,7 @@ class Graph:
     @property
     def individuals(self):
         if self._individuals is None:
-            self._individuals = open(self._f("individuals.txt")).read().split("\n")
+            self._individuals = read_graph_individuals(self.dir)
         return self._individuals
 
     def _build_regions(self):
@@ -357,41 +354,26 @@ class Model:
         return list(v) if v else None
 
 
-def is_url(p):
-    return str(p).startswith(("http://", "https://"))
-
-
 def join_path(base, name):
     return base.rstrip("/") + "/" + name if is_url(base) else os.path.join(base, name)
 
 
 def fetch(path, cache_dir):
-    """Local path as is; a URL is downloaded once into cache_dir."""
+    """Local path as is; a URL is downloaded once into cache_dir (keyed by the URL)."""
     if not is_url(path):
         if not os.path.exists(path):
-            raise SystemExit(f"file not found: {path}")
+            die(f"file not found: {path}")
         return path
-    import urllib.request
-    os.makedirs(cache_dir, exist_ok=True)
-    dest = os.path.join(cache_dir, os.path.basename(path.rstrip("/")))
-    if not os.path.exists(dest):
-        log(f"  downloading {path}")
-        try:
-            tmp = dest + ".part"
-            urllib.request.urlretrieve(path, tmp)
-            os.replace(tmp, dest)
-        except Exception as e:
-            raise SystemExit(f"could not download {path} ({e}). Download the split files yourself, e.g.\n"
-                             f"  wget -r -np -nH --cut-dirs=2 -R 'index.html*' {BH26_SPLITS}/\n"
-                             f"and pass the local folder with --splits splits/")
-    return dest
+    return download(path, url_cache_path(path, cache_dir),
+                    hint=f"Download the split files yourself, e.g.\n  wget -r -np -nH --cut-dirs=2 -R 'index.html*' "
+                         f"{BH26_SPLITS}/\nand pass the local folder with --splits splits/")
 
 
 class Context:
-    def __init__(self, args):
+    def __init__(self, args, model=None):
         self.args = args
         self.graph = Graph(args.graph_dir)
-        self.model = Model(args.model)
+        self.model = model or Model(args.model)
         self.rng = np.random.default_rng(args.seed)
         self.out_dir = args.out_dir
         self._used = {}
@@ -425,6 +407,11 @@ class Context:
             g_train = os.path.join(self.graph.dir, "train_individuals.txt")
             if os.path.exists(g_test):
                 test_src, train_src = g_test, (g_train if os.path.exists(g_train) else None)
+            elif os.path.exists(g_train):
+                die(f"{self.graph.dir} has a training set but no test_individuals.txt (step 1 ran with "
+                    "--train-individuals but no test file). Pass the matching --test-individuals (and "
+                    "--train-individuals) or --splits; falling back to another split could overlap the "
+                    "training set")
             else:
                 log(f"note: {g_test} not found; using the BH_26 split ({BH26_SPLITS})")
                 test_src, train_src = join_path(BH26_SPLITS, a.test_file), join_path(BH26_SPLITS, a.train_file)
@@ -1151,12 +1138,13 @@ def main(argv=None):
     if not os.path.exists(args.model):
         raise SystemExit(f"model file {args.model} not found")
 
+    model = Model(args.model)                     # loaded once, on first use, shared with the tasks
     specs = read_tasks_file(args.tasks) if args.tasks else []
     specs += [parse_task_line(t, "--task") for t in args.task]
     specs += [("gwas_enrichment", {"gwas": g}) for g in args.gwas]
     if not specs:
         specs = [("model_info", {})]
-        if model_kind(Model(args.model).meta).startswith("4a"):
+        if model.kind.startswith("4a"):
             specs.append(("test_set_performance", {}))
         specs.append(("cluster_consistency", {}))
     jobs = []
@@ -1171,7 +1159,7 @@ def main(argv=None):
     stem = re.sub(r"\.pt$", "", os.path.basename(args.model))
     args.out_dir = args.out_dir or os.path.join(args.graph_dir, f"validation_{stem}")
     os.makedirs(args.out_dir, exist_ok=True)
-    ctx = Context(args)
+    ctx = Context(args, model)
     ctx.setup_split()
 
     results = []

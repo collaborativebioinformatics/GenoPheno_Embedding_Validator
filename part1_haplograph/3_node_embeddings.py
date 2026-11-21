@@ -50,7 +50,9 @@ OUTPUT (in --graph-dir)
   node_emb_<method>.json      method, dim, settings, training summary, and the training set used
                               (train_source, n_train, train_set_id)
   node_emb_<method>.csv.gz    (with --csv) gzipped CSV: id, chrom, e0 ... e<dim-1>
-  features_svd<k>_<set id>[_rapids].npy  cached SVD carrier features float32 [N, k] (gnn, xgboost)
+  features_svd<k>_<set id>_<graph id>[_rapids].npy  cached SVD carrier features [N, k] (gnn, xgboost)
+  Existing outputs are reused only if they were made from the same graph build (graph_info.json)
+  and training set; otherwise they are recomputed.
 
 USAGE
   python 3_node_embeddings.py --graph-dir haplograph/genome_train_half_A            # all three
@@ -72,8 +74,8 @@ import pandas as pd
 import scipy.sparse as sp
 from scipy.sparse.linalg import svds
 
-from haplo_common import (chrom_key, die, log, read_graph_individuals, require_files, selftest_graph_dir,
-                          torch_device, train_columns)
+from haplo_common import (chrom_key, die, graph_id, log, read_graph_individuals, require_files,
+                          selftest_graph_dir, torch_device, train_columns)
 
 METHODS = ("node2vec", "gnn", "xgboost")
 
@@ -134,7 +136,7 @@ def svd_basis(M, k, seed, rapids):
 def carrier_features(args):
     """SVD-compressed, standardized carrier profiles of the TRAINING individuals [N, svd_dim] (cached)."""
     tag = "_rapids" if args.rapids else ""
-    f = gfile(args, f"features_svd{args.svd_dim}_{args.train_id}{tag}.npy")
+    f = gfile(args, f"features_svd{args.svd_dim}_{args.train_id}_{args.graph_id}{tag}.npy")
     if os.path.exists(f) and not args.force:
         return np.load(f)
     C = sp.load_npz(gfile(args, "carriers.npz")).tocsc()[:, args.train_idx].tocsr().astype(np.float32)
@@ -455,11 +457,11 @@ def run_method(args, method, A):
     out = gfile(args, f"node_emb_{method}.npy")
     info_file = gfile(args, f"node_emb_{method}.json")
     if os.path.exists(out) and not args.force:
-        old = json.load(open(info_file)).get("train_set_id", "all") if os.path.exists(info_file) else "all"
-        if old == args.train_id:
-            log(f"{out} already exists for this training set (use --force to recompute)")
+        old = json.load(open(info_file)) if os.path.exists(info_file) else {}
+        if old.get("train_set_id") == args.train_id and old.get("graph_id") == args.graph_id:
+            log(f"{out} already exists for this graph and training set (use --force to recompute)")
             return
-        log(f"existing {os.path.basename(out)} was made with another training set ({old}); recomputing")
+        log(f"existing {os.path.basename(out)} was made from another graph build or training set; recomputing")
     t0 = time.time()
     log(f"[{method}] graph {args.graph_dir}: {A.shape[0]:,} nodes, {A.nnz // 2:,} edges; "
         f"training individuals: {len(args.train_idx):,} ({args.train_src})")
@@ -473,7 +475,7 @@ def run_method(args, method, A):
     with open(info_file, "w") as f:
         json.dump({"method": method, "shape": list(Z.shape), "settings": settings,
                    "train_source": args.train_src, "n_train": int(len(args.train_idx)),
-                   "train_set_id": args.train_id,
+                   "train_set_id": args.train_id, "graph_id": args.graph_id,
                    "summary": summary, "seconds": round(time.time() - t0)}, f, indent=2)
     if args.csv:
         nodes = pd.read_csv(gfile(args, "nodes.csv.gz"), usecols=["id", "chrom"])
@@ -562,6 +564,7 @@ def main(argv=None):
                   + (["nodes.csv.gz"] if "xgboost" in methods or args.csv else []), "1_build_graph.py")
     individuals = read_graph_individuals(args.graph_dir)
     args.train_idx, args.train_src, args.train_id = train_columns(args, individuals)
+    args.graph_id = graph_id(args.graph_dir)
     A = sp.load_npz(gfile(args, "graph.npz")).astype(np.float32).tocsr()
     for method in methods:
         run_method(args, method, A)

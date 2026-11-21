@@ -558,3 +558,108 @@ def load_finetuned(meta, graph_dir, device=None, ckpt_dir=None):
 def save_json(path, obj):
     with open(path, "w") as f:
         json.dump(obj, f, indent=2, default=str)
+
+
+# ---------------------------------------------------------------------------
+# Training loop (shared by 4a and 4b)
+# ---------------------------------------------------------------------------
+
+class MasterWeights:
+    """fp32 master copies of low-precision (bf16 / fp16) trainable parameters.
+
+    The evo2 package and BioNeMo keep Evo 2 in bf16. An AdamW update of ~lr (1e-5) is far below
+    bf16's resolution for weights of ordinary size (~2e-4 at 0.05), so updating bf16 weights in
+    place rounds every step away and the 'fine-tuned' blocks never change. The optimizer therefore
+    steps on fp32 copies, which are written back (rounded) to the model after every step."""
+
+    def __init__(self, params):
+        import torch
+        self.torch = torch
+        self.pairs, self.params = [], []
+        for p in params:
+            if p.dtype in (torch.bfloat16, torch.float16):
+                m = p.detach().float().clone().requires_grad_(True)
+                self.pairs.append((p, m))
+                self.params.append(m)
+            else:
+                self.params.append(p)
+
+    def grads_to_master(self):
+        for p, m in self.pairs:
+            m.grad = None if p.grad is None else p.grad.float()
+
+    def master_to_model(self):
+        with self.torch.no_grad():
+            for p, m in self.pairs:
+                p.copy_(m)
+
+
+def fit(args, blocks, new_modules, n_examples, example_loss, evaluate, describe, set_train, rng, grad_check):
+    """AdamW on the unfrozen backbone blocks (--lr, through fp32 master weights) and the new layers
+    (--head-lr), gradient accumulation over --batch examples, gradient clipping at 1.
+      example_loss(j) -> loss tensor of training example j;  evaluate() -> metrics dict (run without
+      gradients in eval mode);  set_train(mode) switches every module;  grad_check = (description,
+      parameters that must receive a gradient on the first step).
+    Returns the evaluation metrics before and after training."""
+    import time
+    import torch
+    new_params = [p for m in new_modules for p in m.parameters()]
+    master = MasterWeights(blocks)
+    if master.pairs:
+        log(f"  {len(master.pairs)} low-precision trainable tensors: optimizing fp32 master copies")
+    opt = torch.optim.AdamW([{"params": master.params, "lr": args.lr}, {"params": new_params, "lr": args.head_lr}],
+                            weight_decay=0.01)
+
+    def run_eval():
+        set_train(False)
+        with torch.no_grad():
+            res = evaluate()
+        set_train(True)
+        return res
+
+    before = run_eval()
+    log(f"  before training: {describe(before)}")
+    set_train(True)
+    step, t0 = 0, time.time()
+    batch = min(args.batch, n_examples)
+    if batch < 1:
+        die("no training examples")
+    for epoch in range(args.epochs):
+        order = rng.permutation(n_examples)
+        for b in range(0, n_examples - batch + 1, batch):
+            opt.zero_grad()
+            for p in blocks:
+                p.grad = None
+            batch_loss = 0.0
+            for j in order[b:b + batch]:                  # gradient accumulation over the batch
+                loss = example_loss(int(j))
+                (loss / batch).backward()
+                batch_loss += loss.item() / batch
+            if not np.isfinite(batch_loss):
+                die(f"loss became {batch_loss} at step {step}; lower --lr / --head-lr")
+            if step == 0:
+                what, params = grad_check
+                if all(p.grad is None for p in params):
+                    die(f"no gradient reached {what}: this Evo 2 version's forward pass is not differentiable "
+                        "here. Try --bionemo.")
+                if blocks and all(p.grad is None for p in blocks):
+                    die("no gradient reached the unfrozen Evo 2 blocks; try --train-blocks 0 "
+                        "(trains only the new layers through frozen Evo 2)")
+            master.grads_to_master()
+            torch.nn.utils.clip_grad_norm_(master.params + new_params, 1.0)
+            opt.step()
+            master.master_to_model()
+            step += 1
+            if step % args.log_every == 0:
+                log(f"  epoch {epoch + 1} step {step}: loss {batch_loss:.4f}  {(time.time() - t0) / step:.2f}s/step")
+            if step % args.eval_every == 0:
+                log(f"  [eval] {describe(run_eval())}")
+    after = run_eval()
+    log(f"  final: {describe(after)}  ({step} steps)")
+    log(f"  (before training: {describe(before)})")
+    return before, after
+
+
+def config_of(args):
+    return {k: v for k, v in vars(args).items() if isinstance(v, (int, float, str, list, type(None)))}
+

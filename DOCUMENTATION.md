@@ -65,7 +65,7 @@ Everything is written under one root folder, `haplograph/` by default (`--workdi
 ```
 haplograph/
 ├── raw/                               step 0 downloads (largest part)
-│   ├── checksums.md5
+│   ├── checksums.md5, verified.json     (files already MD5-checked: re-runs skip re-hashing them)
 │   ├── chr1/ nodes.csv.gz, edges.csv.gz [, edges_lift_above_threshold.csv.gz]
 │   └── ...
 ├── splits/                            step 0
@@ -78,7 +78,7 @@ haplograph/
 └── genome_train_half_A/               one GRAPH FOLDER  (= --graph-dir for steps 3-5)
     ├── nodes.csv.gz, individuals.txt, carriers.npz, graph.npz, graph_info.json    step 1
     ├── train_individuals.txt, test_individuals.txt                                step 1
-    ├── features_svd128_<id>[_rapids].npy        step 3 (cache)
+    ├── features_svd128_<set id>_<graph id>[_rapids].npy   step 3 (cache)
     ├── node_emb_<method>.npy / .json            step 3 (+ .csv.gz with --csv)
     ├── evo2[_bionemo|_mock]_next_<method>.pt    step 4
     └── validation_<model name>/                 step 5
@@ -113,7 +113,9 @@ Downloads `nodes.csv.gz` and the edge file of each chromosome from `https://data
 
 ### Step 1: `1_build_graph.py`
 
-Merges the chromosomes into one graph. Edge weights, support and lift come from the training individuals only (the split of step 0, or `--train-individuals`); `--no-split` uses all individuals.
+Merges the chromosomes into one graph. Edge weights, support and lift come from the training individuals only (the split of step 0, or `--train-individuals`); `--no-split` uses all individuals. When `--train-individuals` is the split's own `train_individuals.txt`, the split's test file is used too; for any other training file pass `--test-individuals`, or step 5 will ask for it.
+
+If the graph folder already exists, step 1 compares the requested settings (chromosomes, `--edges`, `--min-lift`, training and test sets) with its `graph_info.json`: identical settings reuse the graph, different ones stop with the differences listed. `--force` rebuilds in place (steps 3 and 4 then notice the new build and recompute / refuse stale outputs), `--out` writes a new folder.
 
 - **In:** step 0's `raw/` and `splits/`:
   - `nodes.csv.gz` has columns `id`, `high_dim_edge` (the haploblock), then one 0/1 column per individual;
@@ -150,7 +152,7 @@ Learns one vector per node, by default with all three methods (`--method all`, o
 - **In:** `graph.npz`, plus `carriers.npz` (gnn, xgboost) and `nodes.csv.gz` (xgboost).
 - **Out:**
   - `node_emb_<method>.npy`: float32 [nodes × dim], row *i* = node *i*;
-  - `node_emb_<method>.json`: settings, a training summary (e.g. XGBoost accuracy vs the majority-class baseline) and the training set;
+  - `node_emb_<method>.json`: settings, a training summary (e.g. XGBoost accuracy vs the majority-class baseline), the training set and the graph build (`graph_id`, a hash of `graph_info.json`);
   - `node_emb_<method>.csv.gz` with `--csv`.
 
 | Option | Default | Meaning |
@@ -171,7 +173,8 @@ If XGBoost runs out of memory, lower `--chunk-nodes`, `--xgb-svd-nodes`, `--xgb-
 
 Fine-tunes Evo 2 7B on node embeddings, with no DNA involved. One example is one individual on one chromosome: their clusters in genomic order, each replaced by its embedding.
 - The embeddings are projected into Evo 2 in place of its DNA-letter embeddings, plus a learned per-chromosome vector.
-- Evo 2 runs up to its read-out layer. Its last `--train-blocks` blocks before it are fully fine-tuned; the rest stay frozen.
+- Evo 2 runs up to its read-out layer. Its last `--train-blocks` blocks before it are fully fine-tuned; the rest stay frozen. Evo 2 is kept in bf16, so the optimizer steps on fp32 master copies of the unfrozen weights and writes them back after every step (updating bf16 weights in place at `--lr 1e-5` would round every update away).
+- Step 4 refuses embeddings made from an earlier build of the graph (different `graph_id`) or another training set.
 - Objective: predict the next cluster along the chromosome (cosine similarity to every cluster of that chromosome, softmax with `--temperature`).
 - Only training individuals are used, split again into train and validation (`--val-frac`).
 
@@ -217,7 +220,7 @@ Fine-tunes Evo 2 to predict a phenotype from a genomic hash. Each bit of the has
 
 ### Step 5: `5_validate_evo2.py`
 
-Validates one fine-tuned model on the test set. By default it uses the graph folder's `train_individuals.txt` / `test_individuals.txt` (from steps 0–1); `--splits DIR_OR_URL` reads `half_A.txt` / `half_B.txt` from elsewhere (e.g. the [BH_26 folder](https://data.haploblocks.org/BH_26/splits/)), and `--splits none` uses the model's own validation individuals. It warns if any test individual was used to build the graph or to train the model. The checks to run are listed in a tasks file, one per line ([`validation_tasks.txt`](part1_haplograph/validation_tasks.txt)):
+Validates one fine-tuned model on the test set. By default it uses the graph folder's `train_individuals.txt` / `test_individuals.txt` (from steps 0–1; a graph with a training set but no test file is refused rather than paired with another split, and only a `--no-split` graph falls back to BH_26); `--splits DIR_OR_URL` reads `half_A.txt` / `half_B.txt` from elsewhere (e.g. the [BH_26 folder](https://data.haploblocks.org/BH_26/splits/)), and `--splits none` uses the model's own validation individuals. It warns if any test individual was used to build the graph or to train the model. The checks to run are listed in a tasks file, one per line ([`validation_tasks.txt`](part1_haplograph/validation_tasks.txt)):
 
 ```
 model_info
@@ -260,7 +263,7 @@ The pipeline is designed so the test individuals never influence anything that i
 | 4 | the individuals trained and validated on | none |
 | 5 | (checks this, then evaluates on the test individuals) | |
 
-Each step stores the training set's id and the next step checks it: step 4 stops if the embeddings came from another training set, and step 3 recomputes automatically if the training set changed. To use a different split, rerun step 0 with other `--split` settings (or give step 1 another `--train-individuals` file); step 1 then creates a new graph folder.
+Each step stores the training set's id and the graph build's id and the next step checks them: step 4 stops if the embeddings came from another training set or graph build, and step 3 recomputes automatically if either changed. To use a different split, rerun step 0 with other `--split` settings (or give step 1 another `--train-individuals` file); step 1 then creates a new graph folder.
 
 ## 6. GPU acceleration: RAPIDS, CuPy, BioNeMo, Nemotron
 

@@ -250,11 +250,6 @@ def chrom_part(args, chrom, train_names=None, train_tag=""):
 def build(args):
     chroms = sorted(set(args.chroms), key=chrom_key)
     out = args.out
-    if not args.force and all(os.path.exists(os.path.join(out, f)) for f in OUTPUTS):
-        log(f"graph already built in {out} (use --force to rebuild)")
-        return
-    os.makedirs(out, exist_ok=True)
-
     train_names, train_tag, test_names = None, "", None
     to_graph = load_sample_map(args.sample_map) if args.sample_map else {}
     if args.train_individuals:
@@ -270,6 +265,20 @@ def build(args):
         if args.edges == "lift5":
             log("  warning: the lift5 edge file was pre-filtered on ALL individuals (incl. the test set); "
                 "use --edges all for a strictly train-only graph")
+    requested = {"chromosomes": chroms, "edges_file": args.edges, "min_lift": args.min_lift,
+                 "train_file_set_id": train_tag or "all",
+                 "test_file_set_id": set_id(test_names) if test_names is not None else None}
+    if not args.force and all(os.path.exists(os.path.join(out, f)) for f in OUTPUTS):
+        old = json.load(open(os.path.join(out, "graph_info.json")))
+        differ = {k: (old.get(k), v) for k, v in requested.items() if old.get(k) != v}
+        if not differ:
+            log(f"graph already built in {out} with these settings (use --force to rebuild)")
+            return
+        die(f"{out} holds a graph built with other settings "
+            + ", ".join(f"{k}: {a!r} there, {b!r} now" for k, (a, b) in differ.items())
+            + ". Pass --force to rebuild it in place (steps 3-5 outputs in that folder then become stale "
+              "and are recomputed / refused), or --out for a new folder.")
+    os.makedirs(out, exist_ok=True)
     log(f"building graph for {len(chroms)} chromosome(s) -> {out}")
 
     ref_inds = None
@@ -332,7 +341,7 @@ def build(args):
     info = {"chromosomes": chroms, "edges_file": args.edges, "min_lift": args.min_lift,
             "edge_value": "log1p(lift)", "n_nodes": int(n), "n_edges": int(A.nnz // 2),
             "n_individuals": len(ref_inds), "isolated_nodes": int((deg == 0).sum()),
-            "train_only": train_names is not None}
+            "train_only": train_names is not None, **requested}
     if train_names is not None:
         info.update({"train_individuals_source": args.train_individuals,
                      "train_individuals_in_file": len(train_names),
@@ -361,6 +370,15 @@ def resolve_split(args):
         return
     if args.train_individuals:
         args.split_name = re.sub(r"\.(txt|csv|tsv)(\.gz)?$", "", os.path.basename(args.train_individuals.rstrip("/")))
+        if not args.test_individuals and split_json.exists():
+            info = json.loads(split_json.read_text())
+            split_train = split_json.parent / info["train_file"]
+            if os.path.exists(args.train_individuals) and Path(args.train_individuals).resolve() == split_train.resolve():
+                args.test_individuals = str(split_json.parent / info["test_file"])
+                args.split_name = info.get("name", args.split_name)
+        if not args.test_individuals:
+            log("  warning: no --test-individuals given, so the graph folder gets no test_individuals.txt; "
+                "step 5 will then need --test-individuals or --splits")
         return
     if not split_json.exists():
         die(f"no train/test split in {split_json.parent} - run download_haplograph.py first, pass "

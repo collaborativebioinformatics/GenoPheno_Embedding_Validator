@@ -67,76 +67,24 @@ NOTE  The official Evo 2 training paths are Savanna and NVIDIA BioNeMo. The defa
 import argparse
 import json
 import os
-import time
 
 import numpy as np
 
-from evo2_model import GenomeData, NextClusterModel, add_backbone_args, make_runner
-from haplo_common import die, log, read_graph_individuals, require_files, selftest_graph_dir, train_columns
+from evo2_model import GenomeData, NextClusterModel, add_backbone_args, config_of, fit, make_runner
+from haplo_common import (die, graph_id, log, parse_chroms, read_graph_individuals, require_files,
+                          selftest_graph_dir, train_columns)
 
 METHODS = ("node2vec", "gnn", "xgboost")
 
 
-def fit(args, model, train_ex, val_ex, rng):
-    """AdamW on the unfrozen blocks (--lr) and the new layers (--head-lr), gradient accumulation over
-    --batch examples. Returns validation metrics before and after training."""
-    import torch
-    rnr = model.rnr
-    new_params = [p for m in model.modules for p in m.parameters()]
-    blocks = [p for _, p in rnr.trainable]
-    opt = torch.optim.AdamW([{"params": blocks, "lr": args.lr}, {"params": new_params, "lr": args.head_lr}],
-                            weight_decay=0.01)
-
+def evaluate_fn(model, val_ex):
     def evaluate():
-        model.train(False)
         tot = correct = count = 0
-        with torch.no_grad():
-            for chrom, i in val_ex:
-                loss, (k, n) = model.loss(chrom, i)
-                tot += loss.item(); correct += k; count += n
-        model.train(True)
+        for chrom, i in val_ex:
+            loss, (k, n) = model.loss(chrom, i)
+            tot += loss.item(); correct += k; count += n
         return {"loss": tot / max(len(val_ex), 1), "accuracy": correct / max(count, 1), "examples": len(val_ex)}
-
-    describe = lambda r: f"val loss {r['loss']:.4f}, val next-cluster top-1 accuracy {r['accuracy']:.3f}"
-    before = evaluate()
-    log(f"  before training: {describe(before)}")
-    model.train(True)
-    step, t0 = 0, time.time()
-    batch = min(args.batch, len(train_ex))
-    for epoch in range(args.epochs):
-        order = rng.permutation(len(train_ex))
-        for b in range(0, len(order) - batch + 1, batch):
-            opt.zero_grad()
-            batch_loss = 0.0
-            for j in order[b:b + batch]:
-                chrom, i = train_ex[j]
-                loss = model.loss(chrom, i, rng)[0]
-                (loss / batch).backward()
-                batch_loss += loss.item() / batch
-            if not np.isfinite(batch_loss):
-                die(f"loss became {batch_loss} at step {step}; lower --lr / --head-lr")
-            if step == 0:
-                if all(p.grad is None for p in model.proj_in.parameters()):
-                    die("no gradient reached the input projection: this Evo 2 version's forward pass is not "
-                        "differentiable here. Try --bionemo.")
-                if blocks and all(p.grad is None for p in blocks):
-                    die("no gradient reached the unfrozen Evo 2 blocks; try --train-blocks 0 "
-                        "(trains only the new layers through frozen Evo 2)")
-            torch.nn.utils.clip_grad_norm_(blocks + new_params, 1.0)
-            opt.step()
-            step += 1
-            if step % args.log_every == 0:
-                log(f"  epoch {epoch + 1} step {step}: loss {batch_loss:.4f}  {(time.time() - t0) / step:.2f}s/step")
-            if step % args.eval_every == 0:
-                log(f"  [eval] {describe(evaluate())}")
-    after = evaluate()
-    log(f"  final: {describe(after)}  ({step} steps)")
-    log(f"  (before training: {describe(before)})")
-    return before, after
-
-
-def config_of(args):
-    return {k: v for k, v in vars(args).items() if isinstance(v, (int, float, str, list, type(None)))}
+    return evaluate
 
 
 def train(args):
@@ -150,10 +98,14 @@ def train(args):
     train_cols, train_src, train_id = train_columns(args, individuals)
     emb_info = os.path.join(args.graph_dir, f"node_emb_{args.method}.json")
     if os.path.exists(emb_info):
-        emb_id = json.load(open(emb_info)).get("train_set_id", "all")
+        info = json.load(open(emb_info))
+        emb_id = info.get("train_set_id", "all")
         if emb_id != train_id:
             die(f"node_emb_{args.method}.npy was made from another training set ({emb_id}) than this run uses "
                 f"({train_id}, {train_src}); rerun 3_node_embeddings.py with the same --train-individuals")
+        if info.get("graph_id", graph_id(args.graph_dir)) != graph_id(args.graph_dir):
+            die(f"node_emb_{args.method}.npy was made from an earlier build of this graph; rerun "
+                f"3_node_embeddings.py --method {args.method} --graph-dir {args.graph_dir}")
 
     perm = rng.permutation(train_cols)
     n_val = max(1, int(args.val_frac * len(perm)))
@@ -171,7 +123,10 @@ def train(args):
 
     rnr = make_runner(args, args.train_blocks)
     model = NextClusterModel(rnr, data, args.temperature, args.max_len)
-    before, after = fit(args, model, train_ex, val_ex, rng)
+    describe = lambda r: f"val loss {r['loss']:.4f}, val next-cluster top-1 accuracy {r['accuracy']:.3f}"
+    before, after = fit(args, [p for _, p in rnr.trainable], model.modules, len(train_ex),
+                        lambda j: model.loss(*train_ex[j], rng)[0], evaluate_fn(model, val_ex), describe,
+                        model.train, rng, ("the input projection", list(model.proj_in.parameters())))
 
     backend = rnr.backend
     trained = (rnr.net.state_dict() if backend == "mock"
@@ -181,6 +136,7 @@ def train(args):
     torch.save({
         "mode": "embeddings", "backend": backend, "objective": "next", "graph_method": args.method,
         "chroms": data.chroms, "n_chrom_slots": data.n_chrom_slots, "embeddings_sha1": data.emb_sha1,
+        "graph_id": graph_id(args.graph_dir),
         "evo2_model": args.evo2_model if backend == "evo2" else None,
         "layer": args.layer if backend == "evo2" else None,
         **rnr.describe(),
@@ -236,7 +192,7 @@ def main(argv=None):
         self_test(args)
     if not args.method:
         ap.error("--method is required (node2vec, gnn or xgboost)")
-    args.chroms = [c.strip() for c in args.chroms.split(",") if c.strip()] if args.chroms else None
+    args.chroms = parse_chroms(args.chroms)
     for name in ("max_len", "batch", "epochs", "val_examples", "log_every", "eval_every"):
         if getattr(args, name) < 1:
             die(f"--{name.replace('_', '-')} must be >= 1")
