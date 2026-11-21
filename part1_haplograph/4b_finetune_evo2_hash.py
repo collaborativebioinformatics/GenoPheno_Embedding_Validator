@@ -39,9 +39,12 @@ OUTPUT  --out, default <TSV folder>/evo2_hash_<phenotype name>.pt   (torch.save 
   rebuild the new layers with the same shapes and load their state_dicts.
 
 USAGE
+  python 4b_finetune_evo2_hash.py --test                                           # synthetic, CPU
   python 4b_finetune_evo2_hash.py --hash-pheno hash_height.tsv                     # regression
   python 4b_finetune_evo2_hash.py --hash-pheno hash_pop.tsv --task classification
   python 4b_finetune_evo2_hash.py --hash-pheno hash_height.tsv --train-blocks 0    # frozen baseline
+
+  --mock-evo2 replaces Evo 2 by a small random stand-in model (CPU check of the script only).
 
 REQUIRES  numpy, pandas, torch, evo2 (pip install evo2; Linux, CUDA 12.1+, Python 3.11/3.12;
           the 7B models run in bf16 without Transformer Engine; an 80 GB GPU is recommended).
@@ -58,12 +61,15 @@ import time
 import numpy as np
 import pandas as pd
 
+from evo2_model import Evo2Runner, MockEvo2Runner
+from haplo_common import die, log, test_workdir
+
 
 def load_hash_pheno(path, task="auto"):
     """Returns hashes (list of str), y (float64 or int64), task, classes, phenotype name, n_skipped."""
     raw = pd.read_csv(path, sep="\t", header=None, dtype=str, keep_default_na=False, quoting=3)
     if raw.shape[1] < 2 or len(raw) == 0:
-        raise SystemExit(f"{path}: expected a tab-separated file with 2 columns (hash, phenotype)")
+        die(f"{path}: expected a tab-separated file with 2 columns (hash, phenotype)")
     raw = raw.iloc[:, :2].apply(lambda c: c.str.strip())
     name = "phenotype"
     if not re.fullmatch(r"[01]+", raw.iloc[0, 0]):            # header row
@@ -74,7 +80,7 @@ def load_hash_pheno(path, task="auto"):
     n_skipped = int((~ok).sum())
     hashes, v = h[ok].tolist(), v[ok]
     if len(hashes) < 2:
-        raise SystemExit(f"{path}: fewer than 2 valid rows")
+        die(f"{path}: fewer than 2 valid rows")
 
     num = pd.to_numeric(v, errors="coerce")
     if task == "auto":
@@ -82,143 +88,10 @@ def load_hash_pheno(path, task="auto"):
     if task == "regression":
         if num.isna().any():
             bad = v[num.isna()].unique()[:5].tolist()
-            raise SystemExit(f"non-numeric phenotype values {bad}; use --task classification")
+            die(f"non-numeric phenotype values {bad}; use --task classification")
         return hashes, num.to_numpy(np.float64), task, None, name, n_skipped
     classes = np.array(sorted(v.unique()))
     return hashes, np.searchsorted(classes, v.to_numpy()).astype(np.int64), task, classes, name, n_skipped
-
-
-def log(msg=""):
-    print(msg, flush=True)
-
-
-class StopForward(Exception):
-    pass
-
-
-def find_embedding_module(net, name):
-    import torch.nn as nn
-    mods = dict(net.named_modules())
-    if name:
-        return mods[name]
-    for n, m in mods.items():
-        if n.endswith("embedding_layer"):
-            return m
-    for n, m in mods.items():
-        if isinstance(m, nn.Embedding):
-            return m
-    raise SystemExit("could not find Evo 2's token embedding layer; pass --embed-module")
-
-
-def convert_inference_tensors(net):
-    """The evo2 package loads its weights under torch.inference_mode(), which makes them
-    'inference tensors' that autograd can neither train nor save for backward (needed even for
-    frozen blocks, so gradients can flow back to the input projection). Replace every parameter,
-    buffer and plain tensor attribute that is an inference tensor with a normal clone, one tensor
-    at a time (peak extra memory = one tensor). Tied parameters stay tied."""
-    import torch
-    memo, n = {}, 0
-
-    def fresh(t, as_param):
-        nonlocal n
-        if id(t) not in memo:
-            c = t.clone()                      # outside inference mode -> normal tensor
-            memo[id(t)] = torch.nn.Parameter(c, requires_grad=False) if as_param else c
-            n += 1
-        return memo[id(t)]
-
-    with torch.no_grad():
-        for mod in net.modules():
-            for name, p in list(mod._parameters.items()):
-                if p is not None and p.is_inference():
-                    mod._parameters[name] = fresh(p, True)
-            for name, b in list(mod._buffers.items()):
-                if b is not None and b.is_inference():
-                    mod._buffers[name] = fresh(b, False)
-            for name, v in list(vars(mod).items()):
-                if (isinstance(v, torch.Tensor) and not isinstance(v, torch.nn.Parameter)
-                        and v.is_inference()):
-                    setattr(mod, name, fresh(v, False))
-    memo.clear()
-    torch.cuda.empty_cache()
-    return n
-
-
-class Evo2Runner:
-    """Loads Evo 2, unfreezes the last --train-blocks blocks up to --layer, and runs the model up to
-    --layer either on its own tokens (run_ids) or on replacement input vectors (run_soft)."""
-
-    def __init__(self, args):
-        import torch
-        from evo2 import Evo2
-        self.torch = torch
-        self.evo = Evo2(args.evo2_model)
-        net = self.net = self.evo.model
-        self.dev = next(net.parameters()).device
-        n_conv = convert_inference_tensors(net)
-        if n_conv:
-            log(f"  converted {n_conv:,} inference-mode tensors from the evo2 loader to trainable tensors")
-
-        m = re.match(r"blocks\.(\d+)\.", args.layer)
-        if not m:
-            raise SystemExit("--layer must look like blocks.<i>.<...>, e.g. blocks.28.mlp.l3")
-        last = int(m.group(1))
-        for p in net.parameters():
-            p.requires_grad_(False)
-        self.trainable = []
-        if args.train_blocks > 0:
-            for i in range(max(0, last - args.train_blocks + 1), last + 1):
-                for name, p in net.blocks[i].named_parameters():
-                    p.requires_grad_(True)
-                    self.trainable.append((f"blocks.{i}.{name}", p))
-
-        self.state = {"soft": None, "h": None, "embed_shape": None}
-        find_embedding_module(net, args.embed_module).register_forward_hook(self._embed_hook)
-        dict(net.named_modules())[args.layer].register_forward_hook(self._layer_hook)
-
-        with torch.no_grad():                  # discover sizes with one plain forward pass
-            self._forward(torch.zeros(1, 8, dtype=torch.int, device=self.dev))
-        self.hidden_in = self.state["embed_shape"][-1]
-        self.hidden_out = self.state.pop("h").shape[-1]
-        self.state["h"] = None
-        n_train = sum(p.numel() for _, p in self.trainable) / 1e6
-        blocks = f"{last - args.train_blocks + 1}-{last}" if self.trainable else "none"
-        log(f"  {args.evo2_model}: hidden {self.hidden_in}, read-out {args.layer}, "
-            f"unfrozen blocks {blocks} ({n_train:.0f}M params)")
-
-    def _embed_hook(self, _m, _inp, out):
-        self.state["embed_shape"] = tuple(out.shape)
-        soft = self.state["soft"]
-        if soft is None:
-            return None
-        if soft.shape != out.shape:
-            raise RuntimeError(f"soft input {tuple(soft.shape)} != embedding output {tuple(out.shape)}")
-        return soft.to(out.dtype)
-
-    def _layer_hook(self, _m, _inp, out):
-        self.state["h"] = out[0] if isinstance(out, tuple) else out
-        raise StopForward
-
-    def _forward(self, ids):
-        try:
-            self.net(ids)
-        except StopForward:
-            pass
-
-    def run_ids(self, ids):
-        """ids: int tensor [T] of Evo 2 tokens -> hidden states at --layer, [T, hidden_out] float32."""
-        self._forward(ids.unsqueeze(0))
-        return self.state.pop("h").float().squeeze(0)
-
-    def run_soft(self, soft):
-        """soft: [T, hidden_in] replacement input vectors -> [T, hidden_out] float32."""
-        self.state["soft"] = soft.unsqueeze(0)
-        dummy = self.torch.zeros(1, soft.shape[0], dtype=self.torch.int, device=self.dev)
-        try:
-            self._forward(dummy)
-        finally:
-            self.state["soft"] = None
-        return self.state.pop("h").float().squeeze(0)
 
 
 def fit(args, rnr, train_ex, example_loss, evaluate, describe, new_modules, grad_check):
@@ -247,13 +120,14 @@ def fit(args, rnr, train_ex, example_loss, evaluate, describe, new_modules, grad
     step, t0 = 0, time.time()
     for epoch in range(args.epochs):
         order = rng.permutation(len(train_ex))
-        for b in range(0, len(order) - args.batch + 1, args.batch):
+        batch = min(args.batch, len(train_ex))
+        for b in range(0, len(order) - batch + 1, batch):
             opt.zero_grad()
             batch_loss = 0.0
-            for j in order[b:b + args.batch]:            # gradient accumulation over the batch
+            for j in order[b:b + batch]:                 # gradient accumulation over the batch
                 loss = example_loss(train_ex[j], True)[0]
-                (loss / args.batch).backward()
-                batch_loss += loss.item() / args.batch
+                (loss / batch).backward()
+                batch_loss += loss.item() / batch
             if step == 0:
                 what, params = grad_check
                 if all(p.grad is None for p in params):
@@ -303,14 +177,19 @@ def train_hash(args):
 
     if task == "regression":
         mu, sd = float(y[tr].mean()), float(y[tr].std()) or 1.0
-    rnr = Evo2Runner(args)
+    if args.mock_evo2:
+        rnr = MockEvo2Runner(args.mock_hidden, args.mock_layers, args.train_blocks, args.device, args.seed)
+        tokenize = lambda h: list(h.encode())
+    else:
+        rnr = Evo2Runner(args.evo2_model, args.layer, args.train_blocks, args.embed_module)
+        tokenize = rnr.evo.tokenizer.tokenize
     dev = rnr.dev
     head = nn.Sequential(nn.LayerNorm(rnr.hidden_out),
                          nn.Linear(rnr.hidden_out, 1 if task == "regression" else len(classes))).to(dev)
 
     def encode(h, train_mode):
         """Mean of Evo 2's --layer output over every token (bit) of the hash."""
-        ids = torch.tensor(rnr.evo.tokenizer.tokenize(h), dtype=torch.int, device=dev)
+        ids = torch.tensor(tokenize(h), dtype=torch.int, device=dev)
         starts = np.arange(0, len(ids), args.hash_window)
         if args.hash_max_windows and len(starts) > args.hash_max_windows:
             starts = (np.sort(rng.choice(starts, args.hash_max_windows, replace=False)) if train_mode
@@ -359,13 +238,14 @@ def train_hash(args):
 
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_") or "phenotype"
     out = args.out or os.path.join(os.path.dirname(os.path.abspath(args.hash_pheno)), f"evo2_hash_{safe}.pt")
+    trained = rnr.net.state_dict() if args.mock_evo2 else dict(rnr.trainable)
     torch.save({
-        "mode": "hash", "evo2_model": args.evo2_model, "layer": args.layer, "task": task,
+        "mode": "hash", "backend": rnr.backend, "evo2_model": args.evo2_model, "layer": args.layer, "task": task,
         "phenotype": name, "classes": None if classes is None else classes.tolist(),
         "target_mean": mu if task == "regression" else None,
         "target_std": sd if task == "regression" else None,
         "hash_window": args.hash_window,
-        "trained_blocks": {n: p.detach().cpu() for n, p in rnr.trainable},
+        "trained_blocks": {n: p.detach().cpu() for n, p in trained.items()},
         "head": head.state_dict(), "val_rows": val.tolist(),
         "metrics": {"before": before, "after": after}, "config": config_of(args),
     }, out)
@@ -374,10 +254,19 @@ def train_hash(args):
 
 # ===========================================================================
 
-def main():
+def write_test_tsv(path, n=60, bits=48, seed=0):
+    """Synthetic hash-phenotype TSV: the phenotype is the number of 1s in the first 8 bits + noise."""
+    rng = np.random.default_rng(seed)
+    with open(path, "w") as f:
+        f.write("hash\theight\n")
+        for _ in range(n):
+            h = rng.integers(0, 2, bits)
+            f.write("".join(map(str, h)) + f"\t{160 + 4 * h[:8].sum() + rng.normal(0, 2):.1f}\n")
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--hash-pheno", required=True,
-                    help="TSV with 2 columns: genomic hash (0/1 string), phenotype")
+    ap.add_argument("--hash-pheno", help="TSV with 2 columns: genomic hash (0/1 string), phenotype")
     ap.add_argument("--task", choices=["auto", "regression", "classification"], default="auto")
     ap.add_argument("--hash-window", type=int, default=4096, help="bits (tokens) per Evo 2 forward pass")
     ap.add_argument("--hash-max-windows", type=int, default=0,
@@ -387,6 +276,11 @@ def main():
     e.add_argument("--evo2-model", default="evo2_7b_base", help="evo2_7b_base (8K ctx) or evo2_7b")
     e.add_argument("--layer", default="blocks.28.mlp.l3", help="read-out layer; forward stops here")
     e.add_argument("--embed-module", help="name of Evo 2's token embedding module (auto-detected)")
+    e.add_argument("--mock-evo2", action="store_true",
+                   help="small CPU stand-in model instead of Evo 2, to check the script without a GPU")
+    e.add_argument("--mock-hidden", type=int, default=64)
+    e.add_argument("--mock-layers", type=int, default=4)
+    e.add_argument("--device", help="--mock-evo2: cpu / cuda")
     e.add_argument("--train-blocks", type=int, default=4, help="0 = Evo 2 frozen, train new layers only")
     e.add_argument("--batch", type=int, default=8, help="examples per optimizer step")
     e.add_argument("--epochs", type=int, default=1)
@@ -397,9 +291,20 @@ def main():
     e.add_argument("--log-every", type=int, default=10)
     e.add_argument("--eval-every", type=int, default=200)
     e.add_argument("--seed", type=int, default=0)
-    args = ap.parse_args()
+    ap.add_argument("--test", action="store_true", help="self-test on a synthetic TSV with --mock-evo2 (CPU)")
+    args = ap.parse_args(argv)
+    if args.test:
+        args.hash_pheno = str(test_workdir("hash") / "hash_height.tsv")
+        write_test_tsv(args.hash_pheno)
+        args.mock_evo2, args.device, args.mock_hidden, args.mock_layers = True, "cpu", 32, 2
+        args.train_blocks, args.batch, args.epochs, args.log_every, args.hash_window = 1, 8, 3, 5, 32
+    if not args.hash_pheno:
+        ap.error("--hash-pheno is required")
     if not os.path.exists(args.hash_pheno):
-        raise SystemExit(f"{args.hash_pheno} not found")
+        die(f"{args.hash_pheno} not found")
+    for name in ("hash_window", "batch", "epochs", "val_examples", "log_every", "eval_every"):
+        if getattr(args, name) < 1:
+            die(f"--{name.replace('_', '-')} must be >= 1")
     train_hash(args)
     log("done.")
 

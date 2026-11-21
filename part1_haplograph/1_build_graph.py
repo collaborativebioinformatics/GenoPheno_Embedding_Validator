@@ -1,11 +1,15 @@
 """
-Step 1 of 5 - build the haplograph: GENOME-WIDE by default (chr1-chr22 merged into one graph),
-or for selected chromosomes only (--chroms). With --train-individuals, everything the graph is made
-of (edge weights, support, lift) is computed from the TRAINING individuals only, so a held-out test
-set (e.g. BH_26 half_B) never influences the graph or anything trained on it.
+Step 1 - build the haplograph: GENOME-WIDE by default (all chromosomes downloaded by
+download_haplograph.py, merged into one graph), or for selected chromosomes only (--chroms). Edge
+weights, support and lift are computed from the TRAINING individuals only (the training set written
+by download_haplograph.py, or --train-individuals), so the held-out test set never influences the
+graph or anything trained on it.
 
-INPUT  (downloaded from https://data.haploblocks.org/haplograph/1000G/<chrom>/, or read from
-        --local-dir/<chrom>/ if you already have them)
+INPUT  (written by download_haplograph.py into --workdir, default haplograph/)
+  raw/<chrom>/   the haplograph files of each chromosome (see below); --raw-dir to read them elsewhere
+  splits/train_individuals.txt, splits/test_individuals.txt, splits/split.json   the train/test split
+                 (used by default; --train-individuals overrides the train file, --no-split builds
+                 the graph from all individuals)
   nodes.csv.gz   gzipped CSV, one row per haploblock cluster (= graph node):
                    id             cluster id "<chrom>_<start>-<end>_cluster<N>",
                                   e.g. chr21_14215892-14284114_cluster1
@@ -17,13 +21,13 @@ INPUT  (downloaded from https://data.haploblocks.org/haplograph/1000G/<chrom>/, 
                    weight          int, number of individuals carrying both clusters
                  (--edges lift5 reads edges_lift_above_threshold.csv.gz instead: same columns
                   plus a lift column, only pairs with lift >= 5; ~16 MB instead of ~1 GB)
-  --train-individuals FILE_OR_URL   (optional) training individuals: plain text, one sample ID per
-                 line, no header ('#' = comment), or a CSV with an "individual" column; e.g.
-                 https://data.haploblocks.org/BH_26/splits/half_A.txt (1,252 1000G sample IDs)
+  --train-individuals FILE_OR_URL   (optional) training individuals instead of the split's: plain
+                 text, one sample ID per line, no header ('#' = comment), or a CSV with an
+                 "individual" column; e.g. https://data.haploblocks.org/BH_26/splits/half_A.txt
   --sample-map CSV   (optional) only if nodes.csv.gz names individuals differently from the train
                  file (e.g. IND1 vs HG00096): 2 columns, graph name, sample ID
 
-TRAIN-ONLY MODE (--train-individuals)
+TRAIN-ONLY MODE (the default whenever a training set is available)
   - edge weight = number of TRAINING individuals carrying both clusters, recomputed from the
     carrier columns for every pair listed in the edges file (the file's own weight, computed over
     all individuals, is not used); pairs no training individual shares are dropped
@@ -33,7 +37,7 @@ TRAIN-ONLY MODE (--train-individuals)
     already saw the test set (the script warns)
 
 OUTPUT (in --out; default <workdir>/genome, <workdir>/<chrA>_<chrB>... for a selection, plus
-        _train_<train file name> in train-only mode, e.g. haplograph/genome_train_half_A)
+        _train_<split name> in train-only mode, e.g. haplograph/genome_train_half_A)
   nodes.csv.gz     gzipped CSV, N rows; row i describes node i in every other file:
                      node     int, 0..N-1
                      id       cluster id
@@ -45,7 +49,9 @@ OUTPUT (in --out; default <workdir>/genome, <workdir>/<chrA>_<chrB>... for a sel
   individuals.txt  I lines, one individual (column name of nodes.csv.gz) per line; column j of
                    carriers.npz is line j. Same order for every chromosome.
   train_individuals.txt  (train-only mode) the training individuals found in the graph, one per
-                   line, using the names of individuals.txt. Steps 2-4a read it automatically.
+                   line, using the names of individuals.txt. Steps 3-4 read it automatically.
+  test_individuals.txt  (when the split has a test file) the test individuals found in the graph;
+                   only step 5 reads it.
   carriers.npz     scipy.sparse CSR, uint8, shape [N, I]; 1 = individual carries the cluster
   graph.npz        scipy.sparse CSR, float32, shape [N, N]; symmetric, zero diagonal;
                    value = log(1 + lift), lift = weight / (support_A * support_B / n),
@@ -57,28 +63,28 @@ OUTPUT (in --out; default <workdir>/genome, <workdir>/<chrA>_<chrB>... for a sel
   Load with:  scipy.sparse.load_npz("graph.npz"),  pandas.read_csv("nodes.csv.gz")
 
 Parsed chromosomes are cached in <workdir>/parts/<chrom>/ (an interrupted genome-wide run resumes
-where it stopped, and a later selection reuses them); raw downloads go to <workdir>/raw/<chrom>/.
+where it stopped, and a later selection reuses them).
 
 USAGE
-  python 1_build_graph.py                                  # whole genome -> haplograph/genome
-  python 1_build_graph.py --chroms chr21,chr22             # -> haplograph/chr21_chr22
-  python 1_build_graph.py --train-individuals https://data.haploblocks.org/BH_26/splits/half_A.txt
-                                                           # -> haplograph/genome_train_half_A
+  python download_haplograph.py && python 1_build_graph.py # whole genome -> haplograph/genome_train_half_A
+  python 1_build_graph.py --chroms chr21,chr22             # -> haplograph/chr21_chr22_train_half_A
+  python 1_build_graph.py --train-individuals my_train.txt # -> haplograph/genome_train_my_train
+  python 1_build_graph.py --no-split                       # all individuals -> haplograph/genome
   python 1_build_graph.py --edges lift5                    # small pre-filtered edge files
+  python 1_build_graph.py --test                           # synthetic data, a few seconds on CPU
 
-REQUIRES  numpy, pandas, scipy
+REQUIRES  numpy, pandas, scipy.  Run download_haplograph.py first.
           optional: RAPIDS cuDF (pip install cudf-cu12) for --cudf, which runs the pandas parts (reading
           and matching nodes/edges) on the GPU; add --chunksize 0 so the edge files are parsed on the GPU too
 """
 import argparse
-import hashlib
 import json
 import os
 import re
-import time
-import urllib.request
-
+import shutil
 import sys
+import time
+from pathlib import Path
 
 if "--cudf" in sys.argv:
     # GPU dataframes: cuDF's pandas accelerator must be switched on BEFORE pandas is imported.
@@ -93,81 +99,20 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
-BASE_URL = "https://data.haploblocks.org/haplograph/1000G"
-ALL_CHROMS = [f"chr{i}" for i in range(1, 23)]  # chrX/chrY are not in the dataset
-REGION_RE = re.compile(r"^(?P<chrom>.+)_(?P<start>\d+)-(?P<end>\d+)$")
+from haplo_common import (ALL_CHROMS, REGION_RE, chrom_key, die, load_sample_map, log,
+                          parse_chroms, read_individual_list, set_id,
+                          test_workdir)
+
 OUTPUTS = ("nodes.csv.gz", "individuals.txt", "carriers.npz", "graph.npz", "graph_info.json")
-
-
-def log(msg=""):
-    print(msg, flush=True)
-
-
-def chrom_key(c):
-    m = re.fullmatch(r"chr(\d+)", c)
-    return (0, int(m.group(1)), "") if m else (1, 0, c)
-
-
-# ---------------------------------------------------------------------------
-# Download and individual lists
-# ---------------------------------------------------------------------------
-
-def download(url, dest):
-    if os.path.exists(dest):
-        return dest
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    log(f"  downloading {url}")
-    tmp = dest + ".part"
-
-    def hook(blocks, bs, total):
-        if total > 0:
-            sys.stdout.write(f"\r    {min(blocks * bs, total) / 1e6:9.1f} / {total / 1e6:.1f} MB")
-            sys.stdout.flush()
-
-    urllib.request.urlretrieve(url, tmp, reporthook=hook)
-    os.replace(tmp, dest)
-    log()
-    return dest
+EDGE_FILE = {"all": "edges.csv.gz", "lift5": "edges_lift_above_threshold.csv.gz"}
 
 
 def raw_file(args, chrom, name):
-    """Use <local-dir>/<chrom>/<name> if present, otherwise download into <workdir>/raw/<chrom>/."""
-    if args.local_dir:
-        p = os.path.join(args.local_dir, chrom, name)
-        if os.path.exists(p):
-            return p
-    return download(f"{BASE_URL}/{chrom}/{name}", os.path.join(args.workdir, "raw", chrom, name))
-
-
-def is_url(p):
-    return str(p).startswith(("http://", "https://"))
-
-
-def read_individual_list(src, cache_dir):
-    """Plain text (one ID per line, '#' comments) or CSV with an 'individual' column; file or URL."""
-    if is_url(src):
-        src = download(src, os.path.join(cache_dir, os.path.basename(src.rstrip("/"))))
-    elif not os.path.exists(src):
-        raise SystemExit(f"file not found: {src}")
-    if src.endswith((".csv", ".csv.gz")):
-        df = pd.read_csv(src, dtype=str)
-        col = "individual" if "individual" in df.columns else df.columns[0]
-        return [x.strip() for x in df[col].dropna()]
-    out = []
-    with open(src) as f:
-        for line in f:
-            line = line.split("#", 1)[0].strip()
-            if line:
-                out.append(line.split()[0])
-    return out
-
-
-def load_sample_map(path):
-    """CSV with 2 columns (graph individual name, sample ID) -> {sample ID: graph name}."""
-    m = pd.read_csv(path, dtype=str)
-    if m.shape[1] < 2:
-        raise SystemExit(f"{path}: --sample-map needs 2 columns (graph name, sample ID)")
-    return dict(zip(m.iloc[:, 1].str.strip(), m.iloc[:, 0].str.strip()))
+    p = Path(args.raw_dir) / chrom / name
+    if not p.exists():
+        die(f"{p} not found - download it first: python download_haplograph.py --chroms {chrom}"
+            + (" --edges lift5" if name.startswith("edges_lift") else ""))
+    return str(p)
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +155,8 @@ def shared_carriers(packed, s, t, block=1_000_000):
 
 def read_nodes(nodes_path, chunksize=20_000):
     header = pd.read_csv(nodes_path, nrows=0).columns.tolist()
+    if header[:2] != ["id", "high_dim_edge"]:
+        die(f"{nodes_path}: expected columns id, high_dim_edge, <individuals>; got {header[:3]}")
     inds = [c for c in header if c not in ("id", "high_dim_edge")]
     dtypes = {c: np.uint8 for c in inds}
     dtypes.update({"id": str, "high_dim_edge": str})
@@ -220,7 +167,7 @@ def read_nodes(nodes_path, chunksize=20_000):
         blocks.append(sp.csr_matrix(chunk[inds].to_numpy(dtype=np.uint8)))
     ids = np.concatenate(ids)
     if len(pd.unique(ids)) != len(ids):
-        raise ValueError(f"{nodes_path}: duplicate cluster ids")
+        die(f"{nodes_path}: duplicate cluster ids")
     return ids, np.concatenate(regions), sp.vstack(blocks).tocsr(), inds
 
 
@@ -257,7 +204,7 @@ def chrom_part(args, chrom, train_names=None, train_tag=""):
     Returns ids, regions, carriers (all individuals), individual names, edges, lift, train support, status."""
     d = os.path.join(args.workdir, "parts", chrom)
     os.makedirs(d, exist_ok=True)
-    edges_name = "edges_lift_above_threshold.csv.gz" if args.edges == "lift5" else "edges.csv.gz"
+    edges_name = EDGE_FILE[args.edges]
     f_meta, f_car = os.path.join(d, "nodes.npz"), os.path.join(d, "carriers.npz")
     tag = f"_train-{train_tag}" if train_tag else ""
     f_edges = os.path.join(d, f"edges_{args.edges}_minlift{args.min_lift:g}{tag}.npz")
@@ -275,7 +222,7 @@ def chrom_part(args, chrom, train_names=None, train_tag=""):
     if train_names is not None:
         cols = [j for j, c in enumerate(inds) if c in train_names]
         if not cols:
-            raise SystemExit(f"{chrom}: none of the training individuals match the columns of nodes.csv.gz "
+            die(f"{chrom}: none of the training individuals match the columns of nodes.csv.gz "
                              f"(e.g. {inds[:2]}); pass --sample-map (CSV: graph name, sample ID)")
         C_train = carriers[:, cols]
     else:
@@ -308,13 +255,18 @@ def build(args):
         return
     os.makedirs(out, exist_ok=True)
 
-    train_names, train_tag = None, ""
+    train_names, train_tag, test_names = None, "", None
+    to_graph = load_sample_map(args.sample_map) if args.sample_map else {}
     if args.train_individuals:
-        raw = read_individual_list(args.train_individuals, os.path.join(args.workdir, "raw", "splits"))
-        to_graph = load_sample_map(args.sample_map) if args.sample_map else {}
+        raw = read_individual_list(args.train_individuals, os.path.join(args.workdir, "splits"))
         train_names = {to_graph.get(x, x) for x in raw}
-        train_tag = hashlib.sha1("\n".join(sorted(train_names)).encode()).hexdigest()[:8]
+        train_tag = set_id(train_names)
         log(f"train-only mode: {len(raw):,} training individuals from {args.train_individuals}")
+        if args.test_individuals:
+            test_names = {to_graph.get(x, x) for x in read_individual_list(args.test_individuals)}
+            overlap = train_names & test_names
+            if overlap:
+                die(f"{len(overlap):,} individuals are in both the train and the test set (e.g. {sorted(overlap)[:3]})")
         if args.edges == "lift5":
             log("  warning: the lift5 edge file was pre-filtered on ALL individuals (incl. the test set); "
                 "use --edges all for a strictly train-only graph")
@@ -330,7 +282,7 @@ def build(args):
             ref_inds = inds
         elif inds != ref_inds:
             if set(inds) != set(ref_inds):
-                raise ValueError(f"{chrom}: individual columns differ from {chroms[0]}")
+                die(f"{chrom}: individual columns differ from {chroms[0]}")
             pos = {c: j for j, c in enumerate(inds)}
             carriers = carriers[:, [pos[c] for c in ref_inds]].tocsr()
         ids_all.append(ids); regions_all.append(regions); chrom_all.append(np.full(len(ids), chrom))
@@ -365,12 +317,15 @@ def build(args):
     with open(os.path.join(out, "individuals.txt"), "w") as f:
         f.write("\n".join(ref_inds))
     train_in_graph = [x for x in ref_inds if train_names is not None and x in train_names]
-    train_file = os.path.join(out, "train_individuals.txt")
-    if train_names is not None:
-        with open(train_file, "w") as f:
-            f.write("\n".join(train_in_graph) + "\n")
-    elif os.path.exists(train_file):
-        os.remove(train_file)               # a rebuild without a train set must not leave a stale one
+    test_in_graph = [x for x in ref_inds if test_names is not None and x in test_names]
+    for name, members, used in (("train_individuals.txt", train_in_graph, train_names is not None),
+                                ("test_individuals.txt", test_in_graph, test_names is not None)):
+        path = os.path.join(out, name)
+        if used:
+            with open(path, "w") as f:
+                f.write("\n".join(members) + "\n")
+        elif os.path.exists(path):
+            os.remove(path)                 # a rebuild without a split must not leave a stale one
     sp.save_npz(os.path.join(out, "carriers.npz"), carriers)
     sp.save_npz(os.path.join(out, "graph.npz"), A)
     deg = np.diff(A.indptr)
@@ -382,26 +337,66 @@ def build(args):
         info.update({"train_individuals_source": args.train_individuals,
                      "train_individuals_in_file": len(train_names),
                      "train_individuals_in_graph": len(train_in_graph),
-                     # same id as computed by steps 2-4a from train_individuals.txt
-                     "train_set_id": hashlib.sha1("\n".join(sorted(train_in_graph)).encode()).hexdigest()[:8]})
+                     # same id as computed by steps 3-4 from train_individuals.txt
+                     "train_set_id": set_id(train_in_graph)})
+    if test_names is not None:
+        info.update({"test_individuals_source": args.test_individuals,
+                     "test_individuals_in_graph": len(test_in_graph), "test_set_id": set_id(test_in_graph)})
     with open(os.path.join(out, "graph_info.json"), "w") as f:
         json.dump(info, f, indent=2)
     log(f"  graph: {n:,} nodes, {A.nnz // 2:,} edges, {len(ref_inds):,} individuals"
         + (f" ({len(train_in_graph):,} used for training)" if train_names is not None else "")
+        + (f", {len(test_in_graph):,} held out for testing" if test_names is not None else "")
         + f", mean degree {deg.mean():.1f}, isolated {int((deg == 0).sum()):,}")
     if train_names is not None and len(train_in_graph) < len(train_names):
         log(f"  warning: {len(train_names) - len(train_in_graph):,} training IDs are not in the graph")
 
 
-def main():
+def resolve_split(args):
+    """Default training/test sets: the split written by download_haplograph.py (--workdir/splits)."""
+    split_json = Path(args.workdir) / "splits" / "split.json"
+    args.split_name = None
+    if args.no_split:
+        args.train_individuals = args.test_individuals = None
+        return
+    if args.train_individuals:
+        args.split_name = re.sub(r"\.(txt|csv|tsv)(\.gz)?$", "", os.path.basename(args.train_individuals.rstrip("/")))
+        return
+    if not split_json.exists():
+        die(f"no train/test split in {split_json.parent} - run download_haplograph.py first, pass "
+            "--train-individuals, or use --no-split to build the graph from all individuals")
+    info = json.loads(split_json.read_text())
+    args.train_individuals = str(split_json.parent / info["train_file"])
+    args.test_individuals = args.test_individuals or str(split_json.parent / info["test_file"])
+    args.split_name = info.get("name", "split")
+
+
+def run_self_test(args):
+    """Synthetic 2-chromosome haplograph -> graph, on CPU, in a few seconds."""
+    import download_haplograph
+    wd = test_workdir("build_graph")
+    download_haplograph.main(["--test"])                   # writes <tmp>/haplograph_selftest/download
+    src = wd.parent / "download"
+    shutil.copytree(src, wd, dirs_exist_ok=True)
+    args.workdir, args.raw_dir, args.chroms, args.min_lift, args.force = str(wd), str(wd / "raw"), None, 1.2, True
+    args.train_individuals = args.test_individuals = None
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--chroms", help="comma-separated selection, e.g. chr21,chr22 (default: whole genome)")
-    ap.add_argument("--workdir", default="haplograph", help="root folder for downloads, cache and graphs")
+    ap.add_argument("--chroms", help="comma-separated selection, e.g. chr21,chr22 (default: every downloaded chromosome)")
+    ap.add_argument("--workdir", default="haplograph", help="root folder of download_haplograph.py (raw/, splits/); "
+                                                            "the graph and cache are written here too")
+    ap.add_argument("--raw-dir", help="folder with <chrom>/nodes.csv.gz etc. (default <workdir>/raw)")
     ap.add_argument("--out", help="output folder (default <workdir>/genome or <workdir>/<chroms>, "
-                                  "+ _train_<name> in train-only mode)")
+                                  "+ _train_<split name> in train-only mode)")
     ap.add_argument("--train-individuals",
-                    help="file or URL of training individuals (e.g. BH_26 half_A.txt); "
+                    help="file or URL of training individuals (default: <workdir>/splits/train_individuals.txt); "
                          "edge weights, support and lift are computed from them only")
+    ap.add_argument("--test-individuals",
+                    help="file of test individuals, copied into the graph folder for step 5 "
+                         "(default: <workdir>/splits/test_individuals.txt)")
+    ap.add_argument("--no-split", action="store_true", help="build the graph from ALL individuals (no train/test split)")
     ap.add_argument("--sample-map", help="CSV: graph individual name, sample ID (if they differ)")
     ap.add_argument("--edges", choices=["all", "lift5"], default="all",
                     help="all = edges.csv.gz (~1 GB per chromosome); lift5 = pre-filtered lift>=5 file")
@@ -409,20 +404,28 @@ def main():
     ap.add_argument("--chunksize", type=int, default=2_000_000,
                     help="edge rows read at a time; 0 = whole file at once (with --cudf, chunked reading "
                          "runs on the CPU, so 0 puts the parsing on the GPU if the file fits in GPU memory)")
-    ap.add_argument("--local-dir", help="folder with already-downloaded <chrom>/nodes.csv.gz etc.")
     ap.add_argument("--force", action="store_true", help="re-parse cached chromosomes and rebuild")
     ap.add_argument("--cudf", action="store_true",
                     help="run the pandas parts (reading and matching nodes/edges) on the GPU with RAPIDS cuDF")
-    args = ap.parse_args()
+    ap.add_argument("--test", action="store_true", help="self-test on a small synthetic haplograph")
+    args = ap.parse_args(argv)
 
-    if args.chroms:
-        args.chroms = [c.strip() for c in args.chroms.split(",") if c.strip()]
-        name = "_".join(sorted(set(args.chroms), key=chrom_key))
-    else:
-        args.chroms, name = ALL_CHROMS, "genome"
-    if args.train_individuals:
-        stem = re.sub(r"\.(txt|csv|tsv)(\.gz)?$", "", os.path.basename(args.train_individuals.rstrip("/")))
-        name += f"_train_{re.sub(r'[^A-Za-z0-9._-]+', '_', stem)}"
+    if args.test:
+        run_self_test(args)
+    args.raw_dir = args.raw_dir or os.path.join(args.workdir, "raw")
+    if not os.path.isdir(args.raw_dir):
+        die(f"{args.raw_dir} not found - run download_haplograph.py first (or pass --raw-dir)")
+    resolve_split(args)
+
+    downloaded = sorted((p.name for p in Path(args.raw_dir).iterdir() if (p / "nodes.csv.gz").exists()),
+                        key=chrom_key)
+    args.chroms = parse_chroms(args.chroms) or [c for c in ALL_CHROMS if c in downloaded] or downloaded
+    if not args.chroms:
+        die(f"no <chrom>/nodes.csv.gz in {args.raw_dir} - run download_haplograph.py first")
+    genome_wide = set(args.chroms) == set(ALL_CHROMS)
+    name = "genome" if genome_wide else "_".join(args.chroms)
+    if args.split_name:
+        name += f"_train_{re.sub(r'[^A-Za-z0-9._-]+', '_', args.split_name)}"
     args.out = args.out or os.path.join(args.workdir, name)
     build(args)
     log("done.")

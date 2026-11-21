@@ -1,55 +1,66 @@
 """
-Step 3 of 4 - node embeddings for the graph built by 1_build_graph.py (genome-wide, or whichever
-chromosome selection that graph was built from). One model is trained on the whole graph.
+Step 3 - node embeddings for the graph built by 1_build_graph.py (genome-wide, or whichever
+chromosome selection that graph was built from), with node2vec, a GNN and XGBoost. One model per
+method is trained on the whole graph. No phenotype or ancestry labels are used.
 
-METHODS (--method)
+TRAINING INDIVIDUALS  carrier-profile features (gnn, xgboost) use only these individuals, so the
+held-out test set never shapes the embeddings: --train-individuals FILE_OR_URL if given, else
+<graph-dir>/train_individuals.txt (written by 1_build_graph.py), else all individuals. The graph
+itself (node2vec) is train-only when step 1 was run with a training set.
+
+METHODS (--method, default all three; or a comma-separated subset)
   node2vec  Uses the graph only. Biased random walks (return parameter --p, in-out parameter --q,
             edge weights = log(1 + lift) unless --n2v-unweighted), then skip-gram with negative
             sampling, so nodes that appear close together on walks get similar vectors.
   gnn       Uses the graph + node features. 2-layer GCN trained as a graph autoencoder (link
             reconstruction with negative sampling). Node features = SVD of the carrier matrix.
-  xgboost   Uses the graph + node features + ancestry labels (2_ancestry_labels.py). XGBoost
-            predicts each node's ancestry label from [own carrier profile, neighbourhood-averaged
-            profile over the graph]; the leaves each node falls into (across all trees) are one-hot
-            encoded and compressed with SVD.
-            Memory-bounded for large graphs: trains on at most --xgb-train-nodes labelled nodes
+  xgboost   Uses the graph + node features, self-supervised: XGBoost predicts each node's
+            HAPLOBLOCK REGION (regions in genomic order, grouped into --xgb-region-bins bins of about
+            equal node count; with more bins than regions every region is its own class) from
+            [own carrier profile, neighbourhood-averaged profile over the graph]. The leaves each
+            node falls into (across all trees) are one-hot encoded and compressed with SVD.
+            Memory-bounded for large graphs: trains on at most --xgb-train-nodes nodes
             (compressed QuantileDMatrix), fits the leaf SVD on --xgb-svd-nodes sampled nodes, then
             embeds all nodes in chunks of --chunk-nodes (embedding = one-hot leaves @ SVD basis,
-            identical to the SVD scores on the sampled nodes). Still OOM? Lower those three
-            options, --xgb-max-bin, or --xgb-trees, or use --device cpu.
+            identical to the SVD scores on the sampled nodes). The number of trees is
+            --xgb-trees x number of bins. Still out of memory? Lower those options, --xgb-max-bin,
+            --xgb-region-bins, --xgb-trees or --xgb-depth.
 
-RAPIDS:
-
-*I haved added RAPIDS, I have put an instruction list on how to download it and ensure the dependencies are correct.*
+GPU  torch (node2vec, gnn) and XGBoost use CUDA when available (--device to force). --rapids moves
+     the two SVDs (carrier features and leaf basis) to the GPU with RAPIDS cuML + CuPy: the carrier
+     SVD is fitted on --rapids-fit-rows sampled rows and applied in --rapids-chunk chunks, an
+     approximation (on the genome run: val accuracy 0.986 vs 0.992 exact); raise --rapids-fit-rows
+     to close the gap.
 
 Note: the data has only within-chromosome edges, so a genome-wide graph is one disconnected block
 per chromosome. node2vec walks never leave their chromosome, so node2vec vectors are comparable
 within a chromosome but their relative placement across chromosomes is arbitrary. gnn and xgboost
 use one shared feature space (carrier profiles), so their vectors are comparable genome-wide.
 
-INPUT  (in --graph-dir, from 1_build_graph.py / 2_ancestry_labels.py)
+INPUT  (in --graph-dir, from 1_build_graph.py)
   graph.npz        scipy.sparse CSR float32 [N, N], symmetric adjacency      (all methods)
+  individuals.txt  I lines, one individual per line (columns of carriers.npz)
+  train_individuals.txt  (optional) training individuals, one per line (from step 1)
   carriers.npz     scipy.sparse CSR uint8 [N, I], node x individual carriers  (gnn, xgboost)
-  labels.npz       labels int64 [N] (index into classes, -1 = unlabelled),
-                   classes str [P]                                            (xgboost)
-  nodes.csv.gz     node, id, chrom, ...                                       (only for --csv)
+  nodes.csv.gz     node, id, chrom, region, start, ...                        (xgboost, --csv)
 
 OUTPUT (in --graph-dir)
   node_emb_<method>.npy       float32 [N, --dim]; row i = embedding of node i in nodes.csv.gz
                               load with numpy.load("node_emb_gnn.npy")
-  node_emb_<method>.json      method, dim, settings and training summary
+  node_emb_<method>.json      method, dim, settings, training summary, and the training set used
+                              (train_source, n_train, train_set_id)
   node_emb_<method>.csv.gz    (with --csv) gzipped CSV: id, chrom, e0 ... e<dim-1>
-  features_svd<k>.npy         cached SVD carrier features float32 [N, k]      (gnn, xgboost)
+  features_svd<k>_<set id>[_rapids].npy  cached SVD carrier features float32 [N, k] (gnn, xgboost)
 
 USAGE
-  python 3_node_embeddings.py --method node2vec
-  python 3_node_embeddings.py --method gnn
-  python 3_node_embeddings.py --method xgboost --graph-dir haplograph/chr21_chr22 --csv
-  python 3_node_embeddings.py --method xgboost --graph-dir haplograph/genome --device cuda --rapids
+  python 3_node_embeddings.py --graph-dir haplograph/genome_train_half_A            # all three
+  python 3_node_embeddings.py --method gnn --graph-dir haplograph/genome_train_half_A
+  python 3_node_embeddings.py --method xgboost --graph-dir haplograph/chr21_chr22_train_half_A --csv
+  python 3_node_embeddings.py --method xgboost --graph-dir $G --device cuda --rapids  # GPU SVD (RAPIDS)
+  python 3_node_embeddings.py --test                                                # synthetic, CPU
 
 REQUIRES  numpy, pandas, scipy; torch (node2vec, gnn); xgboost (xgboost);
-          cudf, cuml, cupy (only for --rapids).
-          Run 1_build_graph.py first, and 2_ancestry_labels.py for xgboost.
+          cuml + cupy (only for --rapids, see DOCUMENTATION.md). Run 1_build_graph.py first.
 """
 import argparse
 import json
@@ -61,67 +72,59 @@ import pandas as pd
 import scipy.sparse as sp
 from scipy.sparse.linalg import svds
 
-# module-level switch, set from args in embed_xgboost / embed_gnn so the small helpers
-# (leaf_basis) can see whether RAPIDS is requested without threading args through.
-_RAPIDS = [False]
-_RAPIDS_FIT_ROWS = [150_000]
-_RAPIDS_CHUNK = [200_000]
+from haplo_common import (chrom_key, die, log, read_graph_individuals, require_files, selftest_graph_dir,
+                          torch_device, train_columns)
 
-
-def log(msg=""):
-    print(msg, flush=True)
+METHODS = ("node2vec", "gnn", "xgboost")
 
 
 def gfile(args, name):
     return os.path.join(args.graph_dir, name)
 
 
-def require(args, *names, hint):
-    missing = [n for n in names if not os.path.exists(gfile(args, n))]
-    if missing:
-        raise SystemExit(f"missing {', '.join(missing)} in {args.graph_dir} - run {hint} first")
-
-
-def torch_device(name=None):
-    import torch
-    return torch.device(name or ("cuda" if torch.cuda.is_available() else "cpu"))
-
-
 # ---------------------------------------------------------------------------
-# RAPIDS (cuML) GPU SVD helpers
+# SVD: scipy on CPU, or RAPIDS cuML on the GPU (--rapids)
 # ---------------------------------------------------------------------------
+
+def import_rapids():
+    try:
+        import cupy  # noqa: F401
+        from cuml.decomposition import TruncatedSVD  # noqa: F401
+    except ImportError as e:
+        die(f"--rapids needs RAPIDS cuML and CuPy ({e}); see DOCUMENTATION.md, or run without --rapids")
+
 
 def gpu_svd_tall(M, k, seed=0, fit_rows=150_000, chunk=200_000):
-    """RAPIDS cuML TruncatedSVD, VRAM-safe for a TALL sparse M [n, d] (d small):
-    fit on a dense row sample, then project every row through the components in dense chunks.
-    Returns (scores U*S [n, k], S [k], Vt [k, d]) ordered largest component first,
-    matching how scipy.svds output is consumed downstream.
-    cuML TruncatedSVD needs dense input, so only densify sample / chunk slices, never all of M."""
+    """cuML TruncatedSVD for a TALL sparse M [n, d] (d small), VRAM-safe: fit on a dense row sample,
+    then project every row through the components in dense chunks. cuML needs dense input, so only
+    the sample / chunk slices are densified. Returns scores U*S [n, k], largest component first."""
     import cupy as cp
     from cuml.decomposition import TruncatedSVD
     n = M.shape[0]
     rng = np.random.default_rng(seed)
     samp = np.sort(rng.choice(n, min(n, fit_rows), replace=False))
     svd = TruncatedSVD(n_components=k, random_state=seed)
-    svd.fit(cp.asarray(M[samp].toarray().astype("float32")))     # dense sample on GPU
-    S = cp.asnumpy(svd.singular_values_)
-    order = np.argsort(S)[::-1]
+    svd.fit(cp.asarray(M[samp].toarray().astype("float32")))
+    order = np.argsort(cp.asnumpy(svd.singular_values_))[::-1]
     Vo = cp.asarray(svd.components_)[cp.asarray(order)]           # [k, d], largest first
     scores = np.empty((n, k), dtype="float32")
     for b in range(0, n, chunk):
         Xb = cp.asarray(M[b:b + chunk].toarray().astype("float32"))
         scores[b:b + chunk] = cp.asnumpy(Xb @ Vo.T)              # U*S = X @ V^T
-    return scores, S[order], cp.asnumpy(Vo).astype("float32")
+    return scores
 
 
-def gpu_svd_small(M, k, seed=0):
-    """RAPIDS cuML TruncatedSVD on a SMALL matrix that fits VRAM densified in one shot.
-    Returns (S [k], Vt [k, ncols]) unsorted (caller sorts), matching svds(...) [1:] usage."""
-    import cupy as cp
-    from cuml.decomposition import TruncatedSVD
-    svd = TruncatedSVD(n_components=k, random_state=seed)
-    svd.fit(cp.asarray(M.toarray().astype("float32")))
-    return cp.asnumpy(svd.singular_values_), cp.asnumpy(svd.components_)
+def svd_basis(M, k, seed, rapids):
+    """Right singular vectors of M -> V [n_cols, k], largest component first."""
+    if rapids:
+        import cupy as cp
+        from cuml.decomposition import TruncatedSVD
+        svd = TruncatedSVD(n_components=k, random_state=seed)
+        svd.fit(cp.asarray(M.toarray().astype(np.float32)))
+        S, Vt = cp.asnumpy(svd.singular_values_), cp.asnumpy(svd.components_)
+    else:
+        _, S, Vt = svds(M, k=k, random_state=seed)
+    return Vt[np.argsort(S)[::-1]].T.astype(np.float32).copy()
 
 
 # ---------------------------------------------------------------------------
@@ -129,17 +132,19 @@ def gpu_svd_small(M, k, seed=0):
 # ---------------------------------------------------------------------------
 
 def carrier_features(args):
-    """SVD-compressed, standardized carrier profiles [N, svd_dim] (cached)."""
-    f = gfile(args, f"features_svd{args.svd_dim}.npy")
+    """SVD-compressed, standardized carrier profiles of the TRAINING individuals [N, svd_dim] (cached)."""
+    tag = "_rapids" if args.rapids else ""
+    f = gfile(args, f"features_svd{args.svd_dim}_{args.train_id}{tag}.npy")
     if os.path.exists(f) and not args.force:
         return np.load(f)
-    C = sp.load_npz(gfile(args, "carriers.npz")).astype(np.float32)
+    C = sp.load_npz(gfile(args, "carriers.npz")).tocsc()[:, args.train_idx].tocsr().astype(np.float32)
     k = min(args.svd_dim, min(C.shape) - 1)
-    log(f"  SVD of carrier matrix {C.shape} -> {k} features")
-    if getattr(args, "rapids", False):
-        log("  (RAPIDS cuML GPU SVD, sample-fit + chunked transform)")
-        X, S, _ = gpu_svd_tall(C, k, args.seed, _RAPIDS_FIT_ROWS[0], _RAPIDS_CHUNK[0])
-        X = X.astype(np.float32)
+    if k < 1:
+        die(f"carrier matrix {C.shape} is too small for an SVD")
+    log(f"  SVD of carrier matrix {C.shape} (training individuals) -> {k} features"
+        + (" on the GPU (RAPIDS cuML)" if args.rapids else ""))
+    if args.rapids:
+        X = gpu_svd_tall(C, k, args.seed, args.rapids_fit_rows, args.rapids_chunk)
     else:
         U, S, _ = svds(C, k=k, random_state=args.seed)
         X = (U * S).astype(np.float32)
@@ -296,7 +301,6 @@ def embed_gnn(args, A):
     import torch.nn as nn
     import torch.nn.functional as F
 
-    _RAPIDS[0] = getattr(args, "rapids", False)
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
     dev = torch_device(args.device)
@@ -343,7 +347,7 @@ def embed_gnn(args, A):
 
 
 # ---------------------------------------------------------------------------
-# XGBoost (leaf embeddings)
+# XGBoost (self-supervised leaf embeddings: predict the haploblock region)
 # ---------------------------------------------------------------------------
 
 def propagate(A, X):
@@ -363,23 +367,28 @@ def leaf_onehot(leaves, width):
                          shape=(n, n_trees * width))
 
 
-def leaf_basis(M, dim, seed=0):
-    """SVD of a (sampled) one-hot leaf matrix -> basis V [n_cols, k], largest component first.
-    For the sampled rows, M @ V equals the usual SVD scores U * S."""
-    k = min(dim, min(M.shape) - 1)
-    if _RAPIDS[0]:
-        S, Vt = gpu_svd_small(M, k, seed)
-    else:
-        _, S, Vt = svds(M, k=k, random_state=seed)
-    return Vt[np.argsort(S)[::-1]].T.astype(np.float32).copy()
+def region_bins(nodes, n_bins):
+    """Per-node class = genomic bin of its haploblock region. Regions are ordered by (chrom, start)
+    and cut into n_bins groups of about equal node count, never splitting a region."""
+    reg = nodes.groupby("region", sort=False).agg(chrom=("chrom", "first"), start=("start", "first"),
+                                                  n=("node", "size")).reset_index()
+    reg["ck"] = reg["chrom"].map(lambda c: chrom_key(str(c)))
+    reg = reg.sort_values(["ck", "start"], na_position="last").reset_index(drop=True)
+    before = np.concatenate([[0], np.cumsum(reg["n"].to_numpy())[:-1]])
+    reg["bin"] = (before * n_bins // max(len(nodes), 1)).astype(np.int64)
+    _, y = np.unique(nodes["region"].map(dict(zip(reg["region"], reg["bin"]))).to_numpy(), return_inverse=True)
+    return y.astype(np.int64), int(y.max()) + 1
 
 
 def embed_xgboost(args, A):
     import xgboost as xgb
-    _RAPIDS[0] = getattr(args, "rapids", False)
     rng = np.random.default_rng(args.seed)
-    lab = np.load(gfile(args, "labels.npz"), allow_pickle=True)
-    y, classes = lab["labels"], lab["classes"]
+    nodes = pd.read_csv(gfile(args, "nodes.csv.gz"), usecols=["node", "chrom", "region", "start"])
+    if len(nodes) != A.shape[0]:
+        die(f"nodes.csv.gz has {len(nodes)} rows but graph.npz has {A.shape[0]} nodes; rebuild with step 1")
+    y, n_cls = region_bins(nodes, args.xgb_region_bins)
+    if n_cls < 2:
+        die("xgboost needs at least 2 haploblock regions in the graph")
     X = carrier_features(args)
     H = propagate(A, X)                                   # graph neighbourhood average
     n = len(X)
@@ -387,35 +396,33 @@ def embed_xgboost(args, A):
     def feats(idx):                                       # own profile + neighbourhood, built per batch
         return np.hstack([X[idx], H[idx]])
 
-    labelled = np.where(y >= 0)[0]
-    rng.shuffle(labelled)
-    n_val = min(max(1, int(0.1 * len(labelled))), args.xgb_val_nodes)
-    val, tr = labelled[:n_val], labelled[n_val:n_val + args.xgb_train_nodes]
+    order = rng.permutation(n)
+    n_val = min(max(1, int(0.1 * n)), args.xgb_val_nodes)
+    val, tr = order[:n_val], order[n_val:n_val + args.xgb_train_nodes]
+    if len(tr) == 0:
+        die("too few nodes to train xgboost")
 
-    try:
-        device = "cuda" if torch_device(args.device).type == "cuda" else "cpu"
-    except ImportError:
-        device = args.device or "cpu"
+    device = "cuda" if torch_device(args.device).type == "cuda" else "cpu"
     params = {
-        "objective": "multi:softprob", "num_class": len(classes), "eval_metric": "mlogloss",
+        "objective": "multi:softprob", "num_class": n_cls, "eval_metric": "mlogloss",
         "max_depth": args.xgb_depth, "eta": 0.1, "subsample": 0.8, "colsample_bytree": 0.8,
         "tree_method": "hist", "max_bin": args.xgb_max_bin, "device": device, "seed": args.seed,
     }
-    log(f"  XGBoost on {device}: {len(tr):,} train / {len(val):,} val nodes "
-        f"(of {len(labelled):,} labelled, {n:,} total), {2 * X.shape[1]} features, "
-        f"classes {classes.tolist()}")
+    log(f"  XGBoost on {device}: {len(tr):,} train / {len(val):,} val nodes ({n:,} total), "
+        f"{2 * X.shape[1]} features, target = haploblock region in {n_cls} genomic bins "
+        f"({n_cls * args.xgb_trees:,} trees)")
     dtrain = xgb.QuantileDMatrix(feats(tr), label=y[tr], max_bin=args.xgb_max_bin)
     dval = xgb.QuantileDMatrix(feats(val), label=y[val], ref=dtrain, max_bin=args.xgb_max_bin)
     booster = xgb.train(params, dtrain, num_boost_round=args.xgb_trees,
                         evals=[(dval, "val")], verbose_eval=False)
     acc = float((np.asarray(booster.predict(dval)).reshape(len(val), -1).argmax(1) == y[val]).mean())
-    base = float(np.bincount(y[tr]).max() / len(tr))
-    log(f"  node-ancestry accuracy on held-out nodes {acc:.3f} (majority-class baseline {base:.3f})")
-    # leaf prediction / embedding below is CPU numpy regardless of --device; if the booster was
-    # trained on cuda, move it to cpu so pred_leaf doesn't take the slow device-mismatch fallback.
+    base = float(np.bincount(y[tr], minlength=n_cls).max() / len(tr))
+    log(f"  region-bin accuracy on held-out nodes {acc:.3f} (majority-class baseline {base:.3f})")
+    del dtrain, dval
+    # leaf prediction below runs on CPU numpy input; a cuda booster would take XGBoost's slow
+    # device-mismatch fallback (and can exhaust host RAM at genome scale)
     if device == "cuda":
         booster.set_param({"device": "cpu"})
-    del dtrain, dval
 
     width = 2 ** (args.xgb_depth + 1)                     # depth-d tree node ids are < 2^(d+1) - 1
 
@@ -427,7 +434,9 @@ def embed_xgboost(args, A):
         return L
 
     sample = np.sort(rng.choice(n, min(n, args.xgb_svd_nodes), replace=False))
-    V = leaf_basis(leaf_onehot(leaves(sample), width), args.dim, args.seed)
+    M = leaf_onehot(leaves(sample), width)
+    k = min(args.dim, min(M.shape) - 1)
+    V = svd_basis(M, k, args.seed, args.rapids)
     log(f"  leaf SVD fitted on {len(sample):,} nodes ({V.shape[0]:,} leaf columns -> {V.shape[1]} dims)")
     Z = np.empty((n, V.shape[1]), np.float32)
     for b in range(0, n, args.chunk_nodes):
@@ -435,28 +444,68 @@ def embed_xgboost(args, A):
         Z[idx] = leaf_onehot(leaves(idx), width) @ V
         if (b // args.chunk_nodes) % 20 == 0:
             log(f"    embedded {idx[-1] + 1:,}/{n:,} nodes")
-    return Z, {"val_accuracy": acc, "baseline_accuracy": base, "train_nodes": int(len(tr)),
-               "svd_nodes": int(len(sample)), "n_trees_total": int(V.shape[0] // width),
-               "rapids": bool(getattr(args, "rapids", False))}
+    return Z, {"target": "haploblock_region_bin", "n_classes": n_cls, "val_accuracy": acc,
+               "baseline_accuracy": base, "train_nodes": int(len(tr)), "svd_nodes": int(len(sample)),
+               "n_trees_total": int(V.shape[0] // width), "rapids": bool(args.rapids)}
 
 
 # ---------------------------------------------------------------------------
 
-def main():
+def run_method(args, method, A):
+    out = gfile(args, f"node_emb_{method}.npy")
+    info_file = gfile(args, f"node_emb_{method}.json")
+    if os.path.exists(out) and not args.force:
+        old = json.load(open(info_file)).get("train_set_id", "all") if os.path.exists(info_file) else "all"
+        if old == args.train_id:
+            log(f"{out} already exists for this training set (use --force to recompute)")
+            return
+        log(f"existing {os.path.basename(out)} was made with another training set ({old}); recomputing")
+    t0 = time.time()
+    log(f"[{method}] graph {args.graph_dir}: {A.shape[0]:,} nodes, {A.nnz // 2:,} edges; "
+        f"training individuals: {len(args.train_idx):,} ({args.train_src})")
+    fn = {"node2vec": embed_node2vec, "gnn": embed_gnn, "xgboost": embed_xgboost}[method]
+    Z, summary = fn(args, A)
+    if not np.isfinite(Z).all():
+        die(f"{method} produced non-finite embeddings; try other settings (e.g. a lower learning rate)")
+
+    np.save(out, Z)
+    settings = {k: v for k, v in vars(args).items() if k not in ("force", "csv", "train_idx", "test")}
+    with open(info_file, "w") as f:
+        json.dump({"method": method, "shape": list(Z.shape), "settings": settings,
+                   "train_source": args.train_src, "n_train": int(len(args.train_idx)),
+                   "train_set_id": args.train_id,
+                   "summary": summary, "seconds": round(time.time() - t0)}, f, indent=2)
+    if args.csv:
+        nodes = pd.read_csv(gfile(args, "nodes.csv.gz"), usecols=["id", "chrom"])
+        df = pd.DataFrame(Z, columns=[f"e{j}" for j in range(Z.shape[1])])
+        pd.concat([nodes, df], axis=1).to_csv(gfile(args, f"node_emb_{method}.csv.gz"), index=False)
+    log(f"  saved {Z.shape} embeddings to {out}")
+
+
+def self_test_settings(args):
+    """Build the synthetic test graph (1_build_graph.py --test) and shrink every method."""
+    import importlib
+    importlib.import_module("1_build_graph").main(["--test"])
+    args.graph_dir = selftest_graph_dir()
+    args.dim, args.svd_dim, args.walks_per_node, args.walk_length = 8, 8, 2, 10
+    args.gnn_epochs, args.gnn_hidden, args.xgb_trees, args.xgb_depth = 20, 16, 5, 3
+    args.xgb_region_bins, args.force, args.device = 4, True, "cpu"
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--method", choices=["node2vec", "gnn", "xgboost"], required=True)
-    ap.add_argument("--graph-dir", default="haplograph/genome", help="output folder of 1_build_graph.py")
+    ap.add_argument("--method", default="all",
+                    help="node2vec, gnn, xgboost, a comma-separated list, or all (default)")
+    ap.add_argument("--graph-dir", default="haplograph/genome_train_half_A", help="output folder of 1_build_graph.py")
     ap.add_argument("--dim", type=int, default=64, help="embedding size")
     ap.add_argument("--csv", action="store_true", help="also write node_emb_<method>.csv.gz")
     ap.add_argument("--device", help="cpu / cuda (default: cuda if available)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--force", action="store_true", help="recompute existing embeddings")
-    ap.add_argument("--rapids", action="store_true",
-                    help="use RAPIDS cuML GPU SVD for the carrier/leaf SVD steps")
-    ap.add_argument("--rapids-fit-rows", type=int, default=150_000,
-                    help="rows sampled to fit the cuML carrier SVD (higher = closer to exact)")
-    ap.add_argument("--rapids-chunk", type=int, default=200_000,
-                    help="rows densified per GPU transform chunk (lower = less VRAM)")
+    ap.add_argument("--train-individuals",
+                    help="file or URL of training individuals (default: <graph-dir>/train_individuals.txt, else all)")
+    ap.add_argument("--sample-map", help="CSV: graph individual name, sample ID (if they differ)")
+    ap.add_argument("--test", action="store_true", help="self-test on a small synthetic graph (CPU, seconds)")
 
     n = ap.add_argument_group("node2vec")
     n.add_argument("--p", type=float, default=1.0, help="return parameter (low = walks stay local)")
@@ -477,45 +526,45 @@ def main():
     g.add_argument("--gnn-epochs", type=int, default=300)
     g.add_argument("--gnn-lr", type=float, default=0.01)
     g.add_argument("--edge-batch", type=int, default=500_000)
-    g.add_argument("--xgb-trees", type=int, default=100)
+    g.add_argument("--xgb-trees", type=int, default=50, help="boosting rounds (one tree per bin per round)")
     g.add_argument("--xgb-depth", type=int, default=6)
-    g.add_argument("--xgb-train-nodes", type=int, default=1_000_000, help="max labelled nodes to train on")
+    g.add_argument("--xgb-region-bins", type=int, default=16,
+                   help="number of genomic bins of haploblock regions = xgboost classes")
+    g.add_argument("--xgb-train-nodes", type=int, default=1_000_000, help="max nodes to train on")
     g.add_argument("--xgb-val-nodes", type=int, default=100_000, help="max held-out nodes for accuracy")
     g.add_argument("--xgb-svd-nodes", type=int, default=300_000, help="nodes sampled to fit the leaf SVD")
     g.add_argument("--xgb-max-bin", type=int, default=256, help="histogram bins (lower = less memory)")
     g.add_argument("--chunk-nodes", type=int, default=200_000, help="nodes embedded per chunk")
-    args = ap.parse_args()
 
-    _RAPIDS[0] = bool(args.rapids)
-    _RAPIDS_FIT_ROWS[0] = args.rapids_fit_rows
-    _RAPIDS_CHUNK[0] = args.rapids_chunk
+    r = ap.add_argument_group("RAPIDS (GPU SVD)")
+    r.add_argument("--rapids", action="store_true", help="run the carrier and leaf SVDs on the GPU with cuML/CuPy")
+    r.add_argument("--rapids-fit-rows", type=int, default=150_000,
+                   help="rows sampled to fit the cuML carrier SVD (higher = closer to exact)")
+    r.add_argument("--rapids-chunk", type=int, default=200_000,
+                   help="rows densified per GPU transform chunk (lower = less VRAM)")
+    args = ap.parse_args(argv)
 
-    out = gfile(args, f"node_emb_{args.method}.npy")
-    if os.path.exists(out) and not args.force:
-        log(f"{out} already exists (use --force to recompute)")
-        return
-    require(args, "graph.npz", hint="1_build_graph.py")
-    if args.method in ("gnn", "xgboost"):
-        require(args, "carriers.npz", hint="1_build_graph.py")
-    if args.method == "xgboost":
-        require(args, "labels.npz", hint="2_ancestry_labels.py")
+    if args.test:
+        self_test_settings(args)
+    methods = list(METHODS) if args.method == "all" else [m.strip() for m in args.method.split(",") if m.strip()]
+    bad = [m for m in methods if m not in METHODS]
+    if bad or not methods:
+        die(f"unknown --method {bad or args.method!r}; choose from {', '.join(METHODS)} or all")
+    if args.rapids:
+        import_rapids()
+    for name, val in (("--dim", args.dim), ("--svd-dim", args.svd_dim), ("--xgb-region-bins", args.xgb_region_bins),
+                      ("--chunk-nodes", args.chunk_nodes), ("--walk-batch", args.walk_batch)):
+        if val < 1:
+            die(f"{name} must be >= 1")
 
-    t0 = time.time()
+    require_files(args.graph_dir, ["graph.npz", "individuals.txt"]
+                  + (["carriers.npz"] if {"gnn", "xgboost"} & set(methods) else [])
+                  + (["nodes.csv.gz"] if "xgboost" in methods or args.csv else []), "1_build_graph.py")
+    individuals = read_graph_individuals(args.graph_dir)
+    args.train_idx, args.train_src, args.train_id = train_columns(args, individuals)
     A = sp.load_npz(gfile(args, "graph.npz")).astype(np.float32).tocsr()
-    log(f"[{args.method}] graph {args.graph_dir}: {A.shape[0]:,} nodes, {A.nnz // 2:,} edges")
-    fn = {"node2vec": embed_node2vec, "gnn": embed_gnn, "xgboost": embed_xgboost}[args.method]
-    Z, summary = fn(args, A)
-
-    np.save(out, Z)
-    settings = {k: v for k, v in vars(args).items() if k not in ("force", "csv")}
-    with open(gfile(args, f"node_emb_{args.method}.json"), "w") as f:
-        json.dump({"method": args.method, "shape": list(Z.shape), "settings": settings,
-                   "summary": summary, "seconds": round(time.time() - t0)}, f, indent=2)
-    if args.csv:
-        nodes = pd.read_csv(gfile(args, "nodes.csv.gz"), usecols=["id", "chrom"])
-        df = pd.DataFrame(Z, columns=[f"e{j}" for j in range(Z.shape[1])])
-        pd.concat([nodes, df], axis=1).to_csv(gfile(args, f"node_emb_{args.method}.csv.gz"), index=False)
-    log(f"  saved {Z.shape} embeddings to {out}")
+    for method in methods:
+        run_method(args, method, A)
     log("done.")
 
 

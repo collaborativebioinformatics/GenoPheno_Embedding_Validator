@@ -1,0 +1,84 @@
+PROMPT HISTORY - post-hackathon cleanup of GenoPheno_Embedding_Validator
+=========================================================================
+
+Prompt 1 - Split the repo into two pipelines, clean up part 1, test on CPU
+--------------------------------------------------------------------------
+Request (paraphrased): The project is a pipeline in two parts: (1) haplograph -> embeddings ->
+fine-tuning Evo 2, and (2) proteomics -> embeddings -> fine-tuning Evo 2. Put each part's scripts
+and folders in its own subdirectory and organize the README in two parts, changing only formatting
+(no content removed or modified) and adding information about code the README does not mention.
+Do not modify part 2 code; clean up only part 1 with the hackathon-cleanup skill. For part 1: add
+download instructions to the README and a download_haplograph.py script (genome-wide or per
+chromosome) that produces the training and test sets for fine-tuning/testing Evo 2; remove
+2_ancestry_labels.py; merge step 3 with the RAPIDS step 3 (node2vec, xgboost and gnn, no ancestry
+labels); merge step 4 with the BioNeMo step 4 behind a --bionemo flag, taking step 3's embeddings;
+make step 5 a validator of the fine-tuned Evo 2 on the test set; remove scratch_code/; move
+How_to_use_rapids into README or DOCUMENTATION; keep and fix install_evo2.sh and
+validation_tasks.txt; test the pipeline on CPU (no GPU here) but make it run on GPU; include RAPIDS,
+CuPy, BioNeMo and Nemotron if possible; document installation and running in DOCUMENTATION.md.
+
+Decisions confirmed with the user:
+  - XGBoost (step 3) target without labels: the node's haploblock region (genomic bins).
+  - 4b_finetune_evo2_hash.py: kept as an optional extra in part 1.
+  - data/ and clinical_dashboard/ go to part 2; example_test_run/ (ancestry checkpoint) deleted.
+  - Nemotron: optional plain-language summary of the step-5 report (--nemotron-summary).
+
+Changes:
+  Layout (git mv, history kept)
+    - part1_haplograph/: 1_build_graph.py, 3_node_embeddings.py, 4a_finetune_evo2_embeddings.py,
+      4b_finetune_evo2_hash.py, 5_validate_evo2.py, install_evo2.sh, validation_tasks.txt.
+    - part2_proteomics/: proteomics_prep/, synthtan_prolm/, proteomics_emb/, data/,
+      clinical_dashboard/ (contents unchanged; .gitignore path of proteomics_prep/example_out updated).
+    - Deleted: 2_ancestry_labels.py, 3_node_rapid_embeddings.py (merged into step 3),
+      4a_finetune_evo2_embeddings_bionemo.py (merged into step 4), scratch_code/,
+      example_test_run/, How_to_use_rapids (moved into DOCUMENTATION.md section 10.3).
+  New part 1 files
+    - download_haplograph.py (step 0): downloads nodes/edges for all or selected chromosomes,
+      verifies MD5 against checksums.md5, writes splits/train_individuals.txt and
+      test_individuals.txt (BH_26 halves by default, or --split random stratified by population)
+      plus split.json.
+    - haplo_common.py: shared helpers (downloads, individual lists, training set id, device
+      selection, synthetic haplograph for --test) replacing 5 duplicated copies.
+    - evo2_model.py: GenomeData, Evo2Runner (evo2 package), BioNeMoEvo2Runner (from the BioNeMo
+      script), MockEvo2Runner (CPU stand-in), NextClusterModel (new layers + loss), load_finetuned
+      (rebuilds a step-4 model for step 5).
+    - requirements.txt (numpy, pandas, scipy, torch, xgboost).
+  Changed part 1 scripts
+    - 1_build_graph.py: reads step 0's raw/ and splits/ (no downloading); train-only by default;
+      copies test_individuals.txt into the graph folder; --no-split for all individuals; clear
+      errors; --test.
+    - 3_node_embeddings.py: merged with the RAPIDS version (--rapids: cuML/CuPy SVDs, separate
+      cache files); --method all (default) runs node2vec, gnn and xgboost; xgboost predicts
+      haploblock-region bins (--xgb-region-bins) instead of ancestry; booster moved to CPU before
+      leaf prediction; input validation; --test.
+    - 4a_finetune_evo2_embeddings.py: merged with the BioNeMo version (--bionemo); --mock-evo2 for
+      CPU checks; objective "next" only (ancestry removed); checkpoint records backend, embeddings
+      checksum and chromosome count; --out; validation of arguments; --test.
+    - 4b_finetune_evo2_hash.py: uses the shared Evo2Runner; --mock-evo2; --test on a synthetic TSV.
+    - 5_validate_evo2.py: new task test_set_performance (queries the fine-tuned model on the test
+      individuals: loss, perplexity, top-1/top-5, generalization gap, bigram baseline); default
+      split = the graph's own train/test files (BH_26 URL as fallback); --nemotron-summary (NVIDIA
+      NIM, sample IDs and paths scrubbed); --test; model_kind knows the mock/bionemo backends.
+    - validation_tasks.txt: adds test_set_performance.
+    - install_evo2.sh: fails clearly without Linux/nvidia-smi/Python; any GPU with compute
+      capability >= 8.0; /etc/os-release instead of lsb_release; x86_64 and aarch64 CUDA repos;
+      clones evo2 to $EVO2_SRC; installs requirements.txt; SKIP_CUDA_TOOLKIT / SKIP_EVO2_TEST.
+  Docs
+    - README.md: two parts (Part 1 / Part 2) plus repository layout; all original lines kept
+      (checked line by line), headings/bullets reformatted, the interleaved "Hash-phenotype" and
+      "Running the whole genome" code blocks untangled and the broken ''' fences fixed, part 2 link
+      targets updated; added: change notes, download instructions, quick start, script table,
+      test_set_performance, Nemotron, and the undocumented part 2 files (data/, dashboard, notebook).
+    - DOCUMENTATION.md: rewritten to match the code (removed LoRA/micro-batch/activation
+      checkpointing claims that were never implemented), RAPIDS guide merged in, GPU tools section,
+      tested-vs-untested table with the chr21 results, installation (CPU, Evo 2, RAPIDS, BioNeMo,
+      Nemotron) and how to run the pipeline at the end.
+    - .gitignore: pipeline outputs, *.pt, __pycache__.
+  Testing (CPU only, Apple M5, Python 3.9 venv)
+    - All six --test flags pass.
+    - Real chr21 with the BH_26 split, end to end: download + MD5 check; graph 166,754 nodes /
+      1,520,370 edges; node2vec, GNN and XGBoost embeddings; step 4 with --mock-evo2; step 5
+      (consistent split, no leakage, test_set_performance; bigram baseline 0.41 top-1).
+    - The rebuilt model in step 5 reproduces the stored validation accuracy exactly.
+    - Not run (no GPU): Evo 2, BioNeMo, RAPIDS, CUDA XGBoost; Nemotron only against a local fake
+      endpoint.

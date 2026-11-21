@@ -1,3 +1,9 @@
-proteomics_prep/example_out/
+part2_proteomics/proteomics_prep/example_out/
 .Rhistory
 .RData
+
+# part 1 pipeline outputs (downloads, graphs, embeddings, models; regenerate with the scripts)
+part1_haplograph/haplograph/
+haplograph/
+*.pt
+__pycache__/

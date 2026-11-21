@@ -1,15 +1,26 @@
 """
-Step 5 - validate a fine-tuned Evo 2 model on a held-out TEST set of individuals
-(the model is assumed to have been trained on the remaining TRAIN individuals).
+Step 5 - validate a fine-tuned Evo 2 model (from 4a_finetune_evo2_embeddings.py) on the held-out
+TEST set of individuals (the model was trained on the TRAIN individuals of the same split).
 
 The script is a small task runner: every check is a TASK, and you choose which tasks to run (and
 with which parameters) in a plain-text TASKS FILE, one task per line. Add a line to run a check
 again with other settings (e.g. another GWAS trait); write a plugin file to add a new kind of check.
 
 BUILT-IN TASKS
-  model_info           What the model is (4a, 4a BioNeMo, 4b, or unknown), what it was trained on,
-                       its stored training metrics, and a LEAKAGE check: test individuals that the
-                       model did not hold out during training.
+  model_info           What the model is (4a with the evo2 / BioNeMo / mock backbone, 4b, or
+                       unknown), what it was trained on, its stored training metrics, and a LEAKAGE
+                       check: test individuals that the model did not hold out during training.
+  test_set_performance QUERIES THE FINE-TUNED MODEL on the test individuals: for every test
+                       individual and chromosome, predict each next cluster from the clusters before
+                       it (the training objective) and report cross-entropy, perplexity, top-1 and
+                       top-5 accuracy, per chromosome and overall. Compared with:
+                         - the same metrics on a sample of the model's TRAINING individuals
+                           (generalization gap),
+                         - a bigram baseline counted on the training individuals (most frequent
+                           next cluster after the current one): the model should beat it,
+                         - the validation metrics stored in the checkpoint before / after training.
+                       Needs the same backbone as in training (a GPU for Evo 2 / BioNeMo; the
+                       mock backbone runs on CPU). Writes test_set_performance_chroms.csv.
   cluster_consistency  Data-level internal consistency of the haploblock clusters between the train
                        and the test individuals, per haploblock region:
                          - number of distinct clusters carried in train and in test
@@ -29,16 +40,19 @@ BUILT-IN TASKS
                            cover the whole chromosome span; the script says so when they do)
 
 INPUT
-  --model FILE.pt           one fine-tuned model from step 4 (4a / 4a BioNeMo / 4b). Any torch.save
+  --model FILE.pt           one fine-tuned model from step 4 (4a / 4a --bionemo / 4b). Any torch.save
                             dict works; unknown kinds run as "unknown" and only data-level tasks use
                             them. Loaded only when a task needs it (needs torch).
   --graph-dir               output folder of 1_build_graph.py: nodes.csv.gz, individuals.txt,
                             carriers.npz (formats documented in 1_build_graph.py)
-  TRAIN / TEST SPLIT  (default: the BH_26 split, https://data.haploblocks.org/BH_26/splits/)
-    --splits DIR_OR_URL     folder (local path or URL) holding the split files; default the BH_26
-                            folder above. Train = <splits>/half_A.txt (the individuals steps 3-4 were
-                            trained on), test = <splits>/half_B.txt (the individuals Evo 2 is
-                            queried on here). Other names: --train-file / --test-file.
+  TRAIN / TEST SPLIT  (default: the graph's own split, i.e. <graph-dir>/train_individuals.txt and
+                       test_individuals.txt written by 1_build_graph.py from download_haplograph.py)
+    --splits DIR_OR_URL     folder (local path or URL) holding the split files instead, e.g. the
+                            BH_26 folder https://data.haploblocks.org/BH_26/splits/ (also the
+                            fallback when the graph has no test_individuals.txt). Train =
+                            <splits>/half_A.txt (the individuals steps 3-4 were trained on), test =
+                            <splits>/half_B.txt (the individuals Evo 2 is queried on here). Other
+                            names: --train-file / --test-file.
                             Files given as URLs are downloaded once into <out-dir>/inputs/.
                             Use --splits none to fall back to the model's own held-out individuals.
     --train-individuals / --test-individuals FILE_OR_URL
@@ -52,9 +66,9 @@ INPUT
                             neither file are left out of both sets (and counted in the report).
     --sample-map CSV        only if the graph's individuals (individuals.txt) are not named by
                             sample ID (e.g. IND1, IND2 ...): 2 columns, graph name, sample ID
-                            (same file format as for 2_ancestry_labels.py)
-  --tasks FILE              tasks file (see below); default: model_info + cluster_consistency
-                            (+ gwas_enrichment if --gwas is given)
+                            (same file format as in steps 1-4)
+  --tasks FILE              tasks file (see below); default: model_info + test_set_performance
+                            (4a models) + cluster_consistency (+ gwas_enrichment if --gwas is given)
   --gwas FILE               shortcut: adds "gwas_enrichment gwas=FILE"
   GWAS file (gwas_enrichment gwas=...): tab-, comma- or whitespace-separated text, may be .gz/.zip.
       Needs chromosome, position (bp, SAME GENOME BUILD as the haploblock regions) and p-value
@@ -69,6 +83,7 @@ INPUT
 
 TASKS FILE  (plain text, one task per line; '#' starts a comment; values with spaces need quotes)
     model_info
+    test_set_performance max_examples=500
     cluster_consistency min_carriers=1 permutations=200
     gwas_enrichment gwas=Yengo.2022.height.GWAS.ALL.gz pvalue=5e-8 label=height
     gwas_enrichment gwas=bmi_catalog.tsv pvalue=1e-6 window=10000 label=bmi_hits
@@ -92,6 +107,9 @@ OUTPUT  (--out-dir, default <graph-dir>/validation_<model file name>/)
   summary.json                       {"model", "test_set", "tasks": [{name, params, status, summary,
                                        notes, files}]}
   split.csv                          individual, set (train / test)
+  test_set_performance_chroms.csv    per chromosome: chrom, test_sequences, test_predictions, test_loss,
+                                     test_top1, test_top5, bigram_top1
+  nemotron_summary.md                (--nemotron-summary) plain-language reading of the report
   cluster_consistency_regions.csv.gz per region: region, chrom, start, end, n_clusters_total,
                                      n_clusters_train, n_clusters_test, test_expected, test_ci_low,
                                      test_ci_high, outside_ci, n_test_only, test_only_carriers, tvd,
@@ -101,14 +119,23 @@ OUTPUT  (--out-dir, default <graph-dir>/validation_<model file name>/)
                                      expected_hits, fold, p, q, lead_snp, lead_p
   (a task that is listed twice writes its files with a _2, _3 ... suffix)
 
+NEMOTRON (optional, --nemotron-summary)  sends the task summaries (aggregate numbers only: sample IDs
+  and file paths are removed first) to an NVIDIA Nemotron model on an OpenAI-compatible NVIDIA NIM
+  endpoint (--nemotron-url, default build.nvidia.com's https://integrate.api.nvidia.com/v1, or a
+  self-hosted NIM) and writes its plain-language interpretation to nemotron_summary.md. Needs the
+  API key in $NVIDIA_API_KEY. Off by default; a failure only prints a warning.
+
 USAGE
-  python 5_validate_evo2.py --model haplograph/genome/evo2_next_gnn.pt     # BH_26 half_A / half_B
+  python 5_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G     # graph's own test set
   python 5_validate_evo2.py --model evo2_next_gnn.pt --splits splits/ --gwas height_hg38.tsv
   python 5_validate_evo2.py --model evo2_next_gnn.pt --sample-map ind_to_sample.csv
   python 5_validate_evo2.py --model evo2_hash_height.pt --test-individuals test.txt --tasks my_tasks.txt
+  python 5_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --nemotron-summary
   python 5_validate_evo2.py --list-tasks
+  python 5_validate_evo2.py --test                                           # synthetic, CPU
 
-REQUIRES  numpy, pandas, scipy; torch to read the model file.
+REQUIRES  numpy, pandas, scipy; torch to read the model file; for test_set_performance the
+          backbone used in step 4 (evo2 package / BioNeMo container + GPU, or none for --mock-evo2).
           optional: RAPIDS cuDF (pip install cudf-cu12) for --cudf, which runs the pandas parts (mainly
           reading GWAS summary statistics) on the GPU
 """
@@ -137,9 +164,14 @@ import pandas as pd
 import scipy.sparse as sp
 from scipy import stats
 
+from haplo_common import BH26_SPLITS, die, load_sample_map, read_individual_list, selftest_graph_dir
+
 
 def log(msg=""):
     print(msg, flush=True)
+
+
+GRAPH_SPLIT = "graph"
 
 
 # ===========================================================================
@@ -284,7 +316,8 @@ def model_kind(meta):
     if meta.get("mode") == "hash":
         return "4b hash-phenotype"
     if meta.get("mode") == "embeddings" or "proj_in" in meta:
-        return "4a embeddings (BioNeMo)" if meta.get("backend") == "bionemo" else "4a embeddings"
+        backend = meta.get("backend", "evo2")
+        return "4a embeddings" + {"bionemo": " (BioNeMo)", "mock": " (MOCK backbone, not Evo 2)"}.get(backend, "")
     return "unknown"
 
 
@@ -324,9 +357,6 @@ class Model:
         return list(v) if v else None
 
 
-BH26_SPLITS = "https://data.haploblocks.org/BH_26/splits/"
-
-
 def is_url(p):
     return str(p).startswith(("http://", "https://"))
 
@@ -352,31 +382,9 @@ def fetch(path, cache_dir):
             os.replace(tmp, dest)
         except Exception as e:
             raise SystemExit(f"could not download {path} ({e}). Download the split files yourself, e.g.\n"
-                             f"  wget -r -np -nH --cut-dirs=2 -R 'index.html*' {BH26_SPLITS}\n"
+                             f"  wget -r -np -nH --cut-dirs=2 -R 'index.html*' {BH26_SPLITS}/\n"
                              f"and pass the local folder with --splits splits/")
     return dest
-
-
-def read_individual_list(path):
-    if path.endswith((".csv", ".csv.gz")):
-        df = pd.read_csv(path, dtype=str)
-        col = "individual" if "individual" in df.columns else df.columns[0]
-        return [x.strip() for x in df[col].dropna()]
-    out = []
-    with open(path) as f:
-        for line in f:
-            line = line.split("#", 1)[0].strip()
-            if line:
-                out.append(line.split()[0])
-    return out
-
-
-def load_sample_map(path):
-    """CSV with 2 columns (graph individual name, sample ID) -> {sample ID: graph name}."""
-    m = pd.read_csv(path, dtype=str)
-    if m.shape[1] < 2:
-        raise SystemExit(f"{path}: --sample-map needs 2 columns (graph name, sample ID)")
-    return dict(zip(m.iloc[:, 1].str.strip(), m.iloc[:, 0].str.strip()))
 
 
 class Context:
@@ -410,8 +418,16 @@ class Context:
         # where the split comes from: explicit files > split folder (default BH_26) > model held-out
         if a.test_individuals or a.train_individuals:
             if not a.test_individuals:
-                raise SystemExit("--train-individuals given without --test-individuals")
+                die("--train-individuals given without --test-individuals")
             test_src, train_src = a.test_individuals, a.train_individuals
+        elif a.splits == GRAPH_SPLIT:
+            g_test = os.path.join(self.graph.dir, "test_individuals.txt")
+            g_train = os.path.join(self.graph.dir, "train_individuals.txt")
+            if os.path.exists(g_test):
+                test_src, train_src = g_test, (g_train if os.path.exists(g_train) else None)
+            else:
+                log(f"note: {g_test} not found; using the BH_26 split ({BH26_SPLITS})")
+                test_src, train_src = join_path(BH26_SPLITS, a.test_file), join_path(BH26_SPLITS, a.train_file)
         elif a.splits and a.splits.lower() != "none":
             test_src, train_src = join_path(a.splits, a.test_file), join_path(a.splits, a.train_file)
         else:
@@ -464,15 +480,15 @@ class Context:
             self.split_info["test_individuals_in_graph_training_set"] = len(in_both)
             if in_both:
                 log(f"WARNING: {len(in_both):,} test individuals are in the graph's training set "
-                    f"(e.g. {sorted(in_both)[:3]}): steps 1-4 saw them. Rebuild the graph with "
-                    "--train-individuals set to the train half")
+                    f"(e.g. {sorted(in_both)[:3]}): steps 1-4 saw them. Rebuild the graph from the "
+                    "train half (download_haplograph.py, then 1_build_graph.py)")
             elif graph_train != train_set:
                 log(f"note: the graph was built on {len(graph_train):,} training individuals, the train set "
                     f"here has {len(train_set):,} ({len(graph_train - train_set):,} / {len(train_set - graph_train):,} "
                     "differ); test individuals are not in it")
         else:
             self.split_info["graph_built_on"] = "all individuals (no train_individuals.txt)"
-            log("note: the graph was built from ALL individuals (1_build_graph.py without --train-individuals), "
+            log("note: the graph was built from ALL individuals (1_build_graph.py --no-split), "
                 "so its edge weights include the test individuals")
 
         excluded = len(inds) - len(train_set) - len(test_set)
@@ -670,7 +686,7 @@ def cluster_consistency(ctx, min_carriers: int = 1, permutations: int = 200, alp
     }
     per_chrom = regions.groupby("chrom", sort=False)["outside_ci"].mean()
     worst = per_chrom.sort_values(ascending=False).head(3)
-    notes = [f"chromosomes with most regions outside the interval: "
+    notes = ["chromosomes with most regions outside the interval: "
              + ", ".join(f"{c} {v:.1%}" for c, v in worst.items())]
     if test_only.sum():
         notes.append(f"{int(test_only.sum()):,} clusters are carried in test but not in train: the model never saw "
@@ -874,12 +890,192 @@ def gwas_enrichment(ctx, gwas: str, pvalue: float = 5e-8, window: int = 0, permu
     return {"summary": s, "notes": notes, "files": [path]}
 
 
+# ---- querying the fine-tuned model ----------------------------------------
+
+def bigram_table(data, chrom, individuals):
+    """Most frequent next cluster after each cluster (local indices), counted on `individuals`;
+    clusters never seen as 'current' fall back to the most frequent next cluster overall."""
+    n = data.bounds[chrom][1] - data.bounds[chrom][0]
+    keys = []
+    for i in individuals:
+        _, local = data.tokens(chrom, i)
+        if len(local) >= 2:
+            keys.append(local[:-1].astype(np.int64) * n + local[1:])
+    best = np.full(n, -1, np.int64)
+    if not keys:
+        return best
+    keys, counts = np.unique(np.concatenate(keys), return_counts=True)
+    cur, nxt = keys // n, keys % n
+    order = np.lexsort((-counts, cur))                      # per current cluster: highest count first
+    first = np.unique(cur[order], return_index=True)[1]
+    best[cur[order][first]] = nxt[order][first]
+    fallback = np.bincount(nxt, weights=counts, minlength=n).argmax()
+    best[best < 0] = fallback
+    return best
+
+
+@task("test_set_performance", "Query the fine-tuned model on the test individuals (next-cluster prediction)")
+def test_set_performance(ctx, max_examples: int = 500, train_examples: int = 200, top_k: int = 5,
+                         baseline_individuals: int = 0, device: str = "", ckpt_dir: str = ""):
+    """max_examples / train_examples = (individual, chromosome) sequences evaluated from the test set /
+    from the model's training individuals (0 = all); baseline_individuals = training individuals used
+    to count the bigram baseline (0 = all); device = cpu/cuda for the mock backbone; ckpt_dir overrides
+    the NeMo2 checkpoint folder stored in a --bionemo model."""
+    import torch
+    from evo2_model import load_finetuned
+    meta = ctx.model.meta
+    if not model_kind(meta).startswith("4a"):
+        raise ValueError(f"test_set_performance needs a 4a model; this is {model_kind(meta)}")
+    model, data = load_finetuned(meta, ctx.graph.dir, device or None, ckpt_dir or None)
+    if data.by_ind.shape[0] != len(ctx.graph.individuals):
+        raise ValueError("individuals.txt and carriers.npz disagree")
+    rng = ctx.rng
+
+    def sample(examples, k):
+        if k and len(examples) > k:
+            return [examples[j] for j in np.sort(rng.choice(len(examples), k, replace=False))]
+        return examples
+
+    test_ex = sample(data.examples(ctx.test_idx), max_examples)
+    trained = set(meta.get("train_individuals") or [])
+    pos = {x: i for i, x in enumerate(ctx.graph.individuals)}
+    tr_pool = np.array(sorted(pos[x] for x in trained if x in pos), dtype=np.int64) if trained else ctx.train_idx
+    train_ex = sample(data.examples(tr_pool), train_examples)
+    if not test_ex:
+        raise ValueError("no test sequences with at least 2 clusters on the model's chromosomes")
+
+    base_pool = ctx.train_idx
+    if baseline_individuals and len(base_pool) > baseline_individuals:
+        base_pool = np.sort(rng.choice(base_pool, baseline_individuals, replace=False))
+    bigram = {c: bigram_table(data, c, base_pool) for c in sorted({c for c, _ in test_ex})}
+
+    def run(examples, with_baseline):
+        rows = {}
+        with torch.no_grad():
+            for chrom, i in examples:
+                logits, target = model.logits(chrom, i)
+                k = min(top_k, logits.shape[1])
+                nll = torch.nn.functional.cross_entropy(logits, target, reduction="sum").item()
+                top = logits.topk(k, dim=-1).indices
+                r = rows.setdefault(chrom, {"seq": 0, "n": 0, "nll": 0.0, "top1": 0, "topk": 0, "bigram": 0})
+                r["seq"] += 1; r["n"] += len(target); r["nll"] += nll
+                r["top1"] += int((top[:, 0] == target).sum()); r["topk"] += int((top == target[:, None]).any(1).sum())
+                if with_baseline:
+                    _, local = data.tokens(chrom, i)
+                    s, e = model.window(len(local))
+                    r["bigram"] += int((bigram[chrom][local[s:e - 1]] == local[s + 1:e]).sum())
+        return rows
+
+    t_rows, tr_rows = run(test_ex, True), run(train_ex, False)
+    tot = lambda rows, key: sum(r[key] for r in rows.values())
+    n_test, n_train = tot(t_rows, "n"), max(tot(tr_rows, "n"), 1)
+    loss = tot(t_rows, "nll") / n_test
+    top1, topk = tot(t_rows, "top1") / n_test, tot(t_rows, "topk") / n_test
+    tr_top1 = tot(tr_rows, "top1") / n_train
+    big = tot(t_rows, "bigram") / n_test
+
+    path = ctx.out("test_set_performance_chroms.csv")
+    pd.DataFrame([{"chrom": c, "test_sequences": r["seq"], "test_predictions": r["n"],
+                   "test_loss": r["nll"] / r["n"], "test_top1": r["top1"] / r["n"],
+                   f"test_top{top_k}": r["topk"] / r["n"], "bigram_top1": r["bigram"] / r["n"]}
+                  for c, r in t_rows.items()]).to_csv(path, index=False, float_format="%.6g")
+    stored = (meta.get("metrics") or {})
+    s = {
+        "backend": meta.get("backend", "evo2"), "embeddings": meta.get("graph_method"),
+        "test_individuals": len({i for _, i in test_ex}), "test_sequences": len(test_ex),
+        "test_predictions": n_test,
+        "test_loss": round(loss, 4), "test_perplexity": round(float(np.exp(min(loss, 50))), 2),
+        "test_top1_accuracy": round(top1, 4), f"test_top{top_k}_accuracy": round(topk, 4),
+        "train_sample_top1_accuracy": round(tr_top1, 4) if tr_rows else None,
+        "generalization_gap_top1": round(tr_top1 - top1, 4) if tr_rows else None,
+        "bigram_baseline_top1_accuracy": round(big, 4),
+        "beats_bigram_baseline": "yes" if top1 > big else "no",
+        "stored_val_top1_before_training": round(float((stored.get("before") or {}).get("accuracy", np.nan)), 4),
+        "stored_val_top1_after_training": round(float((stored.get("after") or {}).get("accuracy", np.nan)), 4),
+    }
+    notes = []
+    if meta.get("backend") == "mock":
+        notes.append("MOCK backbone: this model is a small stand-in, not Evo 2; the numbers only show that "
+                     "the pipeline runs")
+    leaked = {x for x in (ctx.graph.individuals[i] for _, i in test_ex) if x in trained}
+    if leaked:
+        notes.append(f"WARNING: {len(leaked)} evaluated test individuals were in the model's training set")
+    if top1 <= big:
+        notes.append("the model does not beat the bigram baseline on the test set: it has not learned more "
+                     "than which cluster usually follows the current one")
+    if tr_rows and tr_top1 - top1 > 0.1:
+        notes.append("training accuracy is much higher than test accuracy: likely overfitting")
+    return {"summary": s, "notes": notes, "files": [path]}
+
+
+# ---- Nemotron summary ------------------------------------------------------
+
+_SAMPLE_ID = re.compile(r"\b(HG|NA)\d{5}\b")
+_PATH = re.compile(r"(?:[A-Za-z]:)?(?:/[^\s/'\"]+){2,}")
+
+
+def _scrub(v):
+    """Remove sample IDs and file paths before anything leaves the machine."""
+    if isinstance(v, str):
+        return _PATH.sub(lambda m: os.path.basename(m.group(0)), _SAMPLE_ID.sub("<sample>", v))
+    if isinstance(v, dict):
+        return {k: _scrub(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_scrub(x) for x in v]
+    return v
+
+
+def nemotron_summary(args, results, out_path):
+    import urllib.request
+    key = os.environ.get("NVIDIA_API_KEY")
+    if not key:
+        log("warning: --nemotron-summary needs $NVIDIA_API_KEY (from build.nvidia.com); skipped")
+        return
+    payload = _scrub([{"task": r["name"], "status": r["status"], "summary": r.get("summary", {}),
+                       "notes": r.get("notes", [])} for r in results])
+    prompt = ("These are validation results of an Evo 2 DNA language model fine-tuned on haplograph node "
+              "embeddings (1000 Genomes haploblock clusters) to predict the next haploblock cluster along a "
+              "chromosome, evaluated on held-out test individuals. Explain in plain language, in at most "
+              "250 words: does the model generalize to the test set, does it beat the bigram baseline, is "
+              "there evidence of overfitting or train/test leakage, and what should be checked next. Do not "
+              "invent numbers.\n\n" + json.dumps(payload, indent=1, default=str))
+    body = json.dumps({"model": args.nemotron_model, "temperature": 0.2, "max_tokens": 1024,
+                       "messages": [{"role": "system", "content": "You are a careful genomics data scientist."},
+                                    {"role": "user", "content": prompt}]}).encode()
+    req = urllib.request.Request(args.nemotron_url.rstrip("/") + "/chat/completions", data=body,
+                                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                                          "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r:
+            text = json.loads(r.read())["choices"][0]["message"]["content"]
+    except Exception as e:
+        log(f"warning: Nemotron request failed ({type(e).__name__}: {e}); no summary written")
+        return
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()   # reasoning models may include it
+    with open(out_path, "w") as f:
+        f.write(f"# Nemotron summary ({args.nemotron_model})\n\n"
+                "_Generated by a language model from the aggregate numbers in report.md; check it against "
+                "the report._\n\n" + text + "\n")
+    log(f"Nemotron summary: {out_path}")
+
+
+def self_test(args):
+    """Synthetic data -> step 4 --test (mock backbone) -> validate it with every data-level task."""
+    import importlib
+    importlib.import_module("4a_finetune_evo2_embeddings").main(["--test"])
+    args.graph_dir = selftest_graph_dir()
+    args.model = os.path.join(args.graph_dir, "evo2_mock_next_gnn.pt")
+    args.splits, args.tasks, args.gwas, args.out_dir = GRAPH_SPLIT, None, [], None
+    args.task = ["model_info", "test_set_performance max_examples=40 train_examples=20 device=cpu",
+                 "cluster_consistency permutations=20"]
+
+
 # ===========================================================================
 # Runner and report
 # ===========================================================================
 
 def write_report(ctx, results, path):
-    lines = [f"# Evo 2 validation report", "",
+    lines = ["# Evo 2 validation report", "",
              f"- model: `{ctx.model.path}`",
              f"- graph: `{ctx.graph.dir}`",
              f"- train: {len(ctx.train_idx):,} individuals ({ctx.split_info.get('train_source')})",
@@ -911,13 +1107,14 @@ def list_tasks():
             print(f"    {p.name} ({typ}, {default})")
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", help="fine-tuned model file from step 4 (.pt)")
-    ap.add_argument("--graph-dir", default="haplograph/genome", help="output folder of 1_build_graph.py")
+    ap.add_argument("--graph-dir", default="haplograph/genome_train_half_A", help="output folder of 1_build_graph.py")
     sg = ap.add_argument_group("train / test split")
-    sg.add_argument("--splits", default=BH26_SPLITS,
-                    help="folder or URL with the split files (default: BH_26 split); 'none' = model's held-out set")
+    sg.add_argument("--splits", default=GRAPH_SPLIT,
+                    help="'graph' (default) = the graph folder's train/test_individuals.txt; a folder or URL "
+                         f"with the split files, e.g. {BH26_SPLITS}/; 'none' = model's held-out set")
     sg.add_argument("--train-file", default="half_A.txt", help="train file name inside --splits")
     sg.add_argument("--test-file", default="half_B.txt", help="test file name inside --splits")
     sg.add_argument("--train-individuals", help="explicit train file or URL (overrides --splits)")
@@ -932,7 +1129,17 @@ def main():
     ap.add_argument("--list-tasks", action="store_true", help="print available tasks and their parameters")
     ap.add_argument("--cudf", action="store_true",
                     help="run the pandas parts (e.g. reading GWAS files) on the GPU with RAPIDS cuDF")
-    args = ap.parse_args()
+    ng = ap.add_argument_group("Nemotron summary (optional)")
+    ng.add_argument("--nemotron-summary", action="store_true",
+                    help="ask an NVIDIA Nemotron model (NIM API, key in $NVIDIA_API_KEY) to interpret the report")
+    ng.add_argument("--nemotron-model", default="nvidia/llama-3.3-nemotron-super-49b-v1")
+    ng.add_argument("--nemotron-url", default="https://integrate.api.nvidia.com/v1",
+                    help="OpenAI-compatible endpoint (build.nvidia.com or a self-hosted NIM)")
+    ap.add_argument("--test", action="store_true",
+                    help="self-test: synthetic data, a mock-backbone model from step 4 --test, all tasks (CPU)")
+    args = ap.parse_args(argv)
+    if args.test:
+        self_test(args)
 
     for p in args.plugins:
         load_plugin(p)
@@ -948,7 +1155,10 @@ def main():
     specs += [parse_task_line(t, "--task") for t in args.task]
     specs += [("gwas_enrichment", {"gwas": g}) for g in args.gwas]
     if not specs:
-        specs = [("model_info", {}), ("cluster_consistency", {})]
+        specs = [("model_info", {})]
+        if model_kind(Model(args.model).meta).startswith("4a"):
+            specs.append(("test_set_performance", {}))
+        specs.append(("cluster_consistency", {}))
     jobs = []
     for name, raw in specs:
         if name not in TASKS:
@@ -994,6 +1204,10 @@ def main():
     n_fail = sum(r["status"] != "ok" for r in results)
     log(f"report: {os.path.join(args.out_dir, 'report.md')}"
         + (f"  ({n_fail} task(s) failed)" if n_fail else ""))
+    if args.nemotron_summary:
+        nemotron_summary(args, results, os.path.join(args.out_dir, "nemotron_summary.md"))
+    if args.test and n_fail:
+        die(f"self-test: {n_fail} task(s) failed")
 
 
 if __name__ == "__main__":

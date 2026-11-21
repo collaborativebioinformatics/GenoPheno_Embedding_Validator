@@ -1,0 +1,7 @@
+# Part 1 (haplograph -> embeddings -> Evo 2), CPU-capable core. See DOCUMENTATION.md for the GPU
+# extras: evo2 + flash-attn (install_evo2.sh), RAPIDS cuDF / cuML / CuPy, and the BioNeMo container.
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+torch>=2.2
+xgboost>=2.0
