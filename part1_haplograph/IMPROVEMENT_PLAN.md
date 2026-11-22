@@ -38,6 +38,12 @@ next-cluster prediction is a well-posed task.
 | H9 | Phenotype prediction from individual embeddings | Dropped (no real phenotypes in 1000G) |
 | H10 | Genome-wide (cross-chromosome) sequences | Dropped (memory / context) |
 | H11 | Report the share of test targets that are merged rare tokens | Pursue (iteration 2, with H5) |
+| H12 | Positive control: the step-4 learning setup reaches at least ~bigram test top-1 when the signal is learnable; otherwise the objective / head is broken | Pursue (iteration 3) |
+| H13 | Score only the current and next region's tokens (exact, cheaper) | Dropped in iteration 3 (merging already cut the vocabulary; extra code) |
+| H14 | GPU smoke mode for Evo 2 loading | Dropped in iteration 3 (cannot be verified without a GPU) |
+| H15 | (number not used) | – |
+| H16 | Calibration (ECE) of next-token probabilities | Dropped in iteration 3 (the loss already reflects it) |
+| H17 | Positional signal in the mock backbone | Superseded in iteration 3: H12 failed for lack of genomic position in the inputs, fixed for every backbone by `--pos-freqs` |
 
 ## Pipeline changes
 
@@ -48,6 +54,7 @@ next-cluster prediction is a well-posed task.
 | 4 / 5 `--min-support` **[done, iteration 2]** | Rare-cluster merging; share of merged test targets reported | H5, H11 |
 | ~~6~~ | ~~Model comparison table~~ (dropped, iteration 2) | H6 |
 | ~~runner~~ | ~~Config-driven `run_pipeline.py`~~ (dropped, iteration 2) | H7 |
+| 4 / 5 `--pos-freqs` **[done, iteration 3]** | Genomic-position encoding appended to embeddings (inputs and candidate keys); positive-control tests | H12 |
 
 Review changelog: round 1 restricted H1 to pairs in different regions with a minimum test support and
 distance-matched negatives (avoids "nearby = similar" and noisy rare-cluster lift); round 2 made
@@ -85,7 +92,25 @@ round 3 had no substantive change.
 
 - Iteration 1: H1-H4 in step 5 (no GPU needed), tested on synthetic data and chr21.
 - Iteration 2: H5/H11 and the minimalism pass M1-M2.
-- Iteration 3: re-brainstormed against the iteration-2 results.
+- Iteration 3: H12 positive control (regression test + chr21 CPU experiment); fix what it reveals.
+
+## Iteration 3 (final)
+
+Every model so far had test top-1 near 0 while the bigram reaches 0.44, and nothing showed that the
+step-4 learning setup can learn at all. H12 is that positive control: on synthetic data the mock
+backbone must reach >= 0.8 x the bigram's top-1 within a few seconds (fixed seed), and on chr21 a
+longer CPU run shows how far it gets. Review changelog: round 1 set the pass bar at bigram level
+(beating chance proves little); round 2 required a fast, deterministic test; round 3 no change.
+
+Result: the control FAILED at first (synthetic: top-1 0.13 vs bigram 0.49 after 420 steps, while
+region-conditioned top-1 was 0.66): the inputs and candidate keys carried no genomic position, so the
+model could not tell which region comes next. Fix: `--pos-freqs` (default 16) appends a sin/cos
+encoding of the cluster's start to every embedding (standardized; wavelengths 10 kb .. the graph's largest
+start). Final control (test settings: 60 epochs, 317 predictions on step 4's validation individuals): top-1 0.48 with the
+encoding vs 0.11 without, bigram 0.53 (0.9 x). A regression test asserts >= 0.8 x bigram, another
+that the encoding is appended. On chr21, 3 CPU epochs of the small
+mock: test top-1 0.041 with vs 0.010 without the encoding, bigram 0.44: a real GPU training budget is
+needed to know whether Evo 2 beats the bigram there.
 
 ## Testing steps
 

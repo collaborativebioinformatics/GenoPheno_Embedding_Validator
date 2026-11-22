@@ -42,7 +42,7 @@ def _step4_default_min_support(G):
 def test_step5_reproduces_stored_val_accuracy_with_min_support(graph_copy, tmp_path):
     """Steps 4 and 5 must build the same merged vocabulary (tokens, local indices, mean
     embeddings): with --splits none, step 5 on the model's own validation individuals must
-    reproduce the validation accuracy and loss stored in the checkpoint."""
+    reproduce the validation accuracy stored in the checkpoint."""
     out = tmp_path / "k3.pt"
     script("4a_finetune_evo2_embeddings").main(
         ["--graph-dir", str(graph_copy), "--min-support", "3", "--val-examples", "1000",

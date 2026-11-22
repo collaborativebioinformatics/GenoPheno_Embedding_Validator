@@ -447,7 +447,9 @@ def model_info(ctx):
         test_names = [ctx.graph.individuals[i] for i in ctx.test_idx] if ctx.test_idx is not None else []
         if trained is not None and test_names:
             # the checkpoint lists who it was trained and validated on; both must exclude the test set
-            trained = set(trained) | set(held or [])
+            # with --splits none the test set IS the validation set (used for reporting only)
+            own_split = ctx.split_info.get("test_source") == "held-out individuals stored in the model"
+            trained = set(trained) | (set() if own_split else set(held or []))
             leaked = [x for x in test_names if x in trained]
             s["test_individuals_seen_in_training"] = len(leaked)
             notes.append(f"WARNING: {len(leaked):,} of {len(test_names):,} test individuals are in the model's "

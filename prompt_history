@@ -207,3 +207,28 @@ Iteration 2 (priority: minimal, non-redundant code)
     Redundancy removed: METHODS and EDGE_FILE defined once in haplo_common; step 5 fetch() replaced
        by read_individual_list; individuals/carriers check once in GenomeData; Model._names helper;
        repeated meta["config"] lookups.
+  Committed as 969b591.
+
+Iteration 3 (final)
+  Brainstorm: pursued H12, a positive control for the step-4 learning setup (every model so far had
+  test top-1 ~0 vs bigram 0.44, and nothing showed the setup could learn at all); H17 (positional
+  signal) as backup; dropped H13 (local softmax), H14 (GPU smoke mode), H16 (calibration).
+  Result: the control FAILED (synthetic, mock backbone: top-1 0.13 vs bigram 0.49, region-conditioned
+  0.66): inputs and candidate keys had no genomic position, so no model - Evo 2 included - could tell
+  which region comes next. Fix: step 4 --pos-freqs (default 16) appends a standardized sin/cos
+  encoding of each cluster's start to its embedding (input and candidate keys); stored in the
+  checkpoint, reapplied by step 5 (older checkpoints: none). Control: 0.48 with vs 0.11 without the
+  encoding, bigram 0.53 (317 held-out predictions). chr21, 3 CPU epochs of the mock: 0.041 with vs
+  0.010 without, bigram 0.44 - a real GPU training budget is needed there.
+  Code review (7 findings, all fixed): the control test passed by one prediction (now half the
+  training set held out, >= 200 predictions asserted); the "fails without encoding" test replaced by
+  a shape/scale test; encoding standardized and wavelengths capped at the chromosome span (no
+  constant columns); docs quote the test's own numbers; no-op test arguments removed; --pos-freqs < 0
+  rejected; unknown starts encoded as 0.
+  Spec-tester (no critical/high/medium; 2 low, 3 info; all fixed): --pos-freqs 1 now uses the longest
+  wavelength (was 10 kb only); docs say "largest start coordinate", NaN-safe floor; model_info no
+  longer flags the validation set as leakage under --splits none; test docstring; plan table updated
+  (--pos-freqs row, H17 superseded, H15 slot). Confirmed: steps 4 and 5 build the same encoding (any
+  --chroms), stored metrics reproduce, and the control holds on the graph's real test half (0.51 vs
+  0.13, bigram 0.52). tests/test_audit3.py added (22 tests in total, all passing).
+  Final pipeline code: 4025 lines (tests: 487).

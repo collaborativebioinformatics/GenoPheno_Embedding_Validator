@@ -1,7 +1,8 @@
 """
 Step 4 - fine-tune Evo 2 on the step-3 node embeddings (no DNA). One example = one training
 individual on one chromosome: their clusters in genomic order, each replaced by its embedding,
-projected into Evo 2 in place of its nucleotide embeddings (plus a per-chromosome vector). Evo 2
+projected into Evo 2 in place of its nucleotide embeddings (plus a per-chromosome vector; every
+embedding first gets a sin/cos encoding of its genomic start appended, --pos-freqs). Evo 2
 runs up to its read-out layer, the last --train-blocks blocks are fine-tuned (fp32 master weights;
 0 = frozen baseline), and a head predicts the NEXT cluster among the chromosome's tokens. Clusters
 carried by fewer than --min-support (default 2) of these training individuals share one token per
@@ -66,7 +67,7 @@ def train(args):
     if len(perm) - n_val < 1:
         die(f"only {len(perm)} training individuals: too few to hold out {n_val} for validation")
     val_inds, tr_inds = perm[:n_val], perm[n_val:]
-    data = GenomeData(args.graph_dir, args.method, args.chroms, args.min_support, tr_inds)
+    data = GenomeData(args.graph_dir, args.method, args.chroms, args.min_support, tr_inds, args.pos_freqs)
     train_ex, val_ex = data.examples(tr_inds), data.examples(val_inds)
     if not train_ex or not val_ex:
         die("no training / validation sequences with at least 2 clusters; check --chroms and the graph")
@@ -127,6 +128,9 @@ def main(argv=None):
     ap.add_argument("--sample-map", help="CSV: graph individual name, sample ID (if they differ)")
     ap.add_argument("--max-len", type=int, default=1024, help="max clusters per training sequence")
     ap.add_argument("--temperature", type=float, default=0.1)
+    ap.add_argument("--pos-freqs", type=int, default=16,
+                    help="genomic-position encoding: sin/cos at this many wavelengths appended to every "
+                         "embedding (0 = embeddings only; without it the model cannot tell where a cluster is)")
     ap.add_argument("--min-support", type=int, default=2,
                     help="clusters carried by fewer training individuals become one token per haploblock region "
                          "(0 = no merging; 2 = default, so the merged token also occurs in training)")
@@ -154,6 +158,8 @@ def main(argv=None):
     check_args(args, training=True)
     if args.max_len < 2:
         die("--max-len must be >= 2")
+    if args.pos_freqs < 0:
+        die("--pos-freqs must be >= 0")
     require_files(args.graph_dir, ["nodes.csv.gz", "individuals.txt", "carriers.npz"], "1_build_graph.py")
     require_files(args.graph_dir, [f"node_emb_{args.method}.npy"], f"3_node_embeddings.py --method {args.method}")
     train(args)

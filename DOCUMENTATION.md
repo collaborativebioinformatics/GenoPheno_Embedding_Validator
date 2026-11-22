@@ -172,7 +172,7 @@ If XGBoost runs out of memory, lower `--chunk-nodes`, `--xgb-svd-nodes`, `--xgb-
 ### Step 4: `4a_finetune_evo2_embeddings.py`
 
 Fine-tunes Evo 2 7B on node embeddings, with no DNA involved. One example is one individual on one chromosome: their clusters in genomic order, each replaced by its embedding.
-- The embeddings are projected into Evo 2 in place of its DNA-letter embeddings, plus a learned per-chromosome vector.
+- The embeddings are projected into Evo 2 in place of its DNA-letter embeddings, plus a learned per-chromosome vector. Each embedding first gets a **genomic-position encoding** appended (sin / cos of the cluster's start at `--pos-freqs` wavelengths from 10 kb to the graph's largest start coordinate, standardized like the embedding; unknown starts get 0), used both as input and in the candidate keys the head is scored against. Node embeddings describe carrier and linkage structure, not location, so without it the model cannot tell which region comes next. Positive control (`tests/test_iteration3.py`: synthetic data, mock backbone, 60 epochs, 317 predictions on step 4's validation individuals): top-1 0.48 with the encoding vs 0.11 without, against a bigram of 0.53; on the graph's test half, never used for the graph or embeddings: 0.51 vs 0.13, bigram 0.52 (641 predictions).
 - Evo 2 runs up to its read-out layer. Its last `--train-blocks` blocks before it are fully fine-tuned; the rest stay frozen. Evo 2 is kept in bf16, so the optimizer steps on fp32 master copies of the unfrozen weights and writes them back after every step (updating bf16 weights in place at `--lr 1e-5` would round every update away).
 - Step 4 refuses embeddings made from an earlier build of the graph (different `graph_id`) or another training set.
 - Rare clusters: most clusters are carried by one person, and 38.6% of chr21 clusters never occur in the training half, so predicting their identity is impossible. `--min-support` merges rare clusters into one "rare cluster of this region" token, counting carriers among step 4's own training individuals (not its validation individuals). The default `2` also merges clusters with one training carrier, so the token occurs in training and can be learned (at `1` it never would: on chr21 0 of 559 merged tokens are learnable, at `2` 550 of 567). A region whose rare clusters were all unseen in training still has an unlearnable token. `test_set_performance` reports the share of test targets that are merged tokens.
@@ -202,6 +202,7 @@ Fine-tunes Evo 2 7B on node embeddings, with no DNA involved. One example is one
 | `--max-len` | `1024` | max clusters per sequence (memory grows with it × the clusters on the chromosome) |
 | `--epochs` | `1` | passes over the training sequences |
 | `--chroms` | all of the graph | train on some chromosomes only |
+| `--pos-freqs` | `16` | genomic-position encoding (sin/cos at this many wavelengths); `0` = embeddings only |
 | `--min-support` | `2` | clusters carried by fewer of step 4's training individuals share one token per haploblock region (embedding = mean of its members); `0` = no merging. On chr21 (1,127 training individuals): 166,754 tokens without merging, 95,874 at `1`, 29,034 at `2`, 10,965 at `5` |
 
 ### Step 4b: `4b_finetune_evo2_hash.py` (optional)
@@ -331,7 +332,8 @@ Earlier versions of this document described LoRA adapters, `--micro-batch` and a
 - **Evo 2 was trained on DNA, never on these inputs.**
   - Step 4 replaces its nucleotide inputs with projected graph embeddings, and 4b feeds 0/1 characters. Neither is something Evo 2 has seen.
   - What is tested is whether its architecture and weights are a useful starting point. Its DNA knowledge doesn't transfer directly.
-  - Always compare with a `--train-blocks 0` baseline and with the bigram baseline of `test_set_performance`. On chr21 the bigram baseline already reaches 41% top-1 accuracy.
+  - Always compare with a `--train-blocks 0` baseline and with the bigram baseline of `test_set_performance`. On chr21 the bigram baseline already reaches 41% top-1 accuracy (44% with the default `--min-support 2`).
+  - The learning setup passes a positive control on synthetic data (the mock backbone reaches 0.9 × the bigram's top-1, see step 4). On chr21, 3 CPU epochs of the small mock reached test top-1 0.041 with the position encoding vs 0.010 without, still far below the bigram's 0.44: whether Evo 2 gets there needs a GPU run with a real training budget.
 - **Edges exist only within chromosomes.** The genome-wide graph is 22 disconnected pieces.
   - node2vec vectors can't be compared across chromosomes; step 4 adds a per-chromosome vector to compensate.
   - Training sequences are per chromosome; there's no genome-wide sequence per person.

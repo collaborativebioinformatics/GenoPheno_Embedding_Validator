@@ -47,6 +47,15 @@ and usage (options live in `--help`, the rest in DOCUMENTATION.md); remove dead 
 duplicated across scripts. Every `--test` and `python -m pytest tests` must still pass; report the
 line count before and after.
 
+## Iteration 3 (positive control)
+
+**H12 implement / test.** Add a regression test that trains step 4 with `--mock-evo2` on the synthetic
+haplograph for enough steps (fixed seed, < 30 s on CPU) and asserts that its validation top-1 is at
+least 0.8 x the bigram's top-1 on the same validation individuals. If it fails, find out why (head,
+temperature, learning rates, positional information in the mock) and fix the cause in
+`evo2_model.py` / step 4, keeping the code minimal. Then run a longer chr21 CPU experiment and record
+the result in DOCUMENTATION.md.
+
 ## Integration and documentation
 
 Run every `--test`, then the chr21 CPU run of DOCUMENTATION.md section 11.2, and update

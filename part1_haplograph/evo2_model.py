@@ -35,9 +35,12 @@ class GenomeData:
     min_support: clusters carried by fewer than this many of the individuals `support_from` (column
     indices; step 4's own training individuals) are merged into one token per haploblock region
     (embedding = mean of its members), so clusters barely seen in training are predicted as "a rare
-    cluster of this region" instead of an unlearnable identity."""
+    cluster of this region" instead of an unlearnable identity.
+    pos_freqs: append sin/cos of the cluster's genomic start at this many log-spaced wavelengths
+    (10 kb .. the graph's largest start coordinate), standardized like the embedding; node embeddings alone
+    don't say where a cluster is, so without them the model cannot tell which region comes next."""
 
-    def __init__(self, graph_dir, method, chroms, min_support, support_from):
+    def __init__(self, graph_dir, method, chroms, min_support, support_from, pos_freqs=0):
         nodes = pd.read_csv(os.path.join(graph_dir, "nodes.csv.gz"))
         emb_file = os.path.join(graph_dir, f"node_emb_{method}.npy")
         Z = np.load(emb_file).astype(np.float32)
@@ -45,6 +48,14 @@ class GenomeData:
             die(f"node_emb_{method}.npy has {len(Z)} rows, nodes.csv.gz has {len(nodes)}")
         self.emb_sha1 = hashlib.sha1(np.ascontiguousarray(Z).tobytes()).hexdigest()[:12]
         self.Z = (Z - Z.mean(0)) / (Z.std(0) + 1e-6)
+        if pos_freqs:
+            pos = nodes["start"].to_numpy(dtype=np.float64)
+            top = np.fmax(np.nanmax(pos) if np.isfinite(pos).any() else 0, 2e4)
+            waves = np.geomspace(1e4, top, pos_freqs) if pos_freqs > 1 else np.array([top])
+            angle = pos[:, None] / waves * 2 * np.pi
+            P = np.hstack([np.sin(angle), np.cos(angle)])
+            P = (P - np.nanmean(P, 0)) / (np.nanstd(P, 0) + 1e-6)
+            self.Z = np.hstack([self.Z, np.nan_to_num(P)]).astype(np.float32)   # unknown start -> 0
 
         present = sorted(nodes["chrom"].unique(), key=chrom_key)
         self.chroms = list(chroms or present)
@@ -554,7 +565,7 @@ def load_finetuned(meta, graph_dir, device=None, ckpt_dir=None):
     pos = {x: i for i, x in enumerate(read_graph_individuals(graph_dir))}
     trained = [pos[x] for x in meta.get("train_individuals") or [] if x in pos]
     data = GenomeData(graph_dir, meta["graph_method"], meta.get("chroms"),
-                      cfg.get("min_support", 0), trained)          # older models: min_support 0, no merging
+                      cfg.get("min_support", 0), trained, cfg.get("pos_freqs", 0))   # older models: neither
     from haplo_common import graph_id
     if meta.get("graph_id") and meta["graph_id"] != graph_id(graph_dir):
         raise ValueError(f"the model was trained on another build of this graph (graph_id {meta['graph_id']}, "
