@@ -31,12 +31,13 @@ next-cluster prediction is a well-posed task.
 | H2 | Model-vs-baseline claims need paired bootstrap CIs over test individuals | Pursue (iteration 1) |
 | H3 | Bigram conditional entropy on train is the reference cross-entropy a model with more context should beat | Pursue (iteration 1) |
 | H4 | Accuracy within the true next region separates haplotype knowledge from position knowledge | Pursue (iteration 1) |
-| H5 | Collapsing clusters with train support < k into one per-region rare token makes the task well-posed | Backup (iteration 2) |
-| H6 | One comparison table across embedding methods and frozen/fine-tuned models | Backup (iteration 2) |
-| H7 | One config-driven runner for steps 0-5 | Backup (iteration 2-3) |
+| H5 | Collapsing clusters with train support < k into one per-region rare token makes the task well-posed | Pursue (iteration 2) |
+| H6 | One comparison table across embedding methods and frozen/fine-tuned models | Dropped in iteration 2 (summary.json already holds it; minimalism) |
+| H7 | One config-driven runner for steps 0-5 | Dropped in iteration 2 (duplicates DOCUMENTATION section 11; minimalism) |
 | H8 | Test accuracy stratified by population | Dropped for now (ancestry removed from the pipeline by design) |
 | H9 | Phenotype prediction from individual embeddings | Dropped (no real phenotypes in 1000G) |
 | H10 | Genome-wide (cross-chromosome) sequences | Dropped (memory / context) |
+| H11 | Report the share of test targets that are merged rare tokens | Pursue (iteration 2, with H5) |
 
 ## Pipeline changes
 
@@ -44,9 +45,9 @@ next-cluster prediction is a well-posed task.
 |---|---|---|
 | 5 `embedding_cooccurrence` **[done, iteration 1]** | New CPU-only task: AUC of embedding cosine for cluster pairs that co-occur (lift >= threshold) among TEST individuals vs distance-matched random pairs, per embedding method; pairs in different regions only | H1 |
 | 5 `test_set_performance` **[done, iteration 1]** | Paired cluster bootstrap over test individuals (95% CIs for model, bigram and their difference); region-conditioned top-1; bigram conditional entropy on train as a reference cross-entropy | H2, H3, H4 |
-| 4 / 5 | Optional rare-cluster collapsing (`--min-support`) | H5 |
-| 6 | Model comparison table | H6 |
-| runner | Config-driven `run_pipeline.py` | H7 |
+| 4 / 5 `--min-support` **[done, iteration 2]** | Rare-cluster merging; share of merged test targets reported | H5, H11 |
+| ~~6~~ | ~~Model comparison table~~ (dropped, iteration 2) | H6 |
+| ~~runner~~ | ~~Config-driven `run_pipeline.py`~~ (dropped, iteration 2) | H7 |
 
 Review changelog: round 1 restricted H1 to pairs in different regions with a minimum test support and
 distance-matched negatives (avoids "nearby = similar" and noisy rare-cluster lift); round 2 made
@@ -67,11 +68,24 @@ model-baseline difference; round 3 had no substantive change, so the review stop
   conditional entropy 1.82 nats on train (a reference, not a floor: models with more context can
   go below it). A real Evo 2 run has to beat the bigram top-1 with a CI excluding 0.
 
+## Iteration 2 (priority: minimal, non-redundant code)
+
+| Item | Change |
+|---|---|
+| H5 + H11 | `--min-support k` in step 4 (`GenomeData`): clusters with training support < k become one token per haploblock region (embedding = mean of its members); default 2 (the second audit showed that at 1 the merged token never occurs in training, so it cannot be learned); carriers counted on step 4's own training individuals. Stored in the checkpoint and reapplied by step 5, which also reports the share of test targets that are merged |
+| M1 | Module docstrings keep purpose, input/output files and usage; option tables and prose duplicated in DOCUMENTATION.md / `--help` are removed |
+| M2 | Remove dead or duplicated code across part 1 |
+
+Review changelog: round 1 checked that the collapsed token uses no test information (membership from
+`support_train`, embedding = mean of train-only step-3 embeddings) and added a fallback to `support`
+with a warning for `--no-split` graphs; round 2 kept the file-format contracts in the docstrings;
+round 3 had no substantive change.
+
 ## Development plan
 
 - Iteration 1: H1-H4 in step 5 (no GPU needed), tested on synthetic data and chr21.
-- Iteration 2: H5 and H6, re-brainstormed against the iteration-1 results.
-- Iteration 3: H7 and whatever iteration 2's review leaves open.
+- Iteration 2: H5/H11 and the minimalism pass M1-M2.
+- Iteration 3: re-brainstormed against the iteration-2 results.
 
 ## Testing steps
 
@@ -81,5 +95,6 @@ model-baseline difference; round 3 had no substantive change, so the review stop
   reference (node2vec is weak there under the tiny self-test walk budget, so it is not asserted). The step-5
   `--test` asserts these properties. On chr21, compare methods.
 - `test_set_performance`: the CIs must contain the point estimates; with `--splits none` the
-  model's stored validation accuracy must still be reproduced exactly.
+  model's stored validation accuracy must still be reproduced exactly (when step 4 evaluated all
+  validation sequences, i.e. at most `--val-examples`).
 - End to end: the real chr21 run of DOCUMENTATION.md section 11.2.

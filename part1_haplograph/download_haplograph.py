@@ -1,41 +1,23 @@
 """
-Step 0 - download the 1000 Genomes haplograph and make the train / test split of individuals.
+Step 0 - download the 1000 Genomes haplograph and write the train / test split of individuals.
 
-Downloads, genome-wide (chr1-chr22, the default) or for selected chromosomes (--chroms), the files
-the pipeline needs from https://data.haploblocks.org/haplograph/1000G/<chrom>/, checks them against
-the dataset's checksums.md5, and writes the TRAINING and TEST sets of individuals used by the rest
-of the pipeline: steps 1-4 learn from the training individuals only, and step 5 validates the
-fine-tuned Evo 2 on the test individuals.
+Downloads nodes.csv.gz and the edge file of every chromosome (chr1-chr22, or --chroms) from
+https://data.haploblocks.org/haplograph/1000G/, checks them against checksums.md5, and writes the
+TRAINING set (steps 1-4 learn from it) and the TEST set (step 5 validates on it): the BH_26 halves
+(--split bh26, default) or a new population-stratified random split (--split random).
 
-SPLIT (--split)
-  bh26    (default) the published BH_26 split, stratified by population:
-          https://data.haploblocks.org/BH_26/splits/  half_A.txt = train (1,252), half_B.txt = test (1,251)
-  random  a new random split; --test-fraction (default 0.5) of the individuals go to the test set,
-          stratified by 1000G population (from phenotypes_real.csv) unless --no-stratify.
-  Only individuals present in the haplograph are written; IDs of the split that are not in the
-  haplograph (about 45 for BH_26) are counted in split.json.
-
-OUTPUT  (in --workdir, default haplograph/)
-  raw/<chrom>/nodes.csv.gz        one row per haploblock cluster: id, high_dim_edge (the haploblock
-                                  region), then one 0/1 column per individual (2,548 in 1000G)
-  raw/<chrom>/edges.csv.gz        source, target, weight (co-occurring cluster pairs)   (--edges all)
-  raw/<chrom>/edges_lift_above_threshold.csv.gz   same + lift, only lift >= 5         (--edges lift5)
-  splits/train_individuals.txt    TRAINING set: one sample ID per line
-  splits/test_individuals.txt     TEST set: one sample ID per line
-  splits/split.json               split name, source, sizes, chromosomes, set ids
-  (bh26 also keeps the original splits/half_A.txt and splits/half_B.txt)
+OUTPUT (in --workdir, default haplograph/)
+  raw/<chrom>/nodes.csv.gz        id, high_dim_edge (haploblock region), one 0/1 column per individual
+  raw/<chrom>/edges.csv.gz        source, target, weight   (or edges_lift_above_threshold.csv.gz, --edges lift5)
+  splits/train_individuals.txt    one sample ID per line (only individuals present in the haplograph)
+  splits/test_individuals.txt
+  splits/split.json               split name, source, sizes, set ids
 
 USAGE
-  python download_haplograph.py                               # whole genome, BH_26 split
-  python download_haplograph.py --chroms chr21,chr22          # two chromosomes only
-  python download_haplograph.py --chroms 21 --edges lift5     # small pre-filtered edge file
+  python download_haplograph.py                          # whole genome (~15 GB), BH_26 split
+  python download_haplograph.py --chroms chr21,chr22
   python download_haplograph.py --split random --test-fraction 0.3 --seed 1
-  python download_haplograph.py --test                        # synthetic data, no network
-
-Sizes: edges.csv.gz is ~80 MB (chr21) to ~1 GB (large chromosomes) per chromosome; nodes.csv.gz is
-~7-100 MB. Whole genome: plan for ~15 GB of disk.
-
-REQUIRES  numpy, pandas (stdlib only for the download itself)
+  python download_haplograph.py --test                   # synthetic data, no network
 """
 import argparse
 import gzip
@@ -47,13 +29,9 @@ from pathlib import Path
 
 import numpy as np
 
-from haplo_common import (ALL_CHROMS, BASE_URL, BH26_SPLITS, die, download, log, make_synthetic_haplograph,
+from haplo_common import (ALL_CHROMS, BASE_URL, EDGE_FILE, BH26_SPLITS, die, download, log, make_synthetic_haplograph,
                           parse_chroms, read_individual_list, set_id, test_workdir, url_cache_path,
                           write_individual_list)
-
-EDGE_FILES = {"all": ["edges.csv.gz"], "lift5": ["edges_lift_above_threshold.csv.gz"],
-              "both": ["edges.csv.gz", "edges_lift_above_threshold.csv.gz"]}
-
 
 def md5(path, block=1 << 20):
     h = hashlib.md5()
@@ -175,7 +153,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--chroms", help="comma-separated chromosomes, e.g. chr21,chr22 or 21,22 (default: all, chr1-chr22)")
     ap.add_argument("--workdir", default="haplograph", help="root folder for raw/ and splits/")
-    ap.add_argument("--edges", choices=sorted(EDGE_FILES), default="all",
+    ap.add_argument("--edges", choices=sorted(EDGE_FILE) + ["both"], default="all",
                     help="all = edges.csv.gz (needed for a train-only graph); lift5 = small pre-filtered file")
     ap.add_argument("--split", choices=["bh26", "random"], default="bh26")
     ap.add_argument("--splits-url", default=BH26_SPLITS, help="folder with half_A.txt / half_B.txt (bh26)")
@@ -200,7 +178,7 @@ def main(argv=None):
         checksums = None if args.no_verify else load_checksums(args.workdir)
         log(f"downloading {len(chroms)} chromosome(s) into {args.workdir}/raw ({args.edges} edges)")
         for chrom in chroms:
-            fetch_chromosome(args.workdir, chrom, ["nodes.csv.gz"] + EDGE_FILES[args.edges], checksums)
+            fetch_chromosome(args.workdir, chrom, ["nodes.csv.gz"] + (list(EDGE_FILE.values()) if args.edges == "both" else [EDGE_FILE[args.edges]]), checksums)
 
     individuals = None
     for chrom in chroms:                       # every chromosome must list the same individuals

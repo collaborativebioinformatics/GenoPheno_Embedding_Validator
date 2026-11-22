@@ -1,154 +1,40 @@
 """
-Step 5 - validate a fine-tuned Evo 2 model (from 4a_finetune_evo2_embeddings.py) on the held-out
-TEST set of individuals (the model was trained on the TRAIN individuals of the same split).
+Step 5 - validate a fine-tuned Evo 2 model (step 4) on the held-out TEST individuals.
 
-The script is a small task runner: every check is a TASK, and you choose which tasks to run (and
-with which parameters) in a plain-text TASKS FILE, one task per line. Add a line to run a check
-again with other settings (e.g. another GWAS trait); write a plugin file to add a new kind of check.
+A small task runner: the checks to run are listed one per line in a tasks file (validation_tasks.txt;
+`--list-tasks` shows every task and its parameters); new checks go in a --plugins file using the
+`task` decorator (example and `ctx` fields: DOCUMENTATION.md section 7).
+  model_info              model type, stored metrics, train/test leakage
+  test_set_performance    queries the model on the test individuals: next-cluster loss, top-1/top-k,
+                          region-conditioned top-1, vs training individuals and a bigram baseline,
+                          with paired bootstrap CIs over test individuals (needs step 4's backbone)
+  embedding_cooccurrence  do the step-3 embeddings predict cluster co-occurrence in the test individuals?
+  cluster_consistency     do train and test carry the same clusters per haploblock? (permutation null)
+  gwas_enrichment         haploblocks with more GWAS hits than expected (same genome build needed;
+                          column names auto-detected, see GWAS_COLS)
 
-BUILT-IN TASKS
-  model_info           What the model is (4a with the evo2 / BioNeMo / mock backbone, 4b, or
-                       unknown), what it was trained on, its stored training metrics, and a LEAKAGE
-                       check: test individuals that the model did not hold out during training.
-  test_set_performance QUERIES THE FINE-TUNED MODEL on the test individuals: for every test
-                       individual and chromosome, predict each next cluster from the clusters before
-                       it (the training objective) and report cross-entropy, perplexity, top-1 and
-                       top-5 accuracy, per chromosome and overall. Compared with:
-                         - the same metrics on a sample of the model's TRAINING individuals
-                           (generalization gap),
-                         - a bigram baseline counted on the training individuals (most frequent
-                           next cluster after the current one): the model should beat it,
-                         - the validation metrics stored in the checkpoint before / after training.
-                       Needs the same backbone as in training (a GPU for Evo 2 / BioNeMo; the
-                       mock backbone runs on CPU). Reports 95% CIs from a paired bootstrap over
-                       test individuals (model, bigram, model - bigram), top-1 within the target's own
-                       region, and the bigram conditional entropy of the training sequences as a
-                       reference cross-entropy. Writes test_set_performance_chroms.csv.
-  embedding_cooccurrence  Held-out test of the step-3 EMBEDDINGS (no GPU): do clusters with similar
-                       embeddings co-occur (lift >= min_lift) among the TEST individuals? ROC AUC per
-                       embedding method, overall and distance-matched, against genomic proximity and
-                       train-individual lift as references. Writes embedding_cooccurrence.csv.
-  cluster_consistency  Data-level internal consistency of the haploblock clusters between the train
-                       and the test individuals, per haploblock region:
-                         - number of distinct clusters carried in train and in test
-                         - clusters seen only in test (the model never saw them during training)
-                         - total variation distance (TVD) between train and test cluster frequencies
-                         - chi-square test of homogeneity (BH-corrected)
-                       Permutation null: the same statistics for random train/test splits of the
-                       same sizes, so a smaller test set is not mistaken for a shift. If the split
-                       is consistent, about 5% of regions fall outside the 95% interval.
-  gwas_enrichment      Data-level enrichment of GWAS hits (SNPs with P < pvalue) in haploblocks:
-                         - per region: hits vs expected; background = all SNPs of the GWAS file in
-                           the region (hypergeometric test) when the file has full summary
-                           statistics, or region length (Poisson test) when it only has hits;
-                           BH-corrected
-                         - global: hits inside all graph haploblocks vs a circular-shift
-                           permutation null per chromosome (only informative if haploblocks don't
-                           cover the whole chromosome span; the script says so when they do)
+Split: by default the graph's train_individuals.txt / test_individuals.txt (steps 0-1); --splits
+DIR_OR_URL (half_A.txt / half_B.txt), --train/--test-individuals, or --splits none (the model's own
+held-out individuals). Split files: one sample ID per line, or a CSV with an "individual" column.
 
-INPUT
-  --model FILE.pt           one fine-tuned model from step 4 (4a / 4a --bionemo / 4b). Any torch.save
-                            dict works; unknown kinds run as "unknown" and only data-level tasks use
-                            them. Loaded only when a task needs it (needs torch).
-  --graph-dir               output folder of 1_build_graph.py: nodes.csv.gz, individuals.txt,
-                            carriers.npz (formats documented in 1_build_graph.py)
-  TRAIN / TEST SPLIT  (default: the graph's own split, i.e. <graph-dir>/train_individuals.txt and
-                       test_individuals.txt written by 1_build_graph.py from download_haplograph.py)
-    --splits DIR_OR_URL     folder (local path or URL) holding the split files instead, e.g. the
-                            BH_26 folder https://data.haploblocks.org/BH_26/splits/ (also the
-                            fallback when the graph has no test_individuals.txt). Train =
-                            <splits>/half_A.txt (the individuals steps 3-4 were trained on), test =
-                            <splits>/half_B.txt (the individuals Evo 2 is queried on here). Other
-                            names: --train-file / --test-file.
-                            Files given as URLs are downloaded once into <out-dir>/inputs/.
-                            Use --splits none to fall back to the model's own held-out individuals.
-    --train-individuals / --test-individuals FILE_OR_URL
-                            explicit split files; override --splits. Without a train file, train =
-                            every graph individual not in the test set.
-    Split file format: plain text, one sample ID per line, no header ('#' = comment), e.g.
-                              HG00096
-                              NA06985
-                            or a CSV with an "individual" column. half_A.txt has 1,252 and
-                            half_B.txt 1,251 1000 Genomes sample IDs. Individuals of the graph in
-                            neither file are left out of both sets (and counted in the report).
-    --sample-map CSV        only if the graph's individuals (individuals.txt) are not named by
-                            sample ID (e.g. IND1, IND2 ...): 2 columns, graph name, sample ID
-                            (same file format as in steps 1-4)
-  --tasks FILE              tasks file (see below); default: model_info + test_set_performance
-                            (4a models) + embedding_cooccurrence (if the graph has embeddings) +
-                            cluster_consistency; --gwas adds gwas_enrichment to whichever list
-  --gwas FILE               shortcut: adds "gwas_enrichment gwas=FILE"
-  GWAS file (gwas_enrichment gwas=...): tab-, comma- or whitespace-separated text, may be .gz/.zip.
-      Needs chromosome, position (bp, SAME GENOME BUILD as the haploblock regions) and p-value
-      columns; an SNP id column is optional. Auto-detected names (case-insensitive):
-        chromosome  CHR, CHROM, #CHROM, CHR_ID, CHROMOSOME
-        position    POS, BP, CHR_POS, POSITION, BASE_PAIR_LOCATION
-        p-value     P, PVAL, P_VALUE, P-VALUE, PVALUE, P_BOLT_LMM
-        SNP id      RSID, SNP, SNPS, SNPID, MARKERNAME, VARIANT_ID, ID
-      e.g. GIANT height (Yengo et al. 2022: SNPID RSID CHR POS ... P N, hg19) or the GWAS Catalog
-      associations file (CHR_ID CHR_POS SNPS P-VALUE ...). Override with chrom_col= pos_col= p_col=
-      snp_col=. Chromosomes may be written 1 or chr1. Rows that don't parse are skipped.
-
-TASKS FILE  (plain text, one task per line; '#' starts a comment; values with spaces need quotes)
-    model_info
-    test_set_performance max_examples=500
-    embedding_cooccurrence min_lift=2 min_support=5 min_expected=5
-    cluster_consistency min_carriers=1 permutations=200
-    gwas_enrichment gwas=Yengo.2022.height.GWAS.ALL.gz pvalue=5e-8 label=height
-    gwas_enrichment gwas=bmi_catalog.tsv pvalue=1e-6 window=10000 label=bmi_hits
-  `python 5_validate_evo2.py --list-tasks` prints every task with its parameters and defaults.
-
-PLUGINS  (--plugins my_checks.py, repeatable) - a Python file whose functions are registered with
-the `task` decorator, which the script provides to the file:
-    @task("mean_clusters_per_individual", "Average number of clusters carried per test individual")
-    def mean_clusters(ctx, min_support: int = 1):
-        n = ctx.graph.carriers[:, ctx.test_idx].sum(axis=0)
-        return {"summary": {"mean": float(n.mean())}}
-  A task gets `ctx` plus its parameters (converted using the type annotations) and returns a dict
-  with "summary" (dict of numbers/strings), optional "notes" (list of str), optional "files".
-  ctx provides: ctx.graph.nodes (DataFrame), ctx.graph.carriers (CSR uint8 [N, I]),
-  ctx.graph.individuals (list), ctx.graph.region_codes / ctx.graph.regions (per-node region index
-  and the region table), ctx.train_idx / ctx.test_idx (column indices into carriers), ctx.model
-  (.meta = the checkpoint dict, .kind), ctx.out(name) (path inside the output folder), ctx.rng, log().
-
-OUTPUT  (--out-dir, default <graph-dir>/validation_<model file name>/)
-  report.md                          human-readable summary of every task
-  summary.json                       {"model", "test_set", "tasks": [{name, params, status, summary,
-                                       notes, files}]}
-  split.csv                          individual, set (train / test)
-  test_set_performance_chroms.csv    per chromosome: chrom, test_sequences, test_predictions, test_loss,
-                                     test_top1, test_top5, test_region_top1, bigram_top1
-  embedding_cooccurrence.csv         per score (references + one row per embedding method): name, kind,
-                                     auc, auc_distance_matched, auc_frequency_matched, auc_95ci
-  nemotron_summary.md                (--nemotron-summary) plain-language reading of the report
-  cluster_consistency_regions.csv.gz per region: region, chrom, start, end, n_clusters_total,
-                                     n_clusters_train, n_clusters_test, test_expected, test_ci_low,
-                                     test_ci_high, outside_ci, n_test_only, test_only_carriers, tvd,
-                                     tvd_null_mean, tvd_p, chi2, chi2_df, chi2_p, chi2_q
-  gwas_enrichment_<label>_regions.csv.gz
-                                     per region: region, chrom, start, end, n_snps, n_hits,
-                                     expected_hits, fold, p, q, lead_snp, lead_p
-  (a task that is listed twice writes its files with a _2, _3 ... suffix)
-
-NEMOTRON (optional, --nemotron-summary)  sends the task summaries (aggregate numbers only: sample IDs
-  and file paths are removed first) to an NVIDIA Nemotron model on an OpenAI-compatible NVIDIA NIM
-  endpoint (--nemotron-url, default build.nvidia.com's https://integrate.api.nvidia.com/v1, or a
-  self-hosted NIM) and writes its plain-language interpretation to nemotron_summary.md. Needs the
-  API key in $NVIDIA_API_KEY. Off by default; a failure only prints a warning.
+OUTPUT (--out-dir, default <graph-dir>/validation_<model name>/)
+  report.md, summary.json, split.csv (individual, set)
+  test_set_performance_chroms.csv     chrom, test_sequences, test_predictions, test_loss, test_top1,
+                                      test_top<k>, test_region_top1, bigram_top1
+  embedding_cooccurrence.csv          name, kind, auc, auc_distance_matched, auc_frequency_matched, auc_95ci
+  cluster_consistency_regions.csv.gz  region, chrom, start, end, n_clusters_total/_train/_test,
+                                      test_expected, test_ci_low/high, outside_ci, n_test_only,
+                                      test_only_carriers, tvd, tvd_null_mean, tvd_p, chi2, chi2_df, chi2_p, chi2_q
+  gwas_enrichment_<label>_regions.csv.gz   region, chrom, start, end, n_snps, n_hits, expected_hits,
+                                      fold, p, q, lead_snp, lead_p
+  nemotron_summary.md                 --nemotron-summary: an NVIDIA Nemotron reading of the aggregate
+                                      numbers ($NVIDIA_API_KEY; IDs and paths removed, https only)
+  (a task listed twice writes its files with a _2, _3 ... suffix)
 
 USAGE
-  python 5_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G     # graph's own test set
-  python 5_validate_evo2.py --model evo2_next_gnn.pt --splits splits/ --gwas height_hg38.tsv
-  python 5_validate_evo2.py --model evo2_next_gnn.pt --sample-map ind_to_sample.csv
-  python 5_validate_evo2.py --model evo2_hash_height.pt --test-individuals test.txt --tasks my_tasks.txt
-  python 5_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --nemotron-summary
-  python 5_validate_evo2.py --list-tasks
-  python 5_validate_evo2.py --test                                           # synthetic, CPU
-
-REQUIRES  numpy, pandas, scipy; torch to read the model file; for test_set_performance the
-          backbone used in step 4 (evo2 package / BioNeMo container + GPU, or none for --mock-evo2).
-          optional: RAPIDS cuDF (pip install cudf-cu12) for --cudf, which runs the pandas parts (mainly
-          reading GWAS summary statistics) on the GPU
+  python 5_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt
+  python 5_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --gwas height_hg38.tsv
+  python 5_validate_evo2.py --test                       # synthetic data, mock backbone, CPU
 """
 import argparse
 import glob
@@ -177,8 +63,8 @@ import pandas as pd
 import scipy.sparse as sp
 from scipy import stats
 
-from haplo_common import (BH26_SPLITS, die, download, is_url, load_sample_map, log, read_graph_individuals,
-                          read_individual_list, selftest_graph_dir, url_cache_path)
+from haplo_common import (BH26_SPLITS, die, is_url, load_sample_map, log, read_graph_individuals,
+                          read_individual_list, selftest_graph_dir)
 
 
 GRAPH_SPLIT = "graph"
@@ -355,29 +241,19 @@ class Model:
     def kind(self):
         return model_kind(self.meta)
 
-    def held_out_individuals(self):
-        v = self.meta.get("val_individuals") if isinstance(self.meta, dict) else None
+    def _names(self, key):
+        v = self.meta.get(key) if isinstance(self.meta, dict) else None
         return list(v) if v else None
 
+    def held_out_individuals(self):
+        return self._names("val_individuals")
+
     def trained_individuals(self):
-        """Individuals the model was trained on, if the checkpoint records them."""
-        v = self.meta.get("train_individuals") if isinstance(self.meta, dict) else None
-        return list(v) if v else None
+        return self._names("train_individuals")
 
 
 def join_path(base, name):
     return base.rstrip("/") + "/" + name if is_url(base) else os.path.join(base, name)
-
-
-def fetch(path, cache_dir):
-    """Local path as is; a URL is downloaded once into cache_dir (keyed by the URL)."""
-    if not is_url(path):
-        if not os.path.exists(path):
-            die(f"file not found: {path}")
-        return path
-    return download(path, url_cache_path(path, cache_dir),
-                    hint=f"Download the split files yourself, e.g.\n  wget -r -np -nH --cut-dirs=2 -R 'index.html*' "
-                         f"{BH26_SPLITS}/\nand pass the local folder with --splits splits/")
 
 
 class Context:
@@ -432,7 +308,7 @@ class Context:
             test_src = train_src = None
 
         def load(src, what):
-            raw = read_individual_list(fetch(src, cache))
+            raw = read_individual_list(src, cache)
             names = [to_graph.get(x, x) for x in raw]
             found = [x for x in names if x in pos]
             if raw and not found:
@@ -465,6 +341,9 @@ class Context:
                     f"(e.g. {sorted(overlap)[:3]}); removed from train")
             train_set = set(train) - test_set
             train_source = train_src
+        elif not test_src and self.model.trained_individuals():     # --splits none: the model's own split
+            train_set = {x for x in self.model.trained_individuals() if x in pos} - test_set
+            n_train_file, train_source = None, "individuals the model was trained on"
         else:
             train_set, n_train_file = set(inds) - test_set, None
             train_source = "all other graph individuals"
@@ -574,17 +453,8 @@ def model_info(ctx):
             notes.append(f"WARNING: {len(leaked):,} of {len(test_names):,} test individuals are in the model's "
                          f"training or validation set (e.g. {leaked[:3]})" if leaked else
                          "no leakage: no test individual is in the model's training or validation set")
-        elif held is not None and test_names:
-            # 4a checkpoints without a training list: trained on every graph individual except val_individuals
-            held = set(held)
-            leaked = [x for x in test_names if x not in held]
-            s["test_individuals_seen_in_training"] = len(leaked)
-            if leaked:
-                notes.append(f"WARNING: {len(leaked):,} of {len(test_names):,} test individuals were NOT held "
-                             f"out by the model (e.g. {leaked[:3]}), so they were in its training data. "
-                             "Retrain step 4 on the train half only, so the test half stays unseen")
-            else:
-                notes.append("no leakage: every test individual was held out during training")
+        elif kind.startswith("4a"):
+            notes.append("the checkpoint does not record its training individuals: leakage not checked")
         elif kind.startswith("4b"):
             notes.append("4b models are trained on hash-phenotype rows, not individuals; their held-out rows "
                          "are stored as val_rows (indices into the training TSV)")
@@ -897,7 +767,7 @@ def bigram_table(data, chrom, individuals):
     clusters never seen as 'current' fall back to the most frequent next cluster overall.
     Returns (best next [n], sum over transitions of -log p(next | current), number of transitions):
     the plug-in conditional entropy H(next | current) of the training sequences."""
-    n = data.bounds[chrom][1] - data.bounds[chrom][0]
+    n = len(data.candidates(chrom))
     keys = []
     for i in individuals:
         _, local = data.tokens(chrom, i)
@@ -945,8 +815,6 @@ def test_set_performance(ctx, max_examples: int = 500, train_examples: int = 200
     if not model_kind(meta).startswith("4a"):
         raise ValueError(f"test_set_performance needs a 4a model; this is {model_kind(meta)}")
     model, data = load_finetuned(meta, ctx.graph.dir, device or None, ckpt_dir or None)
-    if data.by_ind.shape[0] != len(ctx.graph.individuals):
-        raise ValueError("individuals.txt and carriers.npz disagree")
     rng = ctx.rng
 
     def sample(examples, k):
@@ -983,7 +851,8 @@ def test_set_performance(ctx, max_examples: int = 500, train_examples: int = 200
                 nll = torch.nn.functional.cross_entropy(logits, target, reduction="sum").item()
                 top = logits.topk(k, dim=-1).indices
                 r = rows.setdefault(chrom, {"seq": 0, "n": 0, "nll": 0.0, "top1": 0, "topk": 0, "bigram": 0,
-                                            "region_top1": 0})
+                                            "region_top1": 0, "rare": 0})
+                r["rare"] += int(data.rare[data.candidates(chrom)[target.cpu().numpy()]].sum())
                 r["seq"] += 1; r["n"] += len(target); r["nll"] += nll
                 hit = int((top[:, 0] == target).sum())
                 r["top1"] += hit; r["topk"] += int((top == target[:, None]).any(1).sum())
@@ -1033,6 +902,7 @@ def test_set_performance(ctx, max_examples: int = 500, train_examples: int = 200
         "test_top1_95ci": cis[0] if cis else None,
         f"test_top{top_k}_accuracy": round(topk, 4),
         "test_region_conditioned_top1": round(region_top1, 4),
+        "test_targets_merged_rare_share": round(tot(t_rows, "rare") / n_test, 4),
         "train_sample_top1_accuracy": round(tr_top1, 4) if tr_rows else None,
         "generalization_gap_top1": round(tr_top1 - top1, 4) if tr_rows else None,
         "bigram_baseline_top1_accuracy": round(big, 4),

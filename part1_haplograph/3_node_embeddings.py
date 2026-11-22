@@ -1,68 +1,26 @@
 """
-Step 3 - node embeddings for the graph built by 1_build_graph.py (genome-wide, or whichever
-chromosome selection that graph was built from), with node2vec, a GNN and XGBoost. One model per
-method is trained on the whole graph. No phenotype or ancestry labels are used.
-
-TRAINING INDIVIDUALS  carrier-profile features (gnn, xgboost) use only these individuals, so the
-held-out test set never shapes the embeddings: --train-individuals FILE_OR_URL if given, else
-<graph-dir>/train_individuals.txt (written by 1_build_graph.py), else all individuals. The graph
-itself (node2vec) is train-only when step 1 was run with a training set.
-
-METHODS (--method, default all three; or a comma-separated subset)
-  node2vec  Uses the graph only. Biased random walks (return parameter --p, in-out parameter --q,
-            edge weights = log(1 + lift) unless --n2v-unweighted), then skip-gram with negative
-            sampling, so nodes that appear close together on walks get similar vectors.
-  gnn       Uses the graph + node features. 2-layer GCN trained as a graph autoencoder (link
-            reconstruction with negative sampling). Node features = SVD of the carrier matrix.
-  xgboost   Uses the graph + node features, self-supervised: XGBoost predicts each node's
-            HAPLOBLOCK REGION (regions in genomic order, grouped into --xgb-region-bins bins of about
-            equal node count; with more bins than regions every region is its own class) from
-            [own carrier profile, neighbourhood-averaged profile over the graph]. The leaves each
-            node falls into (across all trees) are one-hot encoded and compressed with SVD.
-            Memory-bounded for large graphs: trains on at most --xgb-train-nodes nodes
-            (compressed QuantileDMatrix), fits the leaf SVD on --xgb-svd-nodes sampled nodes, then
-            embeds all nodes in chunks of --chunk-nodes (embedding = one-hot leaves @ SVD basis,
-            identical to the SVD scores on the sampled nodes). The number of trees is
-            --xgb-trees x number of bins. Still out of memory? Lower those options, --xgb-max-bin,
-            --xgb-region-bins, --xgb-trees or --xgb-depth.
-
-GPU  torch (node2vec, gnn) and XGBoost use CUDA when available (--device to force). --rapids moves
-     the two SVDs (carrier features and leaf basis) to the GPU with RAPIDS cuML + CuPy: the carrier
-     SVD is fitted on --rapids-fit-rows sampled rows and applied in --rapids-chunk chunks, an
-     approximation (on the genome run: val accuracy 0.986 vs 0.992 exact); raise --rapids-fit-rows
-     to close the gap.
-
-Note: the data has only within-chromosome edges, so a genome-wide graph is one disconnected block
-per chromosome. node2vec walks never leave their chromosome, so node2vec vectors are comparable
-within a chromosome but their relative placement across chromosomes is arbitrary. gnn and xgboost
-use one shared feature space (carrier profiles), so their vectors are comparable genome-wide.
-
-INPUT  (in --graph-dir, from 1_build_graph.py)
-  graph.npz        scipy.sparse CSR float32 [N, N], symmetric adjacency      (all methods)
-  individuals.txt  I lines, one individual per line (columns of carriers.npz)
-  train_individuals.txt  (optional) training individuals, one per line (from step 1)
-  carriers.npz     scipy.sparse CSR uint8 [N, I], node x individual carriers  (gnn, xgboost)
-  nodes.csv.gz     node, id, chrom, region, start, ...                        (xgboost, --csv)
+Step 3 - one embedding per graph node, with node2vec, a GNN and XGBoost (--method, default all).
+No labels are used; carrier features use the graph's training individuals only.
+  node2vec  biased random walks on the graph (--p, --q, weights log(1 + lift)) + skip-gram
+  gnn       2-layer GCN autoencoder (link reconstruction) on SVD-compressed carrier profiles
+  xgboost   trees predict each node's haploblock region (--xgb-region-bins genomic bins) from its
+            own and its neighbourhood's carrier profile; one-hot leaves -> SVD = the embedding.
+            Memory-bounded (sampled training / SVD, chunked embedding); trees = --xgb-trees x bins
+--rapids runs the two SVDs on the GPU (RAPIDS cuML + CuPy; the carrier SVD is fitted on
+--rapids-fit-rows sampled rows). Graphs have within-chromosome edges only, so node2vec vectors are
+comparable within a chromosome; gnn / xgboost vectors are comparable genome-wide.
 
 OUTPUT (in --graph-dir)
-  node_emb_<method>.npy       float32 [N, --dim]; row i = embedding of node i in nodes.csv.gz
-                              load with numpy.load("node_emb_gnn.npy")
-  node_emb_<method>.json      method, dim, settings, training summary, and the training set used
-                              (train_source, n_train, train_set_id)
-  node_emb_<method>.csv.gz    (with --csv) gzipped CSV: id, chrom, e0 ... e<dim-1>
-  features_svd<k>_<set id>_<graph id>[_rapids].npy  cached SVD carrier features [N, k] (gnn, xgboost)
-  Existing outputs are reused only if they were made from the same graph build (graph_info.json),
-  training set and result-affecting settings; otherwise they are recomputed.
+  node_emb_<method>.npy    float32 [nodes, --dim], row i = node i of nodes.csv.gz
+  node_emb_<method>.json   settings, training summary, train_set_id, graph_id, settings_id
+                           (an output is reused only while all three still match)
+  node_emb_<method>.csv.gz (--csv) id, chrom, e0 ... e<dim-1>
+  features_svd*.npy        cached carrier features
 
 USAGE
-  python 3_node_embeddings.py --graph-dir haplograph/genome_train_half_A            # all three
-  python 3_node_embeddings.py --method gnn --graph-dir haplograph/genome_train_half_A
-  python 3_node_embeddings.py --method xgboost --graph-dir haplograph/chr21_chr22_train_half_A --csv
-  python 3_node_embeddings.py --method xgboost --graph-dir $G --device cuda --rapids  # GPU SVD (RAPIDS)
-  python 3_node_embeddings.py --test                                                # synthetic, CPU
-
-REQUIRES  numpy, pandas, scipy; torch (node2vec, gnn); xgboost (xgboost);
-          cuml + cupy (only for --rapids, see DOCUMENTATION.md). Run 1_build_graph.py first.
+  python 3_node_embeddings.py --graph-dir haplograph/genome_train_half_A
+  python 3_node_embeddings.py --method xgboost --graph-dir $G --device cuda --rapids
+  python 3_node_embeddings.py --test            # synthetic data, CPU, seconds
 """
 import argparse
 import hashlib
@@ -75,10 +33,9 @@ import pandas as pd
 import scipy.sparse as sp
 from scipy.sparse.linalg import svds
 
-from haplo_common import (chrom_key, die, graph_id, log, read_graph_individuals, require_files,
+from haplo_common import (METHODS, check_args, chrom_key, die, graph_id, log, read_graph_individuals, require_files,
                           selftest_graph_dir, torch_device, train_columns)
 
-METHODS = ("node2vec", "gnn", "xgboost")
 
 
 def gfile(args, name):
@@ -566,10 +523,7 @@ def main(argv=None):
         die(f"unknown --method {bad or args.method!r}; choose from {', '.join(METHODS)} or all")
     if args.rapids:
         import_rapids()
-    for name, val in (("--dim", args.dim), ("--svd-dim", args.svd_dim), ("--xgb-region-bins", args.xgb_region_bins),
-                      ("--chunk-nodes", args.chunk_nodes), ("--walk-batch", args.walk_batch)):
-        if val < 1:
-            die(f"{name} must be >= 1")
+    check_args(args, ("dim", "svd_dim", "xgb_region_bins", "chunk_nodes", "walk_batch"))
 
     require_files(args.graph_dir, ["graph.npz", "individuals.txt"]
                   + (["carriers.npz"] if {"gnn", "xgboost"} & set(methods) else [])

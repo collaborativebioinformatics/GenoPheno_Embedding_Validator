@@ -16,7 +16,6 @@ All runners expose: net (the backbone module), dev, hidden_in, hidden_out, train
 hidden_in]) -> hidden states [T, hidden_out]. Evo2Runner and MockEvo2Runner also have run_ids(tokens).
 """
 import hashlib
-import json
 import os
 import re
 
@@ -24,7 +23,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
-from haplo_common import chrom_key, die, log
+from haplo_common import chrom_key, die, log, read_graph_individuals
 
 
 # ---------------------------------------------------------------------------
@@ -32,9 +31,13 @@ from haplo_common import chrom_key, die, log
 # ---------------------------------------------------------------------------
 
 class GenomeData:
-    """Node embeddings + each individual's clusters per chromosome, in genomic order."""
+    """Node embeddings + each individual's clusters per chromosome, in genomic order.
+    min_support: clusters carried by fewer than this many of the individuals `support_from` (column
+    indices; step 4's own training individuals) are merged into one token per haploblock region
+    (embedding = mean of its members), so clusters barely seen in training are predicted as "a rare
+    cluster of this region" instead of an unlearnable identity."""
 
-    def __init__(self, graph_dir, method, chroms=None):
+    def __init__(self, graph_dir, method, chroms, min_support, support_from):
         nodes = pd.read_csv(os.path.join(graph_dir, "nodes.csv.gz"))
         emb_file = os.path.join(graph_dir, f"node_emb_{method}.npy")
         Z = np.load(emb_file).astype(np.float32)
@@ -59,20 +62,42 @@ class GenomeData:
         self.bounds = {c: (int(np.searchsorted(code_sorted, i)), int(np.searchsorted(code_sorted, i, "right")))
                        for i, c in enumerate(present)}
         C = sp.load_npz(os.path.join(graph_dir, "carriers.npz")).tocsr()
+        if C.shape[1] != len(read_graph_individuals(graph_dir)):
+            die("individuals.txt and carriers.npz disagree; rebuild the graph with step 1")
         self.by_ind = C[self.order].T.tocsr()                            # [I, N], columns = ranks
         self.by_ind.sort_indices()
+        self.rare = np.asarray(C[:, support_from].sum(axis=1)).ravel() < min_support
+        self.canon = np.arange(len(nodes))                    # node -> the node standing in for it
+        rank = np.empty(len(nodes), np.int64)
+        rank[self.order] = np.arange(len(nodes))
+        rare = np.where(self.rare)[0]
+        if len(rare):
+            key = [nodes["chrom"].to_numpy()[rare], nodes["region"].to_numpy()[rare]]
+            first = pd.Series(rank[rare]).groupby(key).transform("min").to_numpy()
+            self.canon[rare] = self.order[first]              # first rare cluster of the region
+            reps, inv = np.unique(self.canon[rare], return_inverse=True)
+            sums = np.zeros((len(reps), self.Z.shape[1]), np.float64)
+            np.add.at(sums, inv, self.Z[rare])
+            self.Z[reps] = (sums / np.bincount(inv)[:, None]).astype(np.float32)
+        self.local = np.full(len(nodes), -1, np.int64)        # node -> index among its chromosome's tokens
+        self.cands = {}
+        for c in present:
+            s, e = self.bounds[c]
+            nd = self.order[s:e]
+            self.cands[c] = nd[self.canon[nd] == nd]
+            self.local[self.cands[c]] = np.arange(len(self.cands[c]))
 
     def tokens(self, chrom, i):
-        """(node indices, positions among the chromosome's nodes) of individual i, genomic order."""
+        """(token node indices, positions among the chromosome's tokens) of individual i, genomic order."""
         row = self.by_ind.indices[self.by_ind.indptr[i]:self.by_ind.indptr[i + 1]]
         s, e = self.bounds[chrom]
         lo, hi = np.searchsorted(row, [s, e])
-        ranks = row[lo:hi].astype(np.int64)
-        return self.order[ranks], ranks - s
+        nodes = self.canon[self.order[row[lo:hi]]]
+        nodes = nodes[np.r_[True, nodes[1:] != nodes[:-1]]]   # two merged clusters of one region = one token
+        return nodes, self.local[nodes]
 
     def candidates(self, chrom):
-        s, e = self.bounds[chrom]
-        return self.order[s:e]
+        return self.cands[chrom]
 
     def examples(self, individuals):
         """(chrom, individual index) pairs with at least 2 clusters, i.e. one next-cluster target."""
@@ -526,7 +551,10 @@ def load_finetuned(meta, graph_dir, device=None, ckpt_dir=None):
         die("only next-cluster models from 4a_finetune_evo2_embeddings.py can be queried")
     cfg = meta.get("config", {})
     backend = meta.get("backend", "evo2")
-    data = GenomeData(graph_dir, meta["graph_method"], meta.get("chroms"))
+    pos = {x: i for i, x in enumerate(read_graph_individuals(graph_dir))}
+    trained = [pos[x] for x in meta.get("train_individuals") or [] if x in pos]
+    data = GenomeData(graph_dir, meta["graph_method"], meta.get("chroms"),
+                      cfg.get("min_support", 0), trained)          # older models: min_support 0, no merging
     from haplo_common import graph_id
     if meta.get("graph_id") and meta["graph_id"] != graph_id(graph_dir):
         raise ValueError(f"the model was trained on another build of this graph (graph_id {meta['graph_id']}, "
@@ -552,16 +580,10 @@ def load_finetuned(meta, graph_dir, device=None, ckpt_dir=None):
             die(f"{len(missing)} fine-tuned parameters do not exist in the backbone (e.g. {sorted(missing)[:2]})")
         with torch.no_grad():
             rnr.net.load_state_dict(tb, strict=False)
-    model = NextClusterModel(rnr, data, meta.get("config", {}).get("temperature", 0.1),
-                             meta.get("config", {}).get("max_len", 1024))
+    model = NextClusterModel(rnr, data, cfg.get("temperature", 0.1), cfg.get("max_len", 1024))
     model.load(meta)
     model.train(False)
     return model, data
-
-
-def save_json(path, obj):
-    with open(path, "w") as f:
-        json.dump(obj, f, indent=2, default=str)
 
 
 # ---------------------------------------------------------------------------

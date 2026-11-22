@@ -211,3 +211,27 @@ def test_step0_new_splits_url_is_used(tmp_path):
     dl.main(common + ["--splits-url", (tmp_path / "B").as_uri()])
     train = (tmp_path / "wd" / "splits" / "train_individuals.txt").read_text().split()
     assert sorted(train) == sorted(inds[10:])
+
+
+# ---------------------------------------------------------------------------
+# Rare-cluster merging (--min-support)
+# ---------------------------------------------------------------------------
+
+def test_min_support_merging(pipeline):
+    """Merged clusters: fewer tokens, valid local indices, mean embeddings, no repeated tokens."""
+    from evo2_model import GenomeData
+    G = str(pipeline["G"])
+    every = list(range(len(pipeline["train"]) + len(pipeline["test"])))
+    base, merged = GenomeData(G, "gnn", None, 0, every), GenomeData(G, "gnn", None, 20, every)
+    assert merged.rare.any()
+    for c in base.chroms:
+        cands = merged.candidates(c)
+        assert len(cands) < len(base.candidates(c))
+        for i in range(base.by_ind.shape[0]):
+            nodes, local = merged.tokens(c, i)
+            assert ((local >= 0) & (local < len(cands))).all() and (cands[local] == nodes).all()
+            assert not (nodes[1:] == nodes[:-1]).any()
+    rep = merged.canon[merged.rare]
+    for r in np.unique(rep):
+        members = np.where(merged.rare & (merged.canon == r))[0]
+        assert np.allclose(merged.Z[r], base.Z[members].mean(0), atol=1e-5)

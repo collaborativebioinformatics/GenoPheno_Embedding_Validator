@@ -30,21 +30,22 @@ stored validation accuracy.
 
 **H2-H4 wire.** Report the new numbers in report.md / summary.json and the per-chromosome CSV.
 
-## Iteration 2
+## Iteration 2 (minimal, non-redundant code)
 
-**H5 implement.** Add `--min-support k` to step 4: clusters with training support < k are replaced
-by one pseudo-token per haploblock region whose embedding is the mean of its members; targets and
-candidates use the collapsed vocabulary; store the mapping parameters in the checkpoint, and make
-`evo2_model.load_finetuned` and step 5 apply the same mapping.
+**H5 implement.** In `evo2_model.GenomeData`, add `min_support` (default 1): nodes whose `support_train`
+(else `support`, with a warning) is below it are mapped to one representative per haploblock region,
+whose embedding is the mean of the members; `tokens`, `candidates` and the local indices use the
+collapsed vocabulary. Add `--min-support` to step 4, store it in the checkpoint, apply it in
+`load_finetuned`, and report in `test_set_performance` the share of test targets that are collapsed.
+Keep it to a few dozen lines.
 
-**H6 implement.** Add `6_compare_models.py` that reads several `validation_*/summary.json` files and
-writes one comparison table (method, backbone, frozen/fine-tuned, test top-1 with CI, difference to
-bigram with CI, co-occurrence AUC).
+**H5 test.** On the synthetic data, check that with a high `--min-support` the number of candidates
+per chromosome drops, the model still trains and step 5 reproduces the stored validation accuracy.
 
-## Iteration 3
-
-**H7 implement.** Add `run_pipeline.py` that runs steps 0-5 from one YAML/JSON config (chromosomes,
-split, methods, backbone, tasks), skipping steps whose outputs are current, with `--test`.
+**M1-M2 implement.** In every part 1 script, cut the module docstring to purpose, input/output files
+and usage (options live in `--help`, the rest in DOCUMENTATION.md); remove dead code and helpers
+duplicated across scripts. Every `--test` and `python -m pytest tests` must still pass; report the
+line count before and after.
 
 ## Integration and documentation
 

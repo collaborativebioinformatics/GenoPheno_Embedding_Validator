@@ -1,68 +1,28 @@
 """
-Step 4 - fine-tune Evo 2 (7B) on the node embeddings from 3_node_embeddings.py (node2vec, gnn or
-xgboost). No DNA sequence is used. (For hash-phenotype associations, see 4b_finetune_evo2_hash.py.)
+Step 4 - fine-tune Evo 2 on the step-3 node embeddings (no DNA). One example = one training
+individual on one chromosome: their clusters in genomic order, each replaced by its embedding,
+projected into Evo 2 in place of its nucleotide embeddings (plus a per-chromosome vector). Evo 2
+runs up to its read-out layer, the last --train-blocks blocks are fine-tuned (fp32 master weights;
+0 = frozen baseline), and a head predicts the NEXT cluster among the chromosome's tokens. Clusters
+carried by fewer than --min-support (default 2) of these training individuals share one token per
+haploblock region.
+Only the graph's training individuals are used (split again into train / validation).
 
-  - A training example is one individual on one chromosome: the clusters that person carries,
-    ordered by genomic position, each replaced by its node embedding.
-  - A linear layer projects the embeddings to Evo 2's hidden size; a learned per-chromosome vector
-    is added (useful for node2vec, whose vectors aren't aligned across chromosomes). These vectors
-    are fed into Evo 2 IN PLACE OF its nucleotide token embeddings.
-  - Evo 2 runs up to its read-out layer; the last --train-blocks blocks before it are unfrozen, the
-    rest stay frozen (--train-blocks 0 = frozen-Evo 2 baseline, only the new layers train).
-  - Objective: predict the NEXT cluster along the chromosome (softmax over all clusters of that
-    chromosome), mirroring Evo 2's next-token pre-training.
-  - Only TRAINING individuals are used: --train-individuals FILE_OR_URL if given, else
-    <graph-dir>/train_individuals.txt (written by 1_build_graph.py from the split of
-    download_haplograph.py), else all individuals. They are split again into train / validation
-    (--val-frac); validation loss and accuracy are reported before and after training. The test
-    individuals are never seen; step 5 evaluates the model on them.
+Backbone: Evo 2 via the `evo2` package (default; one CUDA GPU, install_evo2.sh), via NVIDIA
+BioNeMo (--bionemo --ckpt-dir NeMo2 checkpoint; experimental, VERSION-SENSITIVE parts in
+evo2_model.py), or --mock-evo2 (a small random stand-in for CPU checks; results mean nothing).
 
-BACKBONE
-  default      Evo 2 through the `evo2` package (Arc Institute), plain PyTorch on one CUDA GPU
-               (install_evo2.sh). Options: --evo2-model, --layer, --embed-module.
-  --bionemo    Evo 2 through NVIDIA BioNeMo / NeMo 2 (Megatron Core), from a NeMo2 checkpoint
-               (--ckpt-dir, --model-size, --layer-index). Run inside the BioNeMo Framework container.
-               EXPERIMENTAL: not yet run on a GPU; code that may need adjusting for your BioNeMo
-               version is marked VERSION-SENSITIVE in evo2_model.py.
-  --mock-evo2  a small random causal transformer instead of Evo 2, on CPU or GPU. For checking the
-               pipeline end-to-end without a GPU (what --test uses); its results mean nothing.
-
-INPUT  (in --graph-dir)
-  nodes.csv.gz              CSV, N rows: node, id, chrom, region, start, end, support
-                            (genomic order within a chromosome is taken from start)
-  individuals.txt           I lines, one individual per line (columns of carriers.npz)
-  carriers.npz              scipy.sparse CSR uint8 [N, I], node x individual carriers
-  node_emb_<method>.npy     float32 [N, dim], row i = node i of nodes.csv.gz      (step 3)
-  node_emb_<method>.json    training set the embeddings were made from (must match)
-  train_individuals.txt     (optional) training individuals, one per line (step 1)
-
-OUTPUT  --out, default <graph-dir>/evo2[_bionemo|_mock]_next_<method>.pt   (torch.save dict, CPU tensors)
-  mode ("embeddings"), backend ("evo2" / "bionemo" / "mock"), objective ("next"), graph_method,
-  chroms, n_chrom_slots, embeddings_sha1, evo2_model + layer (evo2), ckpt_dir + model_size +
-  layer_index (bionemo), mock_config (mock)
-  trained_blocks   {parameter name in the backbone: tensor} for the unfrozen blocks
-                   (mock: the whole backbone, so it can be rebuilt exactly)
-  proj_in          state_dict: Linear(dim -> hidden) + LayerNorm
-  chrom_emb        state_dict: Embedding(n_chroms, hidden), rows in chromosome order of the graph
-  head             state_dict: LayerNorm + Linear(hidden -> dim)
-  train_individuals, val_individuals   who the model was trained / validated on (step 5 checks)
-  train_set_id, train_source;  metrics {before, after};  config
-  Rebuild with evo2_model.load_finetuned(torch.load(path), graph_dir) (what step 5 does).
+OUTPUT  --out, default <graph-dir>/evo2[_bionemo|_mock]_next_<method>.pt (torch dict, CPU tensors):
+  mode "embeddings", objective "next", backend and backbone settings, graph_method, chroms,
+  n_chrom_slots, graph_id, embeddings_sha1, trained_blocks, proj_in, chrom_emb, head,
+  train_individuals, val_individuals, train_set_id, train_source, metrics {before, after}, config.
+  Step 5 rebuilds it with evo2_model.load_finetuned().
 
 USAGE
-  python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir haplograph/genome_train_half_A
-  python 4a_finetune_evo2_embeddings.py --method node2vec --graph-dir $G --chroms chr21,chr22
-  python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir $G --train-blocks 0     # frozen baseline
+  python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir $G
+  python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir $G --train-blocks 0       # baseline
   python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir $G --bionemo --ckpt-dir nemo2_evo2_7b_8k
-  python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir $G --mock-evo2          # CPU check
-  python 4a_finetune_evo2_embeddings.py --test                                           # synthetic, CPU
-
-REQUIRES  numpy, pandas, scipy, torch; evo2 (default: Linux, CUDA 12.8+ and driver >= 570 (install_evo2.sh), Python 3.11/3.12, an
-          80 GB GPU recommended for 7B) or the BioNeMo container (--bionemo).
-
-NOTE  The official Evo 2 training paths are Savanna and NVIDIA BioNeMo. The default backbone uses
-      the `evo2` inference package in plain PyTorch and, after the first step, checks that gradients
-      reach the new layers and the unfrozen blocks, stopping with a clear message if they don't.
+  python 4a_finetune_evo2_embeddings.py --test                                             # CPU
 """
 import argparse
 import json
@@ -71,11 +31,8 @@ import os
 import numpy as np
 
 from evo2_model import GenomeData, NextClusterModel, add_backbone_args, config_of, fit, make_runner
-from haplo_common import (die, graph_id, log, parse_chroms, read_graph_individuals, require_files,
+from haplo_common import (METHODS, check_args, die, graph_id, log, parse_chroms, read_graph_individuals, require_files,
                           selftest_graph_dir, train_columns)
-
-METHODS = ("node2vec", "gnn", "xgboost")
-
 
 def evaluate_fn(model, val_ex):
     def evaluate():
@@ -91,10 +48,7 @@ def train(args):
     import torch
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
-    data = GenomeData(args.graph_dir, args.method, args.chroms)
     individuals = read_graph_individuals(args.graph_dir)
-    if data.by_ind.shape[0] != len(individuals):
-        die("individuals.txt and carriers.npz disagree; rebuild the graph with step 1")
     train_cols, train_src, train_id = train_columns(args, individuals)
     emb_info = os.path.join(args.graph_dir, f"node_emb_{args.method}.json")
     if os.path.exists(emb_info):
@@ -112,6 +66,7 @@ def train(args):
     if len(perm) - n_val < 1:
         die(f"only {len(perm)} training individuals: too few to hold out {n_val} for validation")
     val_inds, tr_inds = perm[:n_val], perm[n_val:]
+    data = GenomeData(args.graph_dir, args.method, args.chroms, args.min_support, tr_inds)
     train_ex, val_ex = data.examples(tr_inds), data.examples(val_inds)
     if not train_ex or not val_ex:
         die("no training / validation sequences with at least 2 clusters; check --chroms and the graph")
@@ -172,6 +127,9 @@ def main(argv=None):
     ap.add_argument("--sample-map", help="CSV: graph individual name, sample ID (if they differ)")
     ap.add_argument("--max-len", type=int, default=1024, help="max clusters per training sequence")
     ap.add_argument("--temperature", type=float, default=0.1)
+    ap.add_argument("--min-support", type=int, default=2,
+                    help="clusters carried by fewer training individuals become one token per haploblock region "
+                         "(0 = no merging; 2 = default, so the merged token also occurs in training)")
     ap.add_argument("--out", help="output .pt (default <graph-dir>/evo2[_backend]_next_<method>.pt)")
     ap.add_argument("--test", action="store_true", help="self-test on synthetic data with --mock-evo2 (CPU, seconds)")
     add_backbone_args(ap)
@@ -193,15 +151,9 @@ def main(argv=None):
     if not args.method:
         ap.error("--method is required (node2vec, gnn or xgboost)")
     args.chroms = parse_chroms(args.chroms)
-    for name in ("max_len", "batch", "epochs", "val_examples", "log_every", "eval_every"):
-        if getattr(args, name) < 1:
-            die(f"--{name.replace('_', '-')} must be >= 1")
+    check_args(args, training=True)
     if args.max_len < 2:
         die("--max-len must be >= 2")
-    if args.train_blocks < 0:
-        die("--train-blocks must be >= 0")
-    if not 0 < args.val_frac < 1:
-        die("--val-frac must be between 0 and 1")
     require_files(args.graph_dir, ["nodes.csv.gz", "individuals.txt", "carriers.npz"], "1_build_graph.py")
     require_files(args.graph_dir, [f"node_emb_{args.method}.npy"], f"3_node_embeddings.py --method {args.method}")
     train(args)

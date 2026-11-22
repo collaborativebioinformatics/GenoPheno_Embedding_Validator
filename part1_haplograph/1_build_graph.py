@@ -1,81 +1,27 @@
 """
-Step 1 - build the haplograph: GENOME-WIDE by default (all chromosomes downloaded by
-download_haplograph.py, merged into one graph), or for selected chromosomes only (--chroms). Edge
-weights, support and lift are computed from the TRAINING individuals only (the training set written
-by download_haplograph.py, or --train-individuals), so the held-out test set never influences the
-graph or anything trained on it.
+Step 1 - build the haplograph co-occurrence graph, genome-wide or for --chroms, from step 0's
+downloads. Edge weight, support and lift are counted on the TRAINING individuals only (step 0's
+split, or --train-individuals; --no-split = all individuals), so the test set never shapes the
+graph: weight = training individuals carrying both clusters of a pair listed in the edge file,
+lift = weight / (support_A * support_B / n_train), edges with lift < --min-lift are dropped.
+Use --edges all for a train-only graph (the lift5 file was filtered on all individuals).
 
-INPUT  (written by download_haplograph.py into --workdir, default haplograph/)
-  raw/<chrom>/   the haplograph files of each chromosome (see below); --raw-dir to read them elsewhere
-  splits/train_individuals.txt, splits/test_individuals.txt, splits/split.json   the train/test split
-                 (used by default; --train-individuals overrides the train file, --no-split builds
-                 the graph from all individuals)
-  nodes.csv.gz   gzipped CSV, one row per haploblock cluster (= graph node):
-                   id             cluster id "<chrom>_<start>-<end>_cluster<N>",
-                                  e.g. chr21_14215892-14284114_cluster1
-                   high_dim_edge  the haploblock region "<chrom>_<start>-<end>"
-                   IND1 ... INDk  one 0/1 column per individual (2,548 in 1000G),
-                                  1 = this individual carries the cluster
-  edges.csv.gz   gzipped CSV, one row per co-occurring pair of clusters (same chromosome only):
-                   source, target  cluster ids (as in nodes.csv.gz)
-                   weight          int, number of individuals carrying both clusters
-                 (--edges lift5 reads edges_lift_above_threshold.csv.gz instead: same columns
-                  plus a lift column, only pairs with lift >= 5; ~16 MB instead of ~1 GB)
-  --train-individuals FILE_OR_URL   (optional) training individuals instead of the split's: plain
-                 text, one sample ID per line, no header ('#' = comment), or a CSV with an
-                 "individual" column; e.g. https://data.haploblocks.org/BH_26/splits/half_A.txt
-  --sample-map CSV   (optional) only if nodes.csv.gz names individuals differently from the train
-                 file (e.g. IND1 vs HG00096): 2 columns, graph name, sample ID
-
-TRAIN-ONLY MODE (the default whenever a training set is available)
-  - edge weight = number of TRAINING individuals carrying both clusters, recomputed from the
-    carrier columns for every pair listed in the edges file (the file's own weight, computed over
-    all individuals, is not used); pairs no training individual shares are dropped
-  - support, lift and the --min-lift filter use the training individuals only
-  - carriers.npz still has ALL individuals (step 5 needs the test individuals' carriers)
-  - use --edges all: the lift5 file was pre-filtered on all individuals, so its choice of pairs
-    already saw the test set (the script warns)
-
-OUTPUT (in --out; default <workdir>/genome, <workdir>/<chrA>_<chrB>... for a selection, plus
-        _train_<split name> in train-only mode, e.g. haplograph/genome_train_half_A)
-  nodes.csv.gz     gzipped CSV, N rows; row i describes node i in every other file:
-                     node     int, 0..N-1
-                     id       cluster id
-                     chrom    e.g. chr21
-                     region   haploblock region
-                     start, end   int, bp, parsed from region
-                     support  int, number of individuals carrying the cluster (all individuals)
-                     support_train  int, the same over training individuals (train-only mode)
-  individuals.txt  I lines, one individual (column name of nodes.csv.gz) per line; column j of
-                   carriers.npz is line j. Same order for every chromosome.
-  train_individuals.txt  (train-only mode) the training individuals found in the graph, one per
-                   line, using the names of individuals.txt. Steps 3-4 read it automatically.
-  test_individuals.txt  (when the split has a test file) the test individuals found in the graph;
-                   only step 5 reads it.
-  carriers.npz     scipy.sparse CSR, uint8, shape [N, I]; 1 = individual carries the cluster
-  graph.npz        scipy.sparse CSR, float32, shape [N, N]; symmetric, zero diagonal;
-                   value = log(1 + lift), lift = weight / (support_A * support_B / n),
-                   n = number of (training) individuals. Pairs with lift < --min-lift are dropped.
-                   The data only has within-chromosome edges, so the genome-wide graph is made
-                   of one disconnected block per chromosome.
-  graph_info.json  chromosomes, settings, node and edge counts, training set (source, size)
-
-  Load with:  scipy.sparse.load_npz("graph.npz"),  pandas.read_csv("nodes.csv.gz")
-
-Parsed chromosomes are cached in <workdir>/parts/<chrom>/ (an interrupted genome-wide run resumes
-where it stopped, and a later selection reuses them).
+OUTPUT (in --out; default <workdir>/genome or <workdir>/<chrA>_<chrB>, + _train_<split name>)
+  nodes.csv.gz      row i = node i: node, id, chrom, region, start, end, support, support_train
+  individuals.txt   one individual per line = the columns of carriers.npz
+  train_individuals.txt / test_individuals.txt   the split, restricted to the graph's individuals
+  carriers.npz      scipy.sparse CSR uint8 [nodes, individuals], ALL individuals (step 5 needs the test ones)
+  graph.npz         scipy.sparse CSR float32 [nodes, nodes], symmetric, value log(1 + lift);
+                    within-chromosome edges only
+  graph_info.json   settings, counts, training/test set ids (rerunning with other settings stops
+                    unless --force)
+Parsed chromosomes are cached in <workdir>/parts/<chrom>/, keyed by the raw files.
 
 USAGE
-  python download_haplograph.py && python 1_build_graph.py # whole genome -> haplograph/genome_train_half_A
-  python 1_build_graph.py --chroms chr21,chr22             # -> haplograph/chr21_chr22_train_half_A
-  python 1_build_graph.py --train-individuals my_train.txt # -> haplograph/genome_train_my_train
-  python 1_build_graph.py --no-split                       # all individuals -> haplograph/genome
-  python 1_build_graph.py --edges lift5                    # small pre-filtered edge files
-  python 1_build_graph.py --test                           # synthetic data, a few seconds on CPU
-
-REQUIRES  numpy, pandas, scipy.  Run download_haplograph.py first.
-          optional: RAPIDS cuDF (pip install cudf-cu12) for --cudf, which runs the pandas parts (reading
-          and matching nodes/edges) on the GPU; add --chunksize 0 so the edge files are parsed on the GPU too
+  python 1_build_graph.py                       # all downloaded chromosomes -> haplograph/genome_train_half_A
+  python 1_build_graph.py --chroms chr21,chr22  # -> haplograph/chr21_chr22_train_half_A
+  python 1_build_graph.py --cudf --chunksize 0  # pandas parts on the GPU (RAPIDS cuDF)
+  python 1_build_graph.py --test                # synthetic data, CPU, seconds
 """
 import argparse
 import hashlib
@@ -100,12 +46,11 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
-from haplo_common import (ALL_CHROMS, REGION_RE, chrom_key, die, load_sample_map, log,
+from haplo_common import (ALL_CHROMS, EDGE_FILE, REGION_RE, chrom_key, die, load_sample_map, log,
                           parse_chroms, read_individual_list, set_id,
                           test_workdir)
 
 OUTPUTS = ("nodes.csv.gz", "individuals.txt", "carriers.npz", "graph.npz", "graph_info.json")
-EDGE_FILE = {"all": "edges.csv.gz", "lift5": "edges_lift_above_threshold.csv.gz"}
 
 
 def file_stamp(path):

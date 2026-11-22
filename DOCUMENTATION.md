@@ -94,7 +94,7 @@ Graph folder names: `genome` (all 22 chromosomes) or e.g. `chr21_chr22` (a selec
 
 ## 4. Script reference
 
-Only the main options are listed; `--help` shows all of them, and each script's header documents its input and output formats. Every script has **`--test`**, which runs it on a small synthetic haplograph (2 chromosomes, 60 individuals) on the CPU in seconds; the test outputs go to `<system temp>/haplograph_selftest/`. Steps 3–4 accept `--train-individuals` (a file or URL, one sample ID per line) and `--sample-map` (CSV: graph name, sample ID; only needed if the graph's individual names differ from the sample IDs); the training set defaults to the graph's `train_individuals.txt`.
+Only the main options are listed; `--help` shows all of them, and each script's header documents its output formats (input formats are in this section). Every script has **`--test`**, which runs it on a small synthetic haplograph (2 chromosomes, 60 individuals) on the CPU in seconds; the test outputs go to `<system temp>/haplograph_selftest/`. Steps 3–4 accept `--train-individuals` (a file or URL, one sample ID per line) and `--sample-map` (CSV: graph name, sample ID; only needed if the graph's individual names differ from the sample IDs); the training set defaults to the graph's `train_individuals.txt`.
 
 ### Step 0: `download_haplograph.py`
 
@@ -175,7 +175,8 @@ Fine-tunes Evo 2 7B on node embeddings, with no DNA involved. One example is one
 - The embeddings are projected into Evo 2 in place of its DNA-letter embeddings, plus a learned per-chromosome vector.
 - Evo 2 runs up to its read-out layer. Its last `--train-blocks` blocks before it are fully fine-tuned; the rest stay frozen. Evo 2 is kept in bf16, so the optimizer steps on fp32 master copies of the unfrozen weights and writes them back after every step (updating bf16 weights in place at `--lr 1e-5` would round every update away).
 - Step 4 refuses embeddings made from an earlier build of the graph (different `graph_id`) or another training set.
-- Objective: predict the next cluster along the chromosome (cosine similarity to every cluster of that chromosome, softmax with `--temperature`).
+- Rare clusters: most clusters are carried by one person, and 38.6% of chr21 clusters never occur in the training half, so predicting their identity is impossible. `--min-support` merges rare clusters into one "rare cluster of this region" token, counting carriers among step 4's own training individuals (not its validation individuals). The default `2` also merges clusters with one training carrier, so the token occurs in training and can be learned (at `1` it never would: on chr21 0 of 559 merged tokens are learnable, at `2` 550 of 567). A region whose rare clusters were all unseen in training still has an unlearnable token. `test_set_performance` reports the share of test targets that are merged tokens.
+- Objective: predict the next token along the chromosome (cosine similarity to every token of that chromosome, i.e. its clusters after `--min-support` merging, softmax with `--temperature`).
 - Only training individuals are used, split again into train and validation (`--val-frac`).
 
 | Backbone | Flag | Notes |
@@ -201,6 +202,7 @@ Fine-tunes Evo 2 7B on node embeddings, with no DNA involved. One example is one
 | `--max-len` | `1024` | max clusters per sequence (memory grows with it × the clusters on the chromosome) |
 | `--epochs` | `1` | passes over the training sequences |
 | `--chroms` | all of the graph | train on some chromosomes only |
+| `--min-support` | `2` | clusters carried by fewer of step 4's training individuals share one token per haploblock region (embedding = mean of its members); `0` = no merging. On chr21 (1,127 training individuals): 166,754 tokens without merging, 95,874 at `1`, 29,034 at `2`, 10,965 at `5` |
 
 ### Step 4b: `4b_finetune_evo2_hash.py` (optional)
 
@@ -220,7 +222,7 @@ Fine-tunes Evo 2 to predict a phenotype from a genomic hash. Each bit of the has
 
 ### Step 5: `5_validate_evo2.py`
 
-Validates one fine-tuned model on the test set. By default it uses the graph folder's `train_individuals.txt` / `test_individuals.txt` (from steps 0–1; a graph with a training set but no test file is refused rather than paired with another split, and only a `--no-split` graph falls back to BH_26); `--splits DIR_OR_URL` reads `half_A.txt` / `half_B.txt` from elsewhere (e.g. the [BH_26 folder](https://data.haploblocks.org/BH_26/splits/)), and `--splits none` uses the model's own validation individuals. It warns if any test individual was used to build the graph or to train the model. The checks to run are listed in a tasks file, one per line ([`validation_tasks.txt`](part1_haplograph/validation_tasks.txt)):
+Validates one fine-tuned model on the test set. By default it uses the graph folder's `train_individuals.txt` / `test_individuals.txt` (from steps 0–1; a graph with a training set but no test file is refused rather than paired with another split, and only a `--no-split` graph falls back to BH_26); `--splits DIR_OR_URL` reads `half_A.txt` / `half_B.txt` from elsewhere (e.g. the [BH_26 folder](https://data.haploblocks.org/BH_26/splits/)), and `--splits none` uses the model's own validation individuals. It warns if any test individual was used to build the graph or to train or validate the model (when the checkpoint records its individuals, as every current step-4 checkpoint does). With `--splits none` the train side is the model's own training individuals. The checks to run are listed in a tasks file, one per line ([`validation_tasks.txt`](part1_haplograph/validation_tasks.txt)):
 
 ```
 model_info
@@ -320,7 +322,7 @@ On a CPU-only machine (Apple M5, 16 GB RAM, Python 3.9, torch 2.8, xgboost 2.1),
 | 4 | `--mock-evo2 --max-len 128`, 1 epoch: validation loss 12.7 → 9.5 | 68 s |
 | 5 | split consistent (3.7% of regions outside the 95% interval), no leakage; `test_set_performance` on 300 test sequences (bigram baseline top-1 accuracy 0.41) | ~15 s |
 
-Every script's `--test` also passes, and step 5 rebuilds a step-4 model exactly (the same validation accuracy as stored in the checkpoint). **Not run, because no GPU was available:** Evo 2 itself (the `evo2` package), the BioNeMo backbone (written against the BioNeMo API, never executed), RAPIDS `--cudf` / `--rapids`, XGBoost on CUDA, `install_evo2.sh` beyond a syntax check, and the Nemotron request against the real NVIDIA endpoint (tested against a local fake endpoint). Expect to fix small API or version issues on first real runs, especially in the parts marked `VERSION-SENSITIVE`.
+Every script's `--test` also passes, and step 5 rebuilds a step-4 model exactly (the same validation accuracy as stored in the checkpoint, when step 4 evaluated all its validation sequences, i.e. at most `--val-examples` of them; otherwise step 4 evaluated a random subset). **Not run, because no GPU was available:** Evo 2 itself (the `evo2` package), the BioNeMo backbone (written against the BioNeMo API, never executed), RAPIDS `--cudf` / `--rapids`, XGBoost on CUDA, `install_evo2.sh` beyond a syntax check, and the Nemotron request against the real NVIDIA endpoint (tested against a local fake endpoint). Expect to fix small API or version issues on first real runs, especially in the parts marked `VERSION-SENSITIVE`.
 
 Earlier versions of this document described LoRA adapters, `--micro-batch` and activation checkpointing for step 4. They were never implemented: step 4 fine-tunes whole blocks, one sequence per forward pass.
 
@@ -360,7 +362,7 @@ Earlier versions of this document described LoRA adapters, `--micro-batch` and a
 - **Host RAM, not the GPU, is the bottleneck of steps 1–3** at genome scale (11M nodes). XGBoost's leaf stage is the peak; see the README's whole-genome notes.
 - **GNN memory.** The GNN runs on the whole graph at once on one device; very large graphs may not fit.
 - **node2vec speed.** Its walks run on CPU (numpy), which can be slow for genome-wide graphs; lower `--walks-per-node` or `--walk-length`.
-- **Step 4.** It uses one GPU and can't resume an interrupted run. Each position is scored against all clusters of its chromosome, so memory grows with `--max-len` × the chromosome's clusters (chr21: 166,754); lower `--max-len` for large chromosomes.
+- **Step 4.** It uses one GPU and can't resume an interrupted run. Each position is scored against all tokens of its chromosome, so memory grows with `--max-len` × the chromosome's tokens (chr21: 166,754 clusters, 29,034 tokens at the default `--min-support 2`); lower `--max-len` for large chromosomes.
 - **Permutation cost.** Step 5's permutations multiply runtime; lower `permutations` for quick runs.
 
 ## 9. Part 2: proteomics

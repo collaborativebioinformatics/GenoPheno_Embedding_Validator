@@ -169,3 +169,41 @@ Iteration 1
        no longer drops the last partial batch; clear errors for truncated/malformed nodes files,
        non-0/1 carriers, bad task lines and permutations=0; install_evo2.sh gets EVO2_REF and tests
        evo2_7b_base; docs: CUDA 12.8 / driver 570, cache and download paths.
+  Committed as 9f420e3.
+
+Prompt 5 - Commit after each iteration; continue with iterations 2 and 3
+-------------------------------------------------------------------------
+Requests: "commit after each iteration"; "continue with iteration 2 after the spec-tester fixes, then
+continue with iteration 3"; "in iteration 2, make sure the code is minimalistic, that there is no
+redundancy and that the number of lines is at the same time sufficient to make the code work as
+expected but also not redundant".
+
+Iteration 2 (priority: minimal, non-redundant code)
+  Brainstorm: pursued H5 (merge rare clusters into one token per region; default merges only
+  clusters never seen in training), H11 (report the share of merged test targets), M1 (module
+  docstrings cut to purpose / output files / usage; DOCUMENTATION.md and --help hold the rest) and
+  M2 (dead / duplicated code); dropped H6 (comparison script) and H7 (pipeline runner) as redundant
+  with summary.json and DOCUMENTATION section 11.
+  Implemented: evo2_model.GenomeData(min_support) + step 4 --min-support (stored in the checkpoint,
+  reapplied by step 5; older checkpoints = no merging); test_targets_merged_rare_share in step 5;
+  haplo_common.check_args replaces three copied validation loops; removed save_json and a legacy
+  model_info branch; docstrings trimmed (step 5: 150 -> 36 lines).
+  chr21 vocabulary: 166,754 tokens without merging, 103,011 at --min-support 1, 11,789 at 5.
+  Line count of part 1 pipeline code (scripts + install_evo2.sh, without tests): 4,311 -> 4,006 (tests: 284 -> 422 lines).
+  Code review (5 findings, all fixed): drop consecutive duplicate tokens created by merging (they
+  inflated top-1 and bigram accuracy); merge per (chromosome, region); min_support is now a required
+  GenomeData argument (no third default); model_info notes when a 4a checkpoint has no training
+  list; new regression test test_min_support_merging (14 tests).
+  Spec-tester (no high, 2 medium, 5 low, 6 redundancies; all fixed; tests/test_iteration2.py, 18 tests):
+    M1 at --min-support 1 the merged token never occurs in training (chr21: 0 of 559 learnable), so
+       it only adds certain misses: default is now 2 (550 of 567 learnable).
+    M2 rarity counted step 4's validation individuals: GenomeData now takes support_from (step 4's
+       own training individuals; step 5 rebuilds them from the checkpoint).
+    L1 --splits none put the graph's test half in step 5's train set: now the model's own training
+       individuals.
+    L2-L5 docs: exact reproduction only when step 4 evaluated all validation sequences; docstrings
+       document outputs (inputs in DOCUMENTATION); "cluster" -> "token" after merging; plan table
+       (H11 added, H5 marked done, H6/H7 struck); leakage check wording.
+    Redundancy removed: METHODS and EDGE_FILE defined once in haplo_common; step 5 fetch() replaced
+       by read_individual_list; individuals/carriers check once in GenomeData; Model._names helper;
+       repeated meta["config"] lookups.

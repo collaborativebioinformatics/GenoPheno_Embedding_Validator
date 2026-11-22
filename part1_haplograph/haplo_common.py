@@ -18,6 +18,8 @@ import numpy as np
 BASE_URL = "https://data.haploblocks.org/haplograph/1000G"
 BH26_SPLITS = "https://data.haploblocks.org/BH_26/splits"
 ALL_CHROMS = [f"chr{i}" for i in range(1, 23)]      # chrX/chrY are not in the dataset (see its README)
+METHODS = ("node2vec", "gnn", "xgboost")                 # step-3 embedding methods
+EDGE_FILE = {"all": "edges.csv.gz", "lift5": "edges_lift_above_threshold.csv.gz"}
 REGION_RE = re.compile(r"^(?P<chrom>.+)_(?P<start>\d+)-(?P<end>\d+)$")
 
 
@@ -189,6 +191,20 @@ def torch_device(name=None):
             return torch.device("cpu")
         return torch.device(name)
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def check_args(args, positive=(), training=False):
+    """Stop on impossible option values: every name in `positive` must be >= 1; training=True adds
+    the training options shared by steps 4 and 4b."""
+    if training:
+        positive = tuple(positive) + ("batch", "epochs", "val_examples", "log_every", "eval_every")
+        if not 0 < args.val_frac < 1:
+            die("--val-frac must be between 0 and 1")
+        if args.train_blocks < 0:
+            die("--train-blocks must be >= 0")
+    for name in positive:
+        if getattr(args, name) < 1:
+            die(f"--{name.replace('_', '-')} must be >= 1")
 
 
 def require_files(folder, names, hint):

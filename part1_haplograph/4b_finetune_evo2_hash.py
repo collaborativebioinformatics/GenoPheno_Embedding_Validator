@@ -1,57 +1,21 @@
 """
-Step 4b - fine-tune Evo 2 7B on hash-phenotype associations (genomic hash -> phenotype).
-Standalone: does not need steps 1-3. (For node embeddings, use 4a_finetune_evo2_embeddings.py.)
+Step 4b (optional, independent of steps 0-3) - fine-tune Evo 2 to predict a phenotype from a
+genomic hash. Every bit of the 0/1 hash is one Evo 2 token (hashes longer than --hash-window are
+split into windows); the read-out layer is mean-pooled and a head predicts the phenotype:
+regression for numbers (RMSE, Pearson r, R^2) or classification for labels / <= 10 distinct
+values (accuracy vs majority class); --task forces one. Rows are split train / validation.
 
-  - Each genomic hash (a string of 0s and 1s) is fed to Evo 2 as text: Evo 2's tokenizer is
-    character-level, so every bit is one token. Hashes longer than --hash-window bits are split
-    into windows; Evo 2's layer output is mean-pooled over all tokens of all windows.
-  - Evo 2 runs up to --layer (default blocks.28.mlp.l3); the last --train-blocks blocks before it
-    are unfrozen, the rest stay frozen.
-  - A head on the pooled vector predicts the phenotype:
-      regression     (numeric phenotype, e.g. height): MSE on the standardized value; reports RMSE
-                     (original units), Pearson r and R^2 on held-out rows
-      classification (text labels, or numbers with <= 10 distinct values): cross-entropy; reports
-                     accuracy vs the majority-class baseline
-    --task auto (default) picks one by these rules; --task regression|classification forces it.
-  - Rows are split train/validation; validation metrics are reported before and after training.
-
-INPUT
-  --hash-pheno FILE.tsv   tab-separated, 2 columns, one row per sample; optional header row
-                          (detected when its first field is not a 0/1 string; the second header
-                          field is used as the phenotype name):
-                            column 1  genomic hash, only the characters 0 and 1, any length
-                            column 2  phenotype value, numeric (e.g. 172.5) or a label (e.g. tall)
-                          Rows with an invalid hash or an empty / NA phenotype are skipped.
-                          Example:
-                            hash<TAB>height
-                            0110100111010<TAB>172.5
-                            1100101000111<TAB>165.0
-
-OUTPUT  --out, default <TSV folder>/evo2_hash_<phenotype name>.pt   (torch.save dict)
-  mode ("hash"), evo2_model, layer, task, phenotype, hash_window
-  classes          class labels (classification) or None
-  target_mean, target_std   (regression) prediction = head output * target_std + target_mean
-  trained_blocks   {parameter name in evo.model: tensor} for the unfrozen Evo 2 blocks
-  head             state_dict: LayerNorm + Linear(hidden -> 1 or n_classes)
-  val_rows         0-based data-row indices (header excluded) of the held-out rows
-  metrics {before, after};  config
-  To reuse: Evo2(evo2_model), copy trained_blocks into evo.model (load_state_dict(strict=False)),
-  rebuild the new layers with the same shapes and load their state_dicts.
+INPUT   --hash-pheno TSV: column 1 = hash (0/1 string), column 2 = phenotype; optional header row
+        (its second field names the phenotype); invalid or empty rows are skipped. Build it from
+        training individuals only.
+OUTPUT  --out, default <TSV folder>/evo2_hash_<phenotype>.pt: mode "hash", backend, task, phenotype,
+        classes, target_mean/std, trained_blocks, head, val_rows, metrics, config.
 
 USAGE
-  python 4b_finetune_evo2_hash.py --test                                           # synthetic, CPU
-  python 4b_finetune_evo2_hash.py --hash-pheno hash_height.tsv                     # regression
-  python 4b_finetune_evo2_hash.py --hash-pheno hash_pop.tsv --task classification
-  python 4b_finetune_evo2_hash.py --hash-pheno hash_height.tsv --train-blocks 0    # frozen baseline
-
-  --mock-evo2 replaces Evo 2 by a small random stand-in model (CPU check of the script only).
-
-REQUIRES  numpy, pandas, torch, evo2 (pip install evo2; Linux, CUDA 12.8+ and driver >= 570 (install_evo2.sh), Python 3.11/3.12;
-          the 7B models run in bf16 without Transformer Engine; an 80 GB GPU is recommended).
-
-NOTE  The official Evo 2 training paths are Savanna and NVIDIA BioNeMo. This script uses the `evo2`
-      inference package in plain PyTorch and, after the first step, checks that gradients reach the
-      new layers and the unfrozen blocks, stopping with a clear message if they don't.
+  python 4b_finetune_evo2_hash.py --hash-pheno hash_height.tsv
+  python 4b_finetune_evo2_hash.py --hash-pheno hash_pop.tsv --task classification --train-blocks 0
+  python 4b_finetune_evo2_hash.py --test        # synthetic TSV, --mock-evo2, CPU
+Evo 2 needs Linux, CUDA 12.8+ (install_evo2.sh) and ~80 GB of GPU memory for 7B.
 """
 import argparse
 import os
@@ -61,7 +25,7 @@ import numpy as np
 import pandas as pd
 
 from evo2_model import Evo2Runner, MockEvo2Runner, config_of, fit
-from haplo_common import die, log, test_workdir
+from haplo_common import check_args, die, log, test_workdir
 
 
 def load_hash_pheno(path, task="auto"):
@@ -249,13 +213,7 @@ def main(argv=None):
         ap.error("--hash-pheno is required")
     if not os.path.exists(args.hash_pheno):
         die(f"{args.hash_pheno} not found")
-    if not 0 < args.val_frac < 1:
-        die("--val-frac must be between 0 and 1")
-    if args.train_blocks < 0:
-        die("--train-blocks must be >= 0")
-    for name in ("hash_window", "batch", "epochs", "val_examples", "log_every", "eval_every"):
-        if getattr(args, name) < 1:
-            die(f"--{name.replace('_', '-')} must be >= 1")
+    check_args(args, ("hash_window",), training=True)
     train_hash(args)
     log("done.")
 
