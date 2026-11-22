@@ -162,7 +162,7 @@ signature set is empty or a patient has fewer than 3 complete observations.
   | `not_in_feature_list` | the protein is in the T-N table but not in `features.tsv` |
 
 - `haplograph_block_id` is the block in the naming of the 1000 Genomes haplograph (`chr21_14215892-14284114`).
-  Haplograph cluster node ids, as written by `1_build_graph.py` at the top of this repository, are this id plus
+  Haplograph cluster node ids, as written by `part1_haplograph/2_build_graph.py` in this repository, are this id plus
   `_cluster<N>`, so proteins can be joined to clusters by prefix. The ids match exactly when the bundled
   haploblocks.org partition is used in step 1.
 - `symbol_ambiguous` and the selected `gene_ids` are kept in `protein_features.tsv`, so the choice of locus can be
