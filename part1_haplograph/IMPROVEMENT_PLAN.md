@@ -1,6 +1,6 @@
-# Part 1 improvement plan (post-hackathon)
+# Part 1 improvement plan
 
-Plan produced with the hackathon-brainstorm workflow, starting from the existing part 1 pipeline
+Plan produced with a structured brainstorm-and-review workflow, starting from the existing part 1 pipeline
 (steps 0-5, see [../DOCUMENTATION.md](../DOCUMENTATION.md)). It is updated after each improvement
 iteration; implemented items are marked **[done]**.
 

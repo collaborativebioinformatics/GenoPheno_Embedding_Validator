@@ -52,43 +52,11 @@ For more see: [haploblocks.org](haploblocks.org)
 
 # Part 1: Haplograph → embeddings → fine-tuning Evo 2
 
-All part 1 scripts are in [`part1_haplograph/`](part1_haplograph/). **Run the commands below from inside that folder** (`cd part1_haplograph`).
+All part 1 scripts are in [`part1_haplograph/`](part1_haplograph/). **Run the commands below from inside that folder** (`cd part1_haplograph`). [DOCUMENTATION.md](DOCUMENTATION.md) lists every option and output format.
 
-> **Changes after the hackathon (read this before the sections below).** The sections after this box are the hackathon-time instructions, kept as they were. Since then:
-> - **New step 0:** [`download_haplograph.py`](part1_haplograph/download_haplograph.py) downloads the haplograph (all chromosomes or a selection) and writes the training and test sets (see [Downloading the haplograph](#downloading-the-haplograph)). Step 1 now reads its output and no longer downloads anything.
-> - **`2_ancestry_labels.py` was removed**: ancestry labels are no longer used anywhere. Skip the step-2 commands below.
-> - **Step 3** (`3_node_embeddings.py`) now includes the RAPIDS version (`--rapids`, formerly `3_node_rapid_embeddings.py`), computes node2vec, GNN and XGBoost embeddings in one run by default (`--method all`), and needs no labels: XGBoost now learns to predict each node's haploblock region (genomic bins) instead of its ancestry.
-> - **Step 4** (`4a_finetune_evo2_embeddings.py`) now includes the BioNeMo version: use `--bionemo` instead of `4a_finetune_evo2_embeddings_bionemo.py`. The only objective is `next` (`--objective ancestry` was removed). `--mock-evo2` replaces Evo 2 by a small stand-in model to check the pipeline on a CPU. (`4_finetune_evo2.py` in the older commands below is this script.)
-> - **Step 5** (`5_validate_evo2.py`) now queries the fine-tuned model on the test set (task `test_set_performance`), uses the graph's own train/test split by default, and can ask NVIDIA Nemotron for a plain-language summary (`--nemotron-summary`).
-> - Every script has a `--test` flag that runs it on a small synthetic dataset on the CPU in seconds.
-> - `scratch_code/` and the `example_test_run/` checkpoint were removed; `How_to_use_rapids` moved into [DOCUMENTATION.md](DOCUMENTATION.md).
+## Pipeline overview
 
-## Downloading the haplograph
-
-The data is the [1000 Genomes haplograph](https://data.haploblocks.org/haplograph/1000G/) (one folder per chromosome, chr1–chr22, files described in its [README](https://data.haploblocks.org/haplograph/1000G/README.txt)), and the train/test split is [BH_26](https://data.haploblocks.org/BH_26/splits/). `download_haplograph.py` downloads both, checks the files against the dataset's `checksums.md5`, and writes the training and test sets for the rest of the pipeline:
-
-```bash
-cd part1_haplograph
-python download_haplograph.py                          # whole genome (chr1-chr22), BH_26 split
-python download_haplograph.py --chroms chr21,chr22     # or selected chromosomes only
-python download_haplograph.py --split random --test-fraction 0.5 --seed 0   # a new random split
-```
-
-Output (in `haplograph/`): `raw/<chrom>/nodes.csv.gz` and `edges.csv.gz`, plus `splits/train_individuals.txt` (training set, 1,252 individuals for BH_26) and `splits/test_individuals.txt` (test set, 1,251), one 1000 Genomes sample ID per line. Steps 1–4 learn from the training set only; step 5 validates the fine-tuned Evo 2 on the test set. The whole genome is about 15 GB (edge files ~80 MB to ~1 GB per chromosome); chr21 alone is about 85 MB.
-
-## Quick start (current scripts)
-
-```bash
-cd part1_haplograph
-python download_haplograph.py --chroms chr21,chr22                 # step 0: data + train/test sets
-python 1_build_graph.py                                            # step 1: graph from the training individuals
-G=haplograph/chr21_chr22_train_half_A
-python 3_node_embeddings.py --graph-dir $G                         # step 3: node2vec + gnn + xgboost
-python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir $G  # step 4: fine-tune Evo 2 (GPU)
-python 5_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt   # step 5
-```
-
-Without a GPU, add `--mock-evo2` to step 4 (the model is then `$G/evo2_mock_next_gnn.pt`) to check the pipeline end to end; the results are meaningless. Each script also runs on synthetic data with `--test`, e.g. `python 5_validate_evo2.py --test` runs steps 0–5 in under a minute on a CPU.
+The input is the [1000 Genomes haplograph](https://data.haploblocks.org/haplograph/1000G/) (chr1–chr22). Each chromosome is cut into **haploblocks**, and within a haploblock the individuals' haplotypes are grouped into **clusters**; every cluster is a graph **node** that records which individuals carry it. An **edge** joins two clusters of the same chromosome that are carried by the same individuals, weighted by **lift**, i.e. how much more often they occur together than expected by chance (`lift = weight / (support_A × support_B / n)`). The individuals are split into a **training set** and a **test set** (by default the [BH_26](https://data.haploblocks.org/BH_26/splits/) halves, 1,252 / 1,251 individuals): steps 1–4 learn from the training individuals only, and step 5 evaluates on the test individuals.
 
 | Step | Script | Does |
 |---|---|---|
@@ -101,13 +69,30 @@ Without a GPU, add `--mock-evo2` to step 4 (the model is then `$G/evo2_mock_next
 | – | `install_evo2.sh` | installs Evo 2 + flash-attn on a Linux GPU machine |
 | – | `haplo_common.py`, `evo2_model.py` | shared code (helpers; Evo 2 / BioNeMo / mock backbones and model loading) |
 
+The step numbers follow the script names; there is no step 2. Every script has a `--test` flag that runs it on a small synthetic haplograph on the CPU in seconds, and `--help` lists all options.
+
+## Quick start
+
+```bash
+cd part1_haplograph
+python download_haplograph.py --chroms chr21,chr22                 # step 0: data + train/test sets
+python 1_build_graph.py                                            # step 1: graph from the training individuals
+G=haplograph/chr21_chr22_train_half_A
+python 3_node_embeddings.py --graph-dir $G                         # step 3: node2vec + gnn + xgboost
+python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir $G  # step 4: fine-tune Evo 2 (GPU)
+python 5_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt   # step 5
+```
+
+Without a GPU, add `--mock-evo2` to step 4 (the model is then `$G/evo2_mock_next_gnn.pt`) to check the pipeline end to end; the results are meaningless. `python 5_validate_evo2.py --test` runs steps 0–5 on synthetic data in under a minute on a CPU.
+
 ## Dependencies
 
-- Python 3.11 or 3.12, Linux, NVIDIA GPU with CUDA 12.1+ (80 GB recommended for step 4)
+- Python 3.11 or 3.12, Linux, NVIDIA GPU with CUDA 12.1+ (80 GB recommended for step 4); the CPU checks (`--test`, `--mock-evo2`) run on any OS
 - numpy, pandas, scipy (all steps)
 - torch (node2vec and GNN embeddings, Evo 2, reading models in step 5)
 - xgboost (XGBoost embeddings)
 - evo2 + flash-attn (step 4)
+- optional: RAPIDS cuDF / cuML + CuPy (GPU tables and SVDs), NVIDIA BioNeMo (step 4 `--bionemo`), an NVIDIA NIM API key (step 5 `--nemotron-summary`)
 
 ## Install
 
@@ -121,144 +106,94 @@ Optional: `pip install cudf-cu12` (RAPIDS cuDF) enables `--cudf` in steps 1 and 
 
 > The core packages are also listed in [`part1_haplograph/requirements.txt`](part1_haplograph/requirements.txt), and [`part1_haplograph/install_evo2.sh`](part1_haplograph/install_evo2.sh) installs Evo 2 on a GPU machine. CPU-only, RAPIDS and BioNeMo setups are in [DOCUMENTATION.md](DOCUMENTATION.md). `install_evo2.sh` installs the CUDA 12.8 toolkit, which needs an NVIDIA driver ≥ 570.
 
-## Usage
+## Step 0: download the haplograph
 
-The pipeline uses the [BH_26 train/test split](https://data.haploblocks.org/BH_26/splits/). `half_A.txt` (1,252 individuals) is the train set, used by steps 1–4. `half_B.txt` (1,251 individuals) is the test set, which only step 5 uses. Both are plain text, one 1000 Genomes sample ID per line.
-
-Pass the train half once, to step 1. It builds the graph from those individuals only and writes `train_individuals.txt` into the graph folder, and steps 2–4a then use it automatically:
+`download_haplograph.py` downloads the haplograph ([files described here](https://data.haploblocks.org/haplograph/1000G/README.txt)) for all chromosomes or a selection and checks every file against the dataset's `checksums.md5`. It then writes the training and test sets: `splits/train_individuals.txt` and `splits/test_individuals.txt` in `haplograph/`, one 1000 Genomes sample ID per line, by default the BH_26 halves (`half_A` = training, `half_B` = test). `--split random --test-fraction 0.5 --seed 0` makes a new random split instead, stratified by population. The whole genome is about 15 GB (edge files ~80 MB to ~1 GB per chromosome); chr21 alone is about 85 MB.
 
 ```bash
-SPLITS=https://data.haploblocks.org/BH_26/splits
-G=haplograph/genome_train_half_A
-
-python 1_build_graph.py --train-individuals $SPLITS/half_A.txt      # whole genome (or --chroms chr21,chr22)
-python 2_ancestry_labels.py --graph-dir $G                           # needed for xgboost or --objective ancestry
-python 3_node_embeddings.py --method node2vec --graph-dir $G         # or gnn / xgboost
-python 4a_finetune_evo2_embeddings.py --method node2vec --graph-dir $G
-python 5_validate_evo2.py --model $G/evo2_next_node2vec.pt --graph-dir $G --tasks validation_tasks.txt
+python download_haplograph.py --test                   # test: synthetic haplograph + split
+python download_haplograph.py --chroms chr21           # test: one chromosome (~85 MB)
+python download_haplograph.py                          # full run: whole genome (chr1-chr22), BH_26 split
 ```
 
-> Now: run `python download_haplograph.py` first (step 1 reads its downloads), and skip the `2_ancestry_labels.py` line (removed). After `download_haplograph.py`, `python 1_build_graph.py` without `--train-individuals` uses the downloaded training set and writes the same `haplograph/genome_train_half_A` folder.
+## Step 1: build the graph
 
-What each step takes from the train half:
-- **Step 1:** the edge weights, cluster support and lift come from training individuals only. The carrier matrix still holds everyone, because step 5 needs the test individuals' clusters.
-- **Step 2:** node ancestry labels.
-- **Step 3:** the carrier features for GNN and XGBoost.
-- **Step 4a:** trains and validates within the train half only. The checkpoint records which individuals it trained on.
+`1_build_graph.py` merges the downloaded chromosomes into one graph and writes it to a **graph folder** (e.g. `haplograph/genome_train_half_A`), which steps 3–5 take as `--graph-dir`. Edge weights, cluster support and lift are counted over the training individuals only, and edges below `--min-lift` (default 2) are dropped; the carrier matrix keeps every individual, because step 5 needs the test individuals' clusters. Each later step checks that it uses the same training set and graph build, and stops if not. If the graph names individuals differently from the sample IDs, add `--sample-map map.csv` (two columns: graph name, sample ID).
 
-Each step checks that it uses the same training set as the step before and stops if not. Every script also accepts `--train-individuals` to override the graph's file. Leaving it out of step 1 builds the graph from all individuals, as before.
+```bash
+python 1_build_graph.py --test                         # test: synthetic data
+python 1_build_graph.py --chroms chr21                 # test: -> haplograph/chr21_train_half_A
+python 1_build_graph.py                                # full run: every downloaded chromosome -> haplograph/genome_train_half_A
+python 1_build_graph.py --cudf --chunksize 0           # full run on the GPU with RAPIDS cuDF
+```
 
-> Now: leaving it out of step 1 uses the training set written by `download_haplograph.py`; `--no-split` builds the graph from all individuals.
+## Step 3: node embeddings
 
-If the graph names individuals differently from the sample IDs (e.g. `IND1, IND2…`), add `--sample-map map.csv` (two columns: graph name, sample ID) to the step that reads the split file.
+`3_node_embeddings.py` turns every node into a vector with three methods, by default all in one run (`--method all`), without any labels. **node2vec** learns from random walks on the graph, the **GNN** (a graph autoencoder) from the graph plus each cluster's carrier profile, and **XGBoost** from trees that predict each node's haploblock region (genomic bins); the leaves a node falls into become its vector. The output is `node_emb_<method>.npy` in the graph folder; `--rapids` runs the SVDs on the GPU with RAPIDS cuML + CuPy.
 
-For a quick test, add `--chroms chr21,chr22` to step 1 and use `G=haplograph/chr21_chr22_train_half_A`. Each script's header describes its input and output file formats, and `--help` lists all options.
+```bash
+python 3_node_embeddings.py --test                                         # test: synthetic data
+python 3_node_embeddings.py --graph-dir haplograph/chr21_train_half_A --device cpu \
+    --walks-per-node 2 --walk-length 20 --window 3 --gnn-epochs 50 --xgb-trees 20 --xgb-depth 4   # test: chr21 on a CPU
+python 3_node_embeddings.py --graph-dir haplograph/genome_train_half_A --device cuda --rapids   # full run: whole genome, GPU
+```
 
-### Optional, experimental: step 4a with NVIDIA BioNeMo
+At genome scale (11M nodes) host RAM, not the GPU, is the bottleneck of steps 1–3. The peak is XGBoost's leaf stage: it one-hot encodes every node's leaf index across all trees, and it grows `--xgb-trees` × `--xgb-region-bins` trees (default 50 × 16), so lower either one, or `--xgb-depth`, if the process is killed without a traceback. As a reference, `--xgb-trees 20 --xgb-depth 3` kept peak RAM around 120 GB on the whole genome.
 
-`4a_finetune_evo2_embeddings_bionemo.py` does the same fine-tuning as step 4a, but loads and runs Evo 2 through [NVIDIA BioNeMo](https://docs.nvidia.com/bionemo-framework/latest/models/evo2/) (NeMo 2 / Megatron Core) instead of the `evo2` package. It uses the training set the same way. It has not been tested on a GPU yet and may need adjusting for your BioNeMo version (the affected parts are marked `VERSION-SENSITIVE` in the code).
+## Step 4: fine-tune Evo 2
 
-It runs inside the BioNeMo Framework container (`nvcr.io/nvidia/clara/bionemo-framework`) and needs an Evo 2 checkpoint in NeMo2 format:
+`4a_finetune_evo2_embeddings.py` fine-tunes Evo 2 (7B) on the step-3 embeddings of one method, with no DNA involved: one example is one training individual's clusters along a chromosome, each replaced by its embedding plus a genomic-position encoding. The model learns to predict the next cluster; rare clusters are merged into one token per haploblock (`--min-support`, default 2). Its last `--train-blocks` blocks (default 4) are fine-tuned, and `--train-blocks 0` gives a frozen baseline to compare against. The backbone is the `evo2` package by default, NVIDIA BioNeMo with `--bionemo` (experimental), or a small CPU stand-in with `--mock-evo2` that only checks the pipeline.
+
+```bash
+python 4a_finetune_evo2_embeddings.py --test                                                  # test: synthetic data, stand-in model
+python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir haplograph/chr21_train_half_A \
+    --mock-evo2 --device cpu --max-len 128                                                    # test: chr21 on a CPU, stand-in model
+G=haplograph/genome_train_half_A
+python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir $G                             # full run: Evo 2 on a GPU -> $G/evo2_next_gnn.pt
+python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir $G --train-blocks 0 --out $G/evo2_frozen_next_gnn.pt   # frozen baseline
+```
+
+**With NVIDIA BioNeMo.** `--bionemo` loads and runs Evo 2 through [BioNeMo](https://docs.nvidia.com/bionemo-framework/latest/models/evo2/) (NeMo 2 / Megatron Core) instead of the `evo2` package. It runs inside the BioNeMo Framework container (`nvcr.io/nvidia/clara/bionemo-framework`), needs an Evo 2 checkpoint in NeMo2 format, and writes `evo2_bionemo_next_<method>.pt`. It has not been tested on a GPU yet and may need adjusting for your BioNeMo version (the affected parts are marked `VERSION-SENSITIVE` in `evo2_model.py`).
 
 ```bash
 evo2_convert_to_nemo2 --model-path hf://arcinstitute/savanna_evo2_7b_base --model-size 7b --output-dir nemo2_evo2_7b_8k
-python 4a_finetune_evo2_embeddings_bionemo.py --method gnn --graph-dir $G --ckpt-dir nemo2_evo2_7b_8k
+python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir $G --bionemo --ckpt-dir nemo2_evo2_7b_8k
 ```
 
-> Now merged into step 4: `python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir $G --bionemo --ckpt-dir nemo2_evo2_7b_8k` (the `VERSION-SENSITIVE` parts are in `evo2_model.py`). The output is `evo2_bionemo_next_<method>.pt`.
+## Step 4b (optional): fine-tune Evo 2 on hash-phenotype pairs
 
-### Hash-phenotype fine-tuning
-
-To fine-tune on hash-phenotype associations instead, use step 4b on its own (no steps 1–3 needed). Its input is a TSV with two columns, a genomic hash (0/1 string) and a phenotype (e.g. height). Use a TSV built from the train half only, so the test half stays unseen.
+`4b_finetune_evo2_hash.py` fine-tunes Evo 2 to predict a phenotype from a genomic hash, independently of steps 0–3. Its input is a TSV with two columns, a genomic hash (0/1 string) and a phenotype (e.g. height); numeric phenotypes are treated as regression, text labels as classification. Build the TSV from training individuals only, so the test individuals stay unseen.
 
 ```bash
-python 4b_finetune_evo2_hash.py --hash-pheno hash_height.tsv   # numeric -> regression, labels -> classification
+python 4b_finetune_evo2_hash.py --test                         # test: synthetic TSV, CPU stand-in model
+python 4b_finetune_evo2_hash.py --hash-pheno hash_height.tsv   # full run: Evo 2 on a GPU
 ```
 
-> `python 4b_finetune_evo2_hash.py --test` checks the script on a synthetic TSV with a CPU stand-in model.
+## Step 5: validate on the test set
 
-### Running the whole genome
-
-```bash
-python3 1_build_graph.py --chroms chr21
-python3 2_ancestry_labels.py --graph-dir haplograph/chr21/
-python3 3_node_embeddings.py --method node2vec --graph-dir haplograph/chr21/
-python3 4_finetune_evo2.py   --method node2vec --graph-dir haplograph/chr21/ --objective ancestry --train-blocks 0 --epochs 1
-```
-
-The example above runs on chr21 as a quick test. To run the whole genome, build the graph across all autosomes (1_build_graph.py with no --chroms covers chr1–chr22) and point the later steps at haplograph/genome/.
-
-I ran this on an RTX PRO 6000 Blackwell for the hackathon. Worth flagging up front: the bottleneck here is host RAM, not GPU. Steps 1–3 are CPU/memory-bound. The step that strains is 3_node_embeddings.py --method xgboost: its leaf-embedding stage one-hot encodes every node’s leaf index across all trees, and at genome scale (11M nodes) that transient matrix is large enough to exhaust ~250 GB at the default --xgb-trees 100 --xgb-depth 6. On a 141 GB machine this gets OOM-killed right after the accuracy line, with no traceback.
-
-The fix is to shrink the leaf matrix with fewer, shallower trees. --xgb-trees 20 --xgb-depth 3 keeps peak RAM around 120 GB and still reaches ~0.98 ancestry accuracy (versus ~0.99 at default), since the super-population signal is easily separable. --device cpu avoids a GPU/CPU device-mismatch in XGBoost’s apply step.
-
-```bash
-python3 1_build_graph.py
-python3 2_ancestry_labels.py --graph-dir haplograph/genome/
-python3 3_node_embeddings.py --method xgboost --graph-dir haplograph/genome/ --device cpu --xgb-trees 20 --xgb-depth 3
-python3 4_finetune_evo2.py   --method xgboost --graph-dir haplograph/genome/ --objective ancestry --train-blocks 0 --epochs 1
-```
-
-> Now: the steps 2 and `--objective ancestry` parts no longer exist, and XGBoost predicts haploblock-region bins, so it grows `--xgb-trees` × `--xgb-region-bins` trees (default 50 × 16); lower either if memory runs out. Step 3 also moves its booster to the CPU before the leaf stage itself, so `--device cpu` is no longer needed for the device mismatch.
-
-## Step 5: validation
-
-`5_validate_evo2.py` checks one fine-tuned model (any `.pt` from step 4) against the test set. By default it reads `half_A.txt` (train) and `half_B.txt` (test) from the BH_26 split, downloading them automatically. Or download them once and pass the folder:
-
-```bash
-wget -r -np -nH --cut-dirs=2 -R "index.html*" https://data.haploblocks.org/BH_26/splits/
-python 5_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --splits splits/ --gwas height_hg38.tsv
-```
-
-> Now: by default step 5 uses the graph folder's own `train_individuals.txt` / `test_individuals.txt` (written by step 1 from `download_haplograph.py`). It falls back to the BH_26 URL only for a graph built without a split (`--no-split`); a graph with a training set but no test file needs `--test-individuals` or `--splits`.
-
-It also checks for leakage at two levels:
-- It warns if any test individual is in the graph's training set (step 1).
-- It warns if any test individual is in the model's training set (step 4a).
-
-Graph individuals in neither half are left out and counted in the report. Other split files can be given with `--train-individuals` / `--test-individuals`, and `--splits none` uses the model's own held-out individuals instead.
-
-The checks to run are listed in a tasks file (`validation_tasks.txt` is an example), one per line with `key=value` parameters. Add a line to run a check again with other settings. `--list-tasks` shows every task and its parameters.
+`5_validate_evo2.py` checks one fine-tuned model (any `.pt` from step 4) against the test individuals, using the graph folder's own training and test sets (`--splits DIR_OR_URL` reads `half_A.txt` / `half_B.txt` from elsewhere). It warns if any test individual was used to build the graph or to train the model. The checks are listed in a tasks file, one per line with `key=value` parameters ([`validation_tasks.txt`](part1_haplograph/validation_tasks.txt) is an example; `--list-tasks` shows all of them):
 
 - `model_info`: what the model is, its stored metrics, and whether any test individual was in its training data
+- `test_set_performance`: loads the fine-tuned model and predicts each test individual's next cluster along each chromosome (cross-entropy, perplexity, top-1 / top-5 accuracy with 95% CIs), compared with training individuals (generalization gap) and with a bigram baseline the model should beat. Needs the backbone used in step 4 (a GPU for Evo 2)
+- `embedding_cooccurrence`: without a GPU, whether the step-3 embeddings predict which clusters are carried together by the test individuals (ROC AUC)
 - `cluster_consistency`: per haploblock, whether train and test individuals carry the same clusters, with the same frequencies, compared against random splits of the same size
-- `gwas_enrichment`: which haploblocks contain more GWAS hits than expected, plus an overall test
-- `test_set_performance` *(new)*: loads the fine-tuned model and predicts each test individual's next cluster along each chromosome: cross-entropy, perplexity, top-1 / top-5 accuracy, the same on a sample of training individuals (generalization gap), and a bigram baseline counted on the training individuals that the model should beat. Needs the backbone used in step 4 (a GPU for Evo 2).
 
-New kinds of checks go in a Python file loaded with `--plugins my_checks.py`; the script's header shows a short example. Results are written to `report.md`, `summary.json` and one CSV per task in `<graph-dir>/validation_<model>/`.
-
-> Optional: `--nemotron-summary` sends the task summaries (aggregate numbers only; sample IDs and file paths are removed) to an NVIDIA Nemotron model via the NVIDIA NIM API (key in `$NVIDIA_API_KEY`) and writes a plain-language reading of the results to `nemotron_summary.md`.
-
-### Getting GWAS data
-
-`gwas_enrichment` reads any text file with chromosome, position and p-value columns, and recognises the GIANT and GWAS Catalog column names automatically. **The positions must use the same genome build as the haploblock regions.** The haplograph README doesn't state its build, so check it before running.
-
-**GIANT height (Yengo et al. 2022).** Download a summary statistics file, e.g. `Yengo.2022.height.GWAS.ALL` (all ancestries) or `.EUR`, from the [GIANT consortium data files page](https://giant-consortium.web.broadinstitute.org/GIANT_consortium_data_files). The columns are `SNPID RSID CHR POS EFFECT_ALLELE OTHER_ALLELE EFFECT_ALLELE_FREQ BETA SE P N`, with positions in **hg19/GRCh37**. The file can be used directly if the haploblocks are hg19. For GRCh38, lift the positions over first, e.g. with [CrossMap](https://crossmap.sourceforge.net/) and the UCSC `hg19ToHg38.over.chain.gz` chain file:
+Results are written to `report.md`, `summary.json` and one CSV per task in `<graph-dir>/validation_<model>/`. New checks go in a Python file loaded with `--plugins my_checks.py`. `--nemotron-summary` sends the task summaries (aggregate numbers only; sample IDs and file paths are removed) to an NVIDIA Nemotron model via the NVIDIA NIM API (key in `$NVIDIA_API_KEY`) and writes a plain-language reading of the results to `nemotron_summary.md`.
 
 ```bash
-zcat Yengo.2022.height.GWAS.ALL.gz | awk 'NR>1 {OFS="\t"; print "chr"$3, $4-1, $4, $2, $10}' > height_hg19.bed
-CrossMap bed hg19ToHg38.over.chain.gz height_hg19.bed height_hg38.bed
-(printf "CHR\tPOS\tRSID\tP\n"; awk 'BEGIN{OFS="\t"} {print $1, $3, $4, $5}' height_hg38.bed) > height_hg38.tsv
+python 5_validate_evo2.py --test                       # test: runs steps 0-5 on synthetic data
+G=haplograph/chr21_train_half_A
+python 5_validate_evo2.py --model $G/evo2_mock_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt   # test: chr21, stand-in model
+G=haplograph/genome_train_half_A
+python 5_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt        # full run: Evo 2 on a GPU
+python 5_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt --nemotron-summary
 ```
-
-**GWAS Catalog (any trait).** Download all associations from the [GWAS Catalog downloads page](https://www.ebi.ac.uk/gwas/docs/file-downloads), e.g. `gwas-catalog-associations_ontology-annotated-full.zip`. It contains only reported hits, in GRCh38 coordinates (columns `CHR_ID`, `CHR_POS`, `SNPS`, `P-VALUE`), so the per-region test then uses region length as the background. Keep one trait:
-
-```python
-import pandas as pd
-cat = pd.read_csv("gwas-catalog-associations_ontology-annotated-full.zip", sep="\t", dtype=str)
-height = cat[cat["MAPPED_TRAIT"].str.contains("body height", case=False, na=False)]
-height[["CHR_ID", "CHR_POS", "SNPS", "P-VALUE"]].to_csv("gwas_catalog_height.tsv", sep="\t", index=False)
-```
-
-Full summary statistics (like GIANT) give the stronger per-region test, because each haploblock is compared against the number of SNPs tested in it.
-
-Add `--chroms chr21,chr22` to any step for a quick test run, and `--help` to see all options.
 
 ---
 
 # Part 2: Proteomics → embeddings → fine-tuning Evo 2
 
-All part 2 folders are in [`part2_proteomics/`](part2_proteomics/); their code is unchanged since the hackathon.
+All part 2 folders are in [`part2_proteomics/`](part2_proteomics/).
 
 ## Proteomics (paired tumor/normal)
 
@@ -270,7 +205,7 @@ place. The early versus late fusion comparison has been designed but not run yet
 | Part | Folder | Status |
 |---|---|---|
 | Prepare real proteomics | [`proteomics_prep/`](part2_proteomics/proteomics_prep/) | v0.1.0 on `main`, tested |
-| Synthetic test data | SynthTAN v0.1 (not in this repository) | Shared with the team |
+| Synthetic test data | SynthTAN v0.1 (not in this repository) | Not included |
 | Convert synthetic data for ProLM | [`synthtan_prolm/`](part2_proteomics/synthtan_prolm/) | On `main`, checked |
 | Protein embeddings with ProLM | `proteomics_emb/` (branch `pr_emb`) | First run done, not yet merged |
 | Early vs late fusion | – | Designed, not run |

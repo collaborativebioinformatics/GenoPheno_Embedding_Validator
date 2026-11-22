@@ -23,7 +23,6 @@ flowchart LR
     H[(hash-phenotype TSV)] -.-> S4b[4b fine-tune Evo 2<br/>on hashes, optional]
     S4 --> S5[5 validate Evo 2<br/>on the test individuals]
     S0 -.test set.-> S5
-    G[(GWAS file<br/>e.g. GIANT height)] -.-> S5
     S5 -.optional.-> N[Nemotron summary]
 ```
 
@@ -34,9 +33,9 @@ flowchart LR
 | 3 | `3_node_embeddings.py` | Turns every graph node into a vector with node2vec, a GNN and XGBoost (no labels); `--rapids` runs the SVDs on the GPU. |
 | 4 | `4a_finetune_evo2_embeddings.py` | Fine-tunes Evo 2 7B on each training individual's sequence of node embeddings (no DNA); `--bionemo` runs Evo 2 through NVIDIA BioNeMo. |
 | 4b | `4b_finetune_evo2_hash.py` | Optional, independent of steps 0–3: fine-tunes Evo 2 to predict a phenotype from a genomic hash (0/1 string). |
-| 5 | `5_validate_evo2.py` | Validates one fine-tuned model on the test individuals (the model's own predictions, cluster consistency, GWAS enrichment, leakage, plus your own checks). |
+| 5 | `5_validate_evo2.py` | Validates one fine-tuned model on the test individuals (the model's own predictions, held-out embedding test, cluster consistency, leakage, plus your own checks). |
 
-There is no step 2: the former `2_ancestry_labels.py` was removed after the hackathon, because the pipeline no longer uses ancestry labels. The step numbers are kept so the scripts keep the names used in the README.
+There is no step 2; the step numbers follow the script names.
 
 Shared code: `haplo_common.py` (downloads, individual lists, training set, device selection, synthetic test data) and `evo2_model.py` (the Evo 2, BioNeMo and mock backbones, the new layers and loss, and `load_finetuned`, which rebuilds a fine-tuned model for step 5).
 
@@ -85,7 +84,6 @@ haplograph/
         ├── report.md, summary.json, split.csv
         ├── test_set_performance_chroms.csv
         ├── cluster_consistency_regions.csv.gz
-        ├── gwas_enrichment_<label>_regions.csv.gz
         ├── nemotron_summary.md                  (--nemotron-summary)
         └── inputs/downloads/<URL hash>/         split files downloaded by step 5
 ```
@@ -110,6 +108,14 @@ Downloads `nodes.csv.gz` and the edge file of each chromosome from `https://data
 | `--test-fraction`, `--seed` | `0.5`, `0` | random split; stratified by 1000G population unless `--no-stratify` |
 | `--workdir` | `haplograph` | output root |
 | `--no-verify` | off | skip the MD5 check |
+
+Usage (more in [section 11](#11-running-the-pipeline)):
+
+```bash
+python download_haplograph.py --test                # test: synthetic haplograph + split
+python download_haplograph.py --chroms chr21        # test: one chromosome
+python download_haplograph.py                       # full run: whole genome, BH_26 split
+```
 
 ### Step 1: `1_build_graph.py`
 
@@ -138,6 +144,15 @@ If the graph folder already exists, step 1 compares the requested settings (chro
 | `--workdir`, `--raw-dir`, `--out` | `haplograph`, `<workdir>/raw`, automatic | locations |
 | `--cudf` | off | read and match nodes/edges on the GPU with RAPIDS cuDF |
 | `--chunksize` | `2000000` | edge rows read at a time; `0` = whole file (with `--cudf`, needed for GPU parsing) |
+
+Usage (more in [section 11](#11-running-the-pipeline)):
+
+```bash
+python 1_build_graph.py --test                      # test: synthetic data
+python 1_build_graph.py --chroms chr21              # test: -> haplograph/chr21_train_half_A
+python 1_build_graph.py                             # full run: whole genome -> haplograph/genome_train_half_A
+python 1_build_graph.py --cudf --chunksize 0        # or with RAPIDS cuDF on the GPU
+```
 
 ### Step 3: `3_node_embeddings.py`
 
@@ -168,6 +183,14 @@ Learns one vector per node, by default with all three methods (`--method all`, o
 | `--rapids` | off | carrier and leaf SVDs on the GPU with RAPIDS cuML + CuPy (see section 6) |
 
 If XGBoost runs out of memory, lower `--chunk-nodes`, `--xgb-svd-nodes`, `--xgb-train-nodes`, `--xgb-max-bin`, `--xgb-region-bins`, `--xgb-trees` or `--xgb-depth`. Step 3 moves the booster to the CPU before computing leaves, which avoids XGBoost's slow GPU/CPU device-mismatch path.
+
+Usage (more in [section 11](#11-running-the-pipeline)):
+
+```bash
+python 3_node_embeddings.py --test                  # test: synthetic data
+python 3_node_embeddings.py --graph-dir haplograph/chr21_train_half_A --device cpu --walks-per-node 2 --gnn-epochs 50 --xgb-trees 20   # test: chr21, CPU
+python 3_node_embeddings.py --graph-dir haplograph/genome_train_half_A --device cuda --rapids                                  # full run: GPU
+```
 
 ### Step 4: `4a_finetune_evo2_embeddings.py`
 
@@ -205,6 +228,14 @@ Fine-tunes Evo 2 7B on node embeddings, with no DNA involved. One example is one
 | `--pos-freqs` | `16` | genomic-position encoding (sin/cos at this many wavelengths); `0` = embeddings only |
 | `--min-support` | `2` | clusters carried by fewer of step 4's training individuals share one token per haploblock region (embedding = mean of its members); `0` = no merging. On chr21 (1,127 training individuals): 166,754 tokens without merging, 95,874 at `1`, 29,034 at `2`, 10,965 at `5` |
 
+Usage (more in [section 11](#11-running-the-pipeline)):
+
+```bash
+python 4a_finetune_evo2_embeddings.py --test        # test: synthetic data, stand-in model
+python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir haplograph/chr21_train_half_A --mock-evo2 --device cpu --max-len 128   # test: chr21, CPU
+python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir haplograph/genome_train_half_A                                       # full run: Evo 2, GPU
+```
+
 ### Step 4b: `4b_finetune_evo2_hash.py` (optional)
 
 Fine-tunes Evo 2 to predict a phenotype from a genomic hash. Each bit of the hash is one Evo 2 token.
@@ -221,6 +252,13 @@ Fine-tunes Evo 2 to predict a phenotype from a genomic hash. Each bit of the has
 | `--hash-window` | `4096` | bits per Evo 2 pass; longer hashes are split |
 | `--mock-evo2` | off | CPU stand-in model instead of Evo 2 |
 
+Usage (more in [section 11](#11-running-the-pipeline)):
+
+```bash
+python 4b_finetune_evo2_hash.py --test                         # test: synthetic TSV, stand-in model
+python 4b_finetune_evo2_hash.py --hash-pheno hash_height.tsv   # full run: Evo 2, GPU
+```
+
 ### Step 5: `5_validate_evo2.py`
 
 Validates one fine-tuned model on the test set. By default it uses the graph folder's `train_individuals.txt` / `test_individuals.txt` (from steps 0–1; a graph with a training set but no test file is refused rather than paired with another split, and only a `--no-split` graph falls back to BH_26); `--splits DIR_OR_URL` reads `half_A.txt` / `half_B.txt` from elsewhere (e.g. the [BH_26 folder](https://data.haploblocks.org/BH_26/splits/)), and `--splits none` uses the model's own validation individuals. It warns if any test individual was used to build the graph or to train or validate the model (when the checkpoint records its individuals, as every current step-4 checkpoint does). With `--splits none` the train side is the model's own training individuals. The checks to run are listed in a tasks file, one per line ([`validation_tasks.txt`](part1_haplograph/validation_tasks.txt)):
@@ -230,7 +268,6 @@ model_info
 test_set_performance max_examples=500 train_examples=200
 embedding_cooccurrence min_lift=2 min_support=5 min_expected=5 pairs=50000
 cluster_consistency permutations=200
-gwas_enrichment gwas=height_hg38.tsv pvalue=5e-8 label=height
 ```
 
 | Task | Checks |
@@ -239,7 +276,6 @@ gwas_enrichment gwas=height_hg38.tsv pvalue=5e-8 label=height
 | `test_set_performance` | **queries the fine-tuned model** on the test individuals: next-cluster cross-entropy, perplexity, top-1 / top-5 accuracy per chromosome, top-1 within the target's own region; 95% CIs from a paired bootstrap over test individuals (model, bigram, model − bigram); the bigram conditional entropy of the training sequences as a reference cross-entropy (not a floor: a model with more context can go below it); the same on a sample of training individuals (generalization gap); a bigram baseline (most frequent next cluster after the current one, counted on the training individuals) that the model should beat; the stored validation metrics. Needs the backbone used in step 4 (a GPU for Evo 2 / BioNeMo) |
 | `embedding_cooccurrence` | **held-out test of the step-3 embeddings, no GPU**: for distinct cluster pairs in different regions (≤ `max_distance` bp apart, ≥ `min_support` test carriers each, ≥ `min_expected` co-carriers expected among the test individuals, so that one chance co-carrier of two rare clusters can't make a pair "linked"), ROC AUC of embedding cosine similarity for pairs that co-occur among the TEST individuals (lift ≥ `min_lift`) vs pairs that don't (lift ≤ 1); overall, within distance bins and within frequency bins, with a 95% CI that resamples haploblock regions; references: genomic proximity, cluster frequency, and the lift counted on the training individuals. Warns when the graph was built with test individuals |
 | `cluster_consistency` | per haploblock: do train and test individuals carry the same clusters, at the same frequencies, compared with random splits of the same size? |
-| `gwas_enrichment` | which haploblocks hold more GWAS hits than expected (positions must use the haplograph's genome build) |
 
 - **In:** the model `.pt`, the graph folder, the split files.
 - **Out:** in `validation_<model name>/`: `report.md`, `summary.json`, `split.csv`, one CSV per task, and `nemotron_summary.md` with `--nemotron-summary`.
@@ -248,13 +284,20 @@ gwas_enrichment gwas=height_hg38.tsv pvalue=5e-8 label=height
 |---|---|---|
 | `--model` | required | fine-tuned model |
 | `--tasks` / `--task` | `model_info` + `test_set_performance` + `embedding_cooccurrence` + `cluster_consistency` | tasks file / one task line |
-| `--gwas` | none | shortcut adding a `gwas_enrichment` line |
 | `--splits` | `graph` | `graph`, a folder or URL with `half_A.txt` / `half_B.txt`, or `none` |
 | `--plugins` | none | Python file(s) with extra tasks |
-| `--cudf` | off | read GWAS files and other tables on the GPU with RAPIDS cuDF |
+| `--cudf` | off | read its tables on the GPU with RAPIDS cuDF |
 | `--nemotron-summary` | off | plain-language summary by an NVIDIA Nemotron model (section 6) |
 
-`--list-tasks` shows every task with its parameters. The README explains how to get GIANT and GWAS Catalog data.
+`--list-tasks` shows every task with its parameters.
+
+Usage (more in [section 11](#11-running-the-pipeline)):
+
+```bash
+python 5_validate_evo2.py --test      # test: steps 0-5 on synthetic data
+G=haplograph/genome_train_half_A
+python 5_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt   # full run: Evo 2, GPU
+```
 
 ## 5. The train/test split and leakage protection
 
@@ -284,7 +327,7 @@ The pipeline detects the GPU itself (torch and XGBoost use CUDA when available; 
 
 **RAPIDS in step 3, honestly.** Step 3 is CPU/RAM-bound, not GPU-bound, so `--rapids` is not a large speedup: the dominant cost is the CPU-side chunked embedding of all ~11M genome-wide nodes, which `--rapids` does not change. It only accelerates the two SVDs; tree fitting uses XGBoost's own GPU path, the rest is numpy. The carrier SVD is fitted on a `--rapids-fit-rows` sample (default 150k) and applied in `--rapids-chunk` dense chunks (default 200k). The sampling is an approximation: on the genome run (with the former ancestry target) it gave val-accuracy 0.986 vs 0.992/0.993 for the exact CPU SVD. Raise `--rapids-fit-rows` (e.g. 300000) to close that gap; the carrier matrix has only ~1,250 training columns, so a larger sample is cheap. The cached features are stored separately for `--rapids` (`features_svd*_rapids.npy`), so the CPU and GPU SVDs never mix.
 
-**Nemotron.** `--nemotron-summary` sends the task summaries of the report to an NVIDIA Nemotron model on an OpenAI-compatible NIM endpoint and writes the answer to `nemotron_summary.md`. Only aggregate numbers are sent: sample IDs (`HG…`/`NA…` and the graph's own individual names) and the directories of file paths are removed, and file names and GWAS column names are dropped. The key is only sent over https (or to localhost), and redirects are not followed. Defaults: `--nemotron-url https://integrate.api.nvidia.com/v1` (build.nvidia.com; or a self-hosted NIM) and `--nemotron-model nvidia/llama-3.3-nemotron-super-49b-v1` (change it if the catalogue has moved on). The API key is read from `$NVIDIA_API_KEY`. Without a key, or if the request fails, step 5 prints a warning and still writes its report.
+**Nemotron.** `--nemotron-summary` sends the task summaries of the report to an NVIDIA Nemotron model on an OpenAI-compatible NIM endpoint and writes the answer to `nemotron_summary.md`. Only aggregate numbers are sent: sample IDs (`HG…`/`NA…` and the graph's own individual names) and the directories of file paths are removed, and file names are dropped. The key is only sent over https (or to localhost), and redirects are not followed. Defaults: `--nemotron-url https://integrate.api.nvidia.com/v1` (build.nvidia.com; or a self-hosted NIM) and `--nemotron-model nvidia/llama-3.3-nemotron-super-49b-v1` (change it if the catalogue has moved on). The API key is read from `$NVIDIA_API_KEY`. Without a key, or if the request fails, step 5 prints a warning and still writes its report.
 
 ## 7. Extending the pipeline
 
@@ -344,7 +387,7 @@ Earlier versions of this document described LoRA adapters, `--micro-batch` and a
 
 ### Data and leakage
 
-- **Genome build.** The haplograph README doesn't state the build of its coordinates (the gene-to-haploblock map in `part2_proteomics/data/` uses hg38 blocks). GIANT 2022 is hg19, the GWAS Catalog GRCh38. A mismatch makes GWAS results meaningless; step 5 warns when most SNPs fall outside the haploblocks.
+- **Genome build.** The haplograph README doesn't state the build of its coordinates (the gene-to-haploblock map in `part2_proteomics/data/` uses hg38 blocks); check it before combining the haploblocks with other position-based data.
 - **Candidate edge pairs.** The *list* of candidate pairs comes from the dataset's edge file, which was made from all individuals. Weights and filtering are train-only, but a pair only present because of test individuals may still be in the list (with a train weight of zero it is dropped).
 - **`--edges lift5`** was pre-filtered on all individuals, so its pair selection saw the test set. Use `--edges all` in train-only mode.
 - **`split.tsv`** in the BH_26 folder isn't used; only `half_A.txt` / `half_B.txt` are.
@@ -354,14 +397,12 @@ Earlier versions of this document described LoRA adapters, `--micro-batch` and a
 ### Statistical caveats in step 5
 
 - **Chi-square assumption.** The chi-square test treats carrier counts as independent, but one person can carry two clusters of the same haploblock. The permutation-based columns don't rely on that and are the ones to trust.
-- **The overall GWAS test.** The haploblocks seem to tile whole chromosomes, so almost every SNP falls inside one and the overall test can't show enrichment. Step 5 says so when this happens; use the per-haploblock results.
-- **Overlapping haploblocks.** A SNP in an overlap (or with `window` > 0) is counted for one haploblock only.
 - **`test_set_performance`** evaluates the central `--max-len` window of each sequence (the same windows as step 4's validation) on a sample of `max_examples` sequences; raise it for tighter estimates.
 
 ### Scale and performance
 
 - **Data size.** The full edge files are up to about 1 GB per chromosome; genome-wide graphs need lots of memory and disk. Use `--min-lift` to shrink the graph, and `--chunksize` if memory runs out while reading edges.
-- **Host RAM, not the GPU, is the bottleneck of steps 1–3** at genome scale (11M nodes). XGBoost's leaf stage is the peak; see the README's whole-genome notes.
+- **Host RAM, not the GPU, is the bottleneck of steps 1–3** at genome scale (11M nodes). XGBoost's leaf stage is the peak; see step 3 in the README.
 - **GNN memory.** The GNN runs on the whole graph at once on one device; very large graphs may not fit.
 - **node2vec speed.** Its walks run on CPU (numpy), which can be slow for genome-wide graphs; lower `--walks-per-node` or `--walk-length`.
 - **Step 4.** It uses one GPU and can't resume an interrupted run. Each position is scored against all tokens of its chromosome, so memory grows with `--max-len` × the chromosome's tokens (chr21: 166,754 clusters, 29,034 tokens at the default `--min-support 2`); lower `--max-len` for large chromosomes.
@@ -369,7 +410,7 @@ Earlier versions of this document described LoRA adapters, `--micro-batch` and a
 
 ## 9. Part 2: proteomics
 
-Part 2's code is unchanged since the hackathon; each folder has its own README with installation and usage.
+Each part 2 folder has its own README with installation and usage.
 
 | Folder | What | Language |
 |---|---|---|
@@ -418,7 +459,7 @@ pip install evo2
 
 ### 10.3 RAPIDS (cuDF, cuML, CuPy) in its own venv
 
-**RAPIDS goes in its own venv; the Evo 2 environment stays clean.** Installing RAPIDS into the same site-packages can downgrade the CUDA bindings (`cuda-bindings`, `cuda-toolkit`) that a CUDA 13 PyTorch depends on to CUDA 12. On the hackathon machine PyTorch happened to keep working because it bundles its own CUDA libraries, but that is luck, not design. Keep two environments:
+**RAPIDS goes in its own venv; the Evo 2 environment stays clean.** Installing RAPIDS into the same site-packages can downgrade the CUDA bindings (`cuda-bindings`, `cuda-toolkit`) that a CUDA 13 PyTorch depends on to CUDA 12. PyTorch may keep working because it bundles its own CUDA libraries, but that is luck, not design. Keep two environments:
 
 - **RAPIDS venv active** (`(rapids-env)` in the prompt): steps 1 and 5 with `--cudf`, step 3 with `--rapids`.
 - **Evo 2 venv active**: step 4, and everything without RAPIDS flags.
@@ -437,7 +478,7 @@ python -c "import cudf, cuml, cupy; print('cuml', cuml.__version__, '| gpu', cup
 # expect: cuml 26.02.000 | gpu 1
 ```
 
-Versions verified at the hackathon (RTX PRO 6000 Blackwell, 96 GB, driver 580.126.09 / CUDA 13.0, `nvcc` 12.8, Python 3.10): `cudf-cu12 26.02.*`, `cuml-cu12 26.02.000`, `cupy-cuda12x 14.2.0`, `numpy 2.2.x`, `scipy 1.15.x`, CUDA-enabled `xgboost`.
+Verified versions (RTX PRO 6000 Blackwell, 96 GB, driver 580.126.09 / CUDA 13.0, `nvcc` 12.8, Python 3.10): `cudf-cu12 26.02.*`, `cuml-cu12 26.02.000`, `cupy-cuda12x 14.2.0`, `numpy 2.2.x`, `scipy 1.15.x`, CUDA-enabled `xgboost`.
 
 If RAPIDS was already pip-installed into the system Python, remove it there (with the RAPIDS venv deactivated) and check that PyTorch still sees the GPU:
 
@@ -540,4 +581,4 @@ export NVIDIA_API_KEY=nvapi-...
 python 5_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt --nemotron-summary
 ```
 
-At genome scale, host RAM is the limit in steps 1–3 (see section 8 and the README's whole-genome notes); lower `--xgb-trees`, `--xgb-depth` or `--xgb-region-bins` if step 3 is killed.
+At genome scale, host RAM is the limit in steps 1–3 (see section 8 and step 3 in the README); lower `--xgb-trees`, `--xgb-depth` or `--xgb-region-bins` if step 3 is killed.
