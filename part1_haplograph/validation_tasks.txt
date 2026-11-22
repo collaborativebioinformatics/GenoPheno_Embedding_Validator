@@ -15,8 +15,10 @@ embedding_cooccurrence min_lift=2 min_support=5 min_expected=5 pairs=50000
 # 3. train vs test consistency of the haploblock clusters (data-level)
 cluster_consistency min_carriers=1 permutations=200
 
-# 4. GWAS enrichment of haploblocks (data-level): which haploblocks hold more GWAS hits than expected?
+# 4. GWAS enrichment of haploblocks (data-level): which haploblocks hold more independent GWAS loci than expected?
 #    Hit file from:  python download_gwas.py --trait "^body height$" --label height   (GWAS Catalog,
 #    GRCh38 like the haplograph). Full summary statistics also work (same genome build, mode=summary).
 #    Add one line per trait or threshold.
-gwas_enrichment gwas=haplograph/gwas/height.tsv pvalue=5e-8 label=height
+#    Hits are clumped into independent loci (clump=auto: 25 kb for hit lists, 250 kb for summary
+#    statistics); chance levels from random loci and from rotations. See --list-tasks for all parameters.
+gwas_enrichment gwas=haplograph/gwas/height.tsv pvalue=5e-8 clump=auto label=height

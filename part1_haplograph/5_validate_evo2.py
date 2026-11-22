@@ -10,8 +10,10 @@ A small task runner: the checks to run are listed one per line in a tasks file (
                           with paired bootstrap CIs over test individuals (needs step 4's backbone)
   embedding_cooccurrence  do the step-3 embeddings predict cluster co-occurrence in the test individuals?
   cluster_consistency     do train and test carry the same clusters per haploblock? (permutation null)
-  gwas_enrichment         haploblocks with more GWAS hits than expected (same genome build needed;
-                          column names auto-detected, see GWAS_COLS; hit files from download_gwas.py)
+  gwas_enrichment         haploblocks with more independent GWAS loci than expected (hits clumped by
+                          distance), chance levels from randomly placed loci (empirical FDR) and from
+                          rotations that keep the hits' spacing, and whether nearby hits share a haploblock (same genome build needed; columns
+                          auto-detected, see GWAS_COLS; hit files from download_gwas.py)
 
 Split: by default the graph's train_individuals.txt / test_individuals.txt (steps 0-1); --splits
 DIR_OR_URL (half_A.txt / half_B.txt), --train/--test-individuals, or --splits none (the model's own
@@ -25,8 +27,8 @@ OUTPUT (--out-dir, default <graph-dir>/validation_<model name>/)
   cluster_consistency_regions.csv.gz  region, chrom, start, end, n_clusters_total/_train/_test,
                                       test_expected, test_ci_low/high, outside_ci, n_test_only,
                                       test_only_carriers, tvd, tvd_null_mean, tvd_p, chi2, chi2_df, chi2_p, chi2_q
-  gwas_enrichment_<label>_regions.csv.gz   region, chrom, start, end, n_snps, n_hits, expected_hits,
-                                      fold, p, q, lead_snp, lead_p
+  gwas_enrichment_<label>_regions.csv.gz   region, chrom, start, end, n_snps, n_hits, n_loci,
+                                      expected_loci, fold, p, q, lead_snp, lead_p
   nemotron_summary.md                 --nemotron-summary: an NVIDIA Nemotron reading of the aggregate
                                       numbers ($NVIDIA_API_KEY; IDs and paths removed, https only)
   (a task listed twice writes its files with a _2, _3 ... suffix)
@@ -65,7 +67,7 @@ import scipy.sparse as sp
 from scipy import stats
 
 from haplo_common import (BH26_SPLITS, die, is_url, load_sample_map, log, read_graph_individuals,
-                          read_individual_list, selftest_graph_dir)
+                          read_individual_list, selftest_graph_dir, test_workdir)
 
 
 GRAPH_SPLIT = "graph"
@@ -654,16 +656,44 @@ def region_pairs(reg_chrom, starts, ends, snp_chrom, snp_pos):
     return np.concatenate(out_s), np.concatenate(out_r)
 
 
-@task("gwas_enrichment", "Are haploblocks enriched in GWAS hits (per region and overall)?")
-def gwas_enrichment(ctx, gwas: str, pvalue: float = 5e-8, window: int = 0, permutations: int = 1000,
-                    label: str = "", chrom_col: str = "", pos_col: str = "", p_col: str = "",
-                    snp_col: str = "", sep: str = "auto", mode: str = "auto"):
-    """window = bp added on each side of every haploblock region (a SNP within reach of two regions
-    counts for both). mode: 'summary' (full summary
-    statistics: hits vs all tested SNPs of the region), 'hits' (reported hits only, e.g. the GWAS
-    Catalog: hits vs region length), or 'auto' (summary if most rows have p > 1e-5)."""
+def clump_hits(chrom, pos, p, hit, dist):
+    """Greedy distance clumping of the hits, lowest p first: each hit joins the first lead within
+    `dist` bp. Returns the lead's index for every hit (a lead points to itself), -1 for non-hits."""
+    group = np.full(len(pos), -1, dtype=np.int64)
+    for c in pd.unique(chrom[hit]):
+        idx = np.where(hit & (chrom == c))[0]
+        idx = idx[np.argsort(pos[idx], kind="stable")]
+        ps = pos[idx]
+        for k in np.lexsort((ps, p[idx])):
+            if group[idx[k]] < 0:
+                w = idx[np.searchsorted(ps, ps[k] - dist):np.searchsorted(ps, ps[k] + dist, side="right")]
+                group[w[group[w] < 0]] = idx[k]
+    return group
+
+
+@task("gwas_enrichment", "Are haploblocks enriched in GWAS loci, and do haploblocks keep each locus together?")
+def gwas_enrichment(ctx, gwas: str, pvalue: float = 5e-8, clump: str = "auto", window: int = 0,
+                    permutations: int = 1000, label: str = "", chrom_col: str = "", pos_col: str = "",
+                    p_col: str = "", snp_col: str = "", sep: str = "auto", mode: str = "auto"):
+    """Hits (p < pvalue) are clumped into independent loci (lowest p first; hits within `clump` bp
+    of a lead join its locus; auto = 25 kb for hit lists, 250 kb for summary statistics), and each
+    haploblock is tested for more loci than expected: vs its length for a hit list (mode 'hits', e.g.
+    the GWAS Catalog), vs its tested SNPs for full summary statistics (mode 'summary'); 'auto' =
+    summary if most rows have p > 1e-5. Two nulls, `permutations` draws each: (1) every locus, with
+    its hits, moved to a random place on its chromosome: haploblocks reaching q < 0.05 by chance and
+    the empirical FDR; (2) all hits rotated along the chromosome with their spacing kept: calls that
+    the clustering of hits alone produces, hit pairs sharing a haploblock (more than expected = the
+    haploblock boundaries keep GWAS loci together) and hits inside haploblocks. window = bp added on
+    each side of every haploblock (a SNP within reach of two counts for both)."""
     if mode not in ("auto", "summary", "hits"):
         raise ValueError(f"mode must be auto, summary or hits, not {mode!r}")
+    for name, v in (("permutations", permutations), ("window", window)):
+        if v < 0:
+            raise ValueError(f"{name} must be >= 0")
+    if not 0 < pvalue <= 1:
+        raise ValueError(f"pvalue must be in (0, 1], not {pvalue}")
+    if clump != "auto" and not (re.fullmatch(r"\d+", str(clump))):
+        raise ValueError(f"clump must be 'auto' or a number of bp >= 0, not {clump!r}")
     if not os.path.exists(gwas):
         raise ValueError(f"GWAS file {gwas} not found (download_gwas.py writes haplograph/gwas/<label>.tsv)")
     sidecar = re.sub(r"\.tsv$", ".json", gwas)                 # written by download_gwas.py
@@ -678,6 +708,9 @@ def gwas_enrichment(ctx, gwas: str, pvalue: float = 5e-8, window: int = 0, permu
     reg_chrom = reg["chrom"].to_numpy()
     starts = reg["start"].to_numpy(np.int64) - window
     ends = reg["end"].to_numpy(np.int64) + window
+    if window == 0:                      # adjacent haploblocks share a coordinate: it belongs to the next one
+        ends = ends - (pd.MultiIndex.from_arrays([reg_chrom, ends]).isin(
+            pd.MultiIndex.from_arrays([reg_chrom, starts])) & (ends > starts)).astype(np.int64)
 
     on = snps["chrom"].isin(set(reg_chrom))
     snps = snps[on].reset_index(drop=True)
@@ -693,96 +726,143 @@ def gwas_enrichment(ctx, gwas: str, pvalue: float = 5e-8, window: int = 0, permu
     lo = span.loc[s_chrom, "lo"].to_numpy(); hi = span.loc[s_chrom, "hi"].to_numpy()
     in_span = (s_pos >= lo) & (s_pos <= hi)
     frac_outside = float(1 - in_span.mean())
-    snps, hit, s_chrom, s_pos, lo, hi = snps[in_span].reset_index(drop=True), hit[in_span], \
-        s_chrom[in_span], s_pos[in_span], lo[in_span], hi[in_span]
+    order = np.lexsort((s_pos, s_chrom))[in_span[np.lexsort((s_pos, s_chrom))]]   # by chromosome, position
+    snps, hit, s_chrom, s_pos, lo, hi = snps.iloc[order].reset_index(drop=True), hit[order], \
+        s_chrom[order], s_pos[order], lo[order], hi[order]
     K, M = int(hit.sum()), len(snps)
     if M == 0:
         raise ValueError("none of the GWAS SNPs falls inside the haploblock span - check the genome build (GRCh38)")
+    clump = (250_000 if summary_stats else 25_000) if clump == "auto" else int(clump)
+    pv = snps["p"].to_numpy()
+    group = clump_hits(s_chrom, s_pos, pv, hit, clump)            # lead index of each hit's locus, -1 = no hit
+    locus = group == np.arange(M)
+    Kl, R = int(locus.sum()), len(reg)
+    length = (ends - starts + 1).astype(np.float64)
     si, ri = region_pairs(reg_chrom, starts, ends, s_chrom, s_pos)
-
-    # ---- per region
-    R = len(reg)
+    if len(si) == 0:
+        raise ValueError("none of the GWAS SNPs falls inside a haploblock - check the genome build (GRCh38)")
     inside = np.zeros(M, bool)
     inside[si] = True
     n_snps = np.bincount(ri, minlength=R)
-    n_hits = np.bincount(ri, weights=hit[si], minlength=R).astype(int)
-    length = (ends - starts + 1).astype(np.float64)
-    if summary_stats:
-        expected = n_snps * K / max(M, 1)
-        p = np.where(n_snps > 0, stats.hypergeom.sf(n_hits - 1, M, K, n_snps), np.nan)
-        background = "all GWAS SNPs in the region (hypergeometric)"
-    else:
-        hits_chrom = pd.Series(hit).groupby(s_chrom).sum()
-        chrom_len = (span["hi"] - span["lo"] + 1).astype(np.float64)
-        rate = (hits_chrom / chrom_len.loc[hits_chrom.index]).reindex(span.index).fillna(0)
-        expected = length * rate.loc[reg_chrom].to_numpy()
-        p = stats.poisson.sf(n_hits - 1, np.maximum(expected, 1e-300))
-        background = "region length (Poisson)"
-    reg["n_snps"], reg["n_hits"], reg["expected_hits"] = n_snps, n_hits, expected
-    reg["fold"] = np.where(expected > 0, n_hits / np.maximum(expected, 1e-300), np.nan)
+    if not summary_stats:                           # loci per bp of haploblock span, per chromosome
+        loci_chrom = pd.Series(locus).groupby(s_chrom).sum()
+        rate = (loci_chrom / (span["hi"] - span["lo"] + 1)).reindex(span.index).fillna(0)
+        expected_len = length * rate.loc[reg_chrom].to_numpy()
+
+    # hits only from here on. The nulls move hits: along the chromosome span for a hit list; for
+    # summary statistics over the SNP order (hit labels onto other tested SNPs, so SNP counts stay)
+    h = np.where(hit)[0]
+    hc, hpos, hloc, hlo, L = s_chrom[h], s_pos[h], locus[h], lo[h], (hi - lo + 1)[h]
+    ccode, cu = pd.factorize(hc)
+    gcode, gu = pd.factorize(group[h])
+    first = pd.Series(np.arange(M)).groupby(s_chrom).min().loc[hc].to_numpy()   # SNP index range per chromosome
+    n_chrom = pd.Series(s_chrom).value_counts().loc[hc].to_numpy()
+
+    def count(pos):
+        """Hits and loci per region for hit positions `pos`, and how many hits are inside any region."""
+        sj, rj = region_pairs(reg_chrom, starts, ends, hc, pos)
+        return (np.bincount(rj, minlength=R), np.bincount(rj, weights=hloc[sj], minlength=R).astype(int),
+                np.unique(sj).size)
+
+    def region_test(nh, nl):
+        if summary_stats:
+            exp = n_snps * Kl / M
+            return exp, np.where(n_snps > 0, stats.hypergeom.sf(nl - 1, M, Kl, n_snps), np.nan)
+        return expected_len, stats.poisson.sf(nl - 1, np.maximum(expected_len, 1e-300))
+
+    def pairs(nh):
+        return int((nh * (nh - 1) // 2).sum())      # hit pairs sharing a haploblock
+
+    def moved(u):                                    # circular move within the chromosome
+        if summary_stats:
+            return s_pos[first + (h - first + (u * n_chrom).astype(np.int64)) % n_chrom]
+        return hlo + (hpos - hlo + (u * L).astype(np.int64)) % L
+
+    n_hits, n_loci, obs_inside = count(hpos)
+    expected, p = region_test(n_hits, n_loci)
+    reg["n_snps"], reg["n_hits"], reg["n_loci"], reg["expected_loci"] = n_snps, n_hits, n_loci, expected
+    reg["fold"] = np.where(expected > 0, n_loci / np.maximum(expected, 1e-300), np.nan)
     reg["p"], reg["q"] = p, bh(p)
-    lead = pd.DataFrame({"r": ri, "p": snps["p"].to_numpy()[si],
-                         "snp": snps["snp"].to_numpy()[si] if cols["snp"] else
+    lead = pd.DataFrame({"r": ri, "p": pv[si], "snp": snps["snp"].to_numpy()[si] if cols["snp"] else
                          (s_chrom[si] + ":" + s_pos[si].astype(str))})
-    lead = lead.sort_values("p").drop_duplicates("r").set_index("r")
+    lead = lead.sort_values("p", kind="stable").drop_duplicates("r").set_index("r")
     reg["lead_snp"] = lead["snp"].reindex(np.arange(R)).to_numpy()
     reg["lead_p"] = lead["p"].reindex(np.arange(R)).to_numpy()
+    n_sig = int((reg["q"] < 0.05).sum())
+    obs_pairs = pairs(n_hits)
 
-    # ---- global: hits inside haploblocks vs circular shifts of the SNP positions per chromosome
-    obs = int(hit[inside].sum())
-    covered = float(length.sum() / (span["hi"] - span["lo"] + 1).sum())
-    hp, hc, hlo, hhi = s_pos[hit], s_chrom[hit], lo[hit], hi[hit]
-    chroms_h = pd.unique(hc)
-    null = np.zeros(permutations)
-    L = hhi - hlo + 1
+    null = np.zeros((permutations, 4))              # loci moved: calls | rotation: calls, pairs, inside
     for j in range(permutations):
-        shift = dict(zip(chroms_h, ctx.rng.random(len(chroms_h))))
-        u = (np.array([shift[c] for c in hc]) * L).astype(np.int64)
-        shifted = hlo + (hp - hlo + u) % L
-        null[j] = np.unique(region_pairs(reg_chrom, starts, ends, hc, shifted)[0]).size
-    p_global = (1 + (null >= obs).sum()) / (1 + permutations)
-    if summary_stats:
-        frac_snps_in = float(inside.mean())
-        bt = stats.binomtest(obs, max(K, 1), frac_snps_in, alternative="greater") if K else None
+        nh, nl, _ = count(moved(ctx.rng.random(len(gu))[gcode]))
+        null[j, 0] = (bh(region_test(nh, nl)[1]) < 0.05).sum()
+        nh, nl, ins = count(moved(ctx.rng.random(len(cu))[ccode]))
+        null[j, 1:] = (bh(region_test(nh, nl)[1]) < 0.05).sum(), pairs(nh), ins
+    ran = permutations > 0
+    mean = lambda k: round(float(null[:, k].mean()), 2) if ran else None
+    pval = lambda k, o: round(float((1 + (null[:, k] >= o).sum()) / (1 + permutations)), 4) if ran else None
+    iv = pd.DataFrame({"c": reg_chrom, "s": starts, "e": ends}).sort_values(["c", "s"])
+    reach = iv.groupby("c")["e"].cummax().groupby(iv["c"]).shift().fillna(-1).to_numpy()
+    covered = float(np.maximum(0, iv["e"] - np.maximum(iv["s"], reach + 1) + 1).sum()
+                    / (span["hi"] - span["lo"] + 1).sum())        # union of the (window-extended) haploblocks
+    max_loci = length // clump + 1 if clump else n_hits       # loci a haploblock can hold after clumping
+    best_p = (stats.hypergeom.sf(np.minimum(max_loci, n_snps) - 1, M, Kl, n_snps) if summary_stats
+              else stats.poisson.sf(max_loci - 1, np.maximum(expected_len, 1e-300)))
 
     path = ctx.out(f"gwas_enrichment_{safe}_regions.csv.gz")
-    reg[["region", "chrom", "start", "end", "n_snps", "n_hits", "expected_hits", "fold", "p", "q",
+    reg[["region", "chrom", "start", "end", "n_snps", "n_hits", "n_loci", "expected_loci", "fold", "p", "q",
          "lead_snp", "lead_p"]].to_csv(path, index=False, float_format="%.6g")
-
-    n_sig = int((reg["q"] < 0.05).sum())
     s = {
         "gwas_file": gwas, "label": label, "columns_used": ",".join(f"{k}={v}" for k, v in cols.items() if v),
         "file_type": "summary statistics" if summary_stats else "hits only",
-        "pvalue_threshold": pvalue, "window_bp": window,
-        "snps_tested": M, "hits": K, "hits_in_haploblocks": obs,
-        "regions_with_hits": int((n_hits > 0).sum()), "regions": R,
-        "regions_enriched_q<0.05": n_sig, "per_region_background": background,
-        "top_region": reg.loc[reg["p"].idxmin(), "region"] if K and reg["p"].notna().any() else None,
-        "top_region_q": float(reg["q"].min()) if K and reg["q"].notna().any() else None,
-        "global_hits_expected_by_shift": round(float(null.mean()), 2),
-        "global_fold": round(float(obs / null.mean()), 3) if null.mean() > 0 else None,
-        "global_p_shift": round(float(p_global), 4),
+        "pvalue_threshold": pvalue, "clump_bp": clump, "window_bp": window, "permutations": permutations,
+        "snps_in_span": M, "hits": K, "loci": Kl,
+        "regions_with_loci": int((n_loci > 0).sum()), "regions": R,
+        "per_region_background": "tested SNPs (hypergeometric)" if summary_stats else "haploblock length (Poisson)",
+        "regions_enriched_q<0.05": n_sig,
+        "regions_q<0.05_by_chance": mean(0),
+        "empirical_fdr": round(min(1.0, mean(0) / n_sig), 3) if ran and n_sig else None,
+        "regions_q<0.05_under_rotation": mean(1),
+        "empirical_fdr_rotation": round(min(1.0, mean(1) / n_sig), 3) if ran and n_sig else None,
+        "top_region": reg.loc[reg["p"].idxmin(), "region"] if n_loci.any() else None,
+        "top_region_q": float(reg["q"].min()) if n_loci.any() else None,
+        "hit_pairs_same_haploblock": obs_pairs,
+        "hit_pairs_same_haploblock_under_rotation": mean(2),
+        "hit_pairs_same_haploblock_p": pval(2, obs_pairs),
+        "hits_in_haploblocks": obs_inside,
+        "hits_in_haploblocks_under_rotation": mean(3),
+        "hits_in_haploblocks_p": pval(3, obs_inside),
         "haploblock_coverage_of_span": f"{covered:.1%}",
         "snps_outside_haploblock_span": f"{frac_outside:.1%}",
     }
-    if summary_stats and bt is not None:
-        s["global_p_binomial_vs_snp_density"] = float(bt.pvalue)
-    notes = []
+    notes = [f"per-haploblock tests count {Kl:,} loci ({K:,} hits clumped within {clump:,} bp)"]
+    if ran:
+        notes.append(f"loci moved at random: {mean(0):.2f} haploblocks with q < 0.05 by chance"
+                     + (f" (empirical FDR {s['empirical_fdr']:.0%})" if n_sig else ""))
+        if n_sig and mean(1) > max(2 * mean(0), 0.05):
+            notes.append(f"all hits rotated with their spacing kept: {mean(1):.1f} haploblocks with q < 0.05 "
+                         f"(FDR {s['empirical_fdr_rotation']:.0%}), so the calls reflect dense clusters of hits; they "
+                         f"are independent signals only if LD there does not reach beyond {clump:,} bp (raise `clump` "
+                         "to check)")
+        notes.append(f"hit pairs sharing a haploblock: {obs_pairs:,} vs {mean(2)} under rotation "
+                     f"(p = {s['hit_pairs_same_haploblock_p']:.3g}); more than expected means the haploblock "
+                     "boundaries keep GWAS loci together" + (" (window > 0: overlapping haploblocks share pairs)"
+                                                              if window else ""))
+    if Kl and np.nanmin(best_p) > 0.05 / R:
+        notes.append(f"with clump={clump:,} bp a haploblock holds at most length/clump + 1 loci, so no haploblock "
+                     f"can reach p < 0.05/{R} even if every possible locus is a hit (no power); lower `clump` to test "
+                     "single haploblocks")
     if covered > 0.95:
-        notes.append(f"haploblocks cover {covered:.0%} of each chromosome span, so almost every SNP is inside one: "
-                     "the GLOBAL test is uninformative here; use the per-region results")
+        notes.append(f"haploblocks cover {covered:.0%} of each chromosome span, so the hits-in-haploblocks test is "
+                     "uninformative here; use the per-haploblock and same-haploblock results")
     if frac_outside > 0.05:                         # GRCh38 catalog hits on chr21: 1.3%; hg19 positions: ~10%
         notes.append(f"{frac_outside:.0%} of the GWAS SNPs fall outside the haploblock spans - check that the GWAS "
                      "file and the haploblock regions use the same genome build (e.g. GIANT 2022 is hg19/GRCh37)")
     if n_bad:
         notes.append(f"{n_bad:,} GWAS rows had no usable position or p-value and were skipped")
-    if not summary_stats:
-        notes.append("hits-only file: nearby hits in linkage disequilibrium (e.g. the same locus reported by "
-                     "several studies) are counted separately, so per-region p-values are optimistic; rank by fold")
     top = reg[reg["q"] < 0.05].sort_values("p").head(5)
     if len(top):
         notes.append("top enriched haploblocks: " + "; ".join(
-            f"{r.region} ({r.n_hits} hits, {r.fold:.1f}x, q={r.q:.2g})" for r in top.itertuples()))
+            f"{r.region} ({r.n_loci} loci, {r.n_hits} hits, {r.fold:.1f}x, q={r.q:.2g})" for r in top.itertuples()))
     return {"summary": s, "notes": notes, "files": [path]}
 
 
@@ -1184,7 +1264,7 @@ def nemotron_summary(args, results, out_path, names=()):
     log(f"Nemotron summary: {out_path}")
 
 
-def check_self_test(summaries):
+def check_self_test(summaries, hotspot):
     """Properties the synthetic self-test must satisfy (see IMPROVEMENT_PLAN.md, testing steps)."""
     problems = []
 
@@ -1211,12 +1291,15 @@ def check_self_test(summaries):
         for k, v in e.items():
             if k.startswith("auc_95ci_"):
                 ci_ok(e["auc_" + k[len("auc_95ci_"):]], v, k)
-    g = summaries["gwas_enrichment"]                       # planted hotspot (download_gwas.TEST_HOTSPOT)
-    chrom, a, b = importlib.import_module("download_gwas").TEST_HOTSPOT
-    m = re.fullmatch(r"(.+)_(\d+)-(\d+)", g["top_region"] or "")
-    if not (m and m[1] == chrom and int(m[2]) <= b and int(m[3]) >= a and g["regions_enriched_q<0.05"] >= 1):
-        problems.append(f"gwas_enrichment missed the planted hotspot {chrom}:{a}-{b} (top region "
-                        f"{g['top_region']}, {g['regions_enriched_q<0.05']} enriched)")
+    g, c = summaries["gwas_enrichment:independent"], summaries["gwas_enrichment:clumped"]
+    if g["top_region"] != hotspot or g["regions_enriched_q<0.05"] < 1:      # positive control
+        problems.append(f"gwas_enrichment missed the 10 loci planted in {hotspot} (top region {g['top_region']})")
+    rot, fdr = g["regions_q<0.05_under_rotation"], g["empirical_fdr"]
+    if rot is None or rot < 0.5 or (fdr is not None and fdr >= 0.2):         # cluster seen, loci not chance
+        problems.append(f"gwas_enrichment nulls: rotation {rot}, FDR {fdr}")
+    if c["regions_enriched_q<0.05"] != 0:              # clumped, the planted hits are one locus
+        problems.append(f"gwas_enrichment with clump={c['clump_bp']} still calls {c['regions_enriched_q<0.05']} "
+                        "haploblocks enriched")
     if problems:
         die("self-test checks failed:\n  " + "\n  ".join(problems))
     log("self-test checks passed")
@@ -1225,14 +1308,29 @@ def check_self_test(summaries):
 def self_test(args):
     """Synthetic data -> step 4 --test (mock backbone) -> validate it with every data-level task."""
     importlib.import_module("4a_finetune_evo2_embeddings").main(["--test"])
-    gwas = importlib.import_module("download_gwas").main(["--test"])
     args.graph_dir = selftest_graph_dir()
+    gwas, args.hotspot = planted_gwas(args.graph_dir, test_workdir("validate_gwas"))
     args.model = os.path.join(args.graph_dir, "evo2_mock_next_gnn.pt")
     args.splits, args.tasks, args.gwas, args.out_dir = GRAPH_SPLIT, None, [], None
     args.task = ["model_info", "test_set_performance max_examples=40 train_examples=20 bootstrap=200 device=cpu",
                  "embedding_cooccurrence min_lift=1.5 min_support=3 min_expected=1 pairs=5000 bootstrap=50",
                  "cluster_consistency permutations=20",
-                 f"gwas_enrichment gwas={shlex.quote(gwas)} mode=hits permutations=200"]
+                 f"gwas_enrichment gwas={shlex.quote(gwas)} clump=500 label=independent permutations=200",
+                 f"gwas_enrichment gwas={shlex.quote(gwas)} label=clumped permutations=200"]
+
+
+def planted_gwas(graph_dir, workdir):
+    """Synthetic catalog with 10 hits ~1.8 kb apart in the middle of the graph's longest chr21
+    haploblock, filtered by download_gwas.py. Returns (hit file, that haploblock)."""
+    dg = importlib.import_module("download_gwas")
+    reg = pd.read_csv(os.path.join(graph_dir, "nodes.csv.gz"), usecols=["region", "chrom", "start", "end"])
+    r = reg[reg["chrom"] == "chr21"].assign(n=lambda d: d["end"] - d["start"]).sort_values("n").iloc[-1]
+    assert r.n > 16_000, f"self-test graph: longest chr21 haploblock {r.region} is too short to plant 10 hits"
+    mid = (r.start + r.end) // 2
+    dg.make_test_catalog(os.path.join(workdir, "catalog.zip"), ("chr21", mid - 8000, mid + 8000))
+    tsv = dg.main(["--workdir", str(workdir), "--catalog", os.path.join(workdir, "catalog.zip"),
+                   "--trait-id", "EFO_0000001", "--label", "planted"])
+    return tsv, r.region
 
 
 # ===========================================================================
@@ -1384,7 +1482,8 @@ def main(argv=None):
     if args.test:
         if n_fail:
             die(f"self-test: {n_fail} task(s) failed")
-        check_self_test({r["name"]: r["summary"] for r in results})
+        check_self_test({r["name"] + (":" + r["summary"]["label"] if r["name"] == "gwas_enrichment" else ""):
+                         r["summary"] for r in results}, args.hotspot)
 
 
 if __name__ == "__main__":

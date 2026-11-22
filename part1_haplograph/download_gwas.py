@@ -33,7 +33,7 @@ from haplo_common import die, download, is_url, log, test_workdir
 CATALOG_URL = ("https://ftp.ebi.ac.uk/pub/databases/gwas/releases/latest/"
                "gwas-catalog-associations_ontology-annotated-full.zip")
 COLS = ["PUBMEDID", "DISEASE/TRAIT", "CHR_ID", "CHR_POS", "SNPS", "P-VALUE", "MAPPED_TRAIT", "MAPPED_TRAIT_URI"]
-TEST_HOTSPOT = ("chr21", 1_100_000, 1_101_000)      # planted enriched window of the --test catalog
+TEST_HOTSPOT = ("chr21", 1_100_000, 1_116_000)      # default planted window of the --test catalog
 
 
 def sha1(path, block=1 << 20):
@@ -44,22 +44,23 @@ def sha1(path, block=1 << 20):
     return h.hexdigest()
 
 
-def make_test_catalog(path, seed=0):
+def make_test_catalog(path, hotspot=TEST_HOTSPOT, seed=0):
     """Catalog-format zip on the synthetic haplograph's coordinates (chr21 from 1 Mb, chr22 from
-    2 Mb): 40 background hits per chromosome, 25 hits in TEST_HOTSPOT, and another trait."""
+    2 Mb): 15 background hits per chromosome, 10 evenly spaced hits in `hotspot` (chrom, start,
+    end), and 40 hits per chromosome of another trait."""
     rng = np.random.default_rng(seed)
     rows = []
     for chrom, lo in (("21", 1_000_000), ("22", 2_000_000)):
-        rows += [(chrom, p, "synthetic trait") for p in rng.integers(lo, lo + 600_000, 40)]
+        rows += [(chrom, p, "synthetic trait") for p in rng.integers(lo, lo + 600_000, 15)]
         rows += [(chrom, p, "other trait") for p in rng.integers(lo, lo + 600_000, 40)]
-    c, a, b = TEST_HOTSPOT
-    rows += [(c[3:], p, "synthetic trait") for p in rng.integers(a, b, 25)]
+    c, a, b = hotspot
+    rows += [(c[3:], int(p), "synthetic trait") for p in np.linspace(a, b, 10)]
     df = pd.DataFrame(rows, columns=["CHR_ID", "CHR_POS", "MAPPED_TRAIT"])
     df["DISEASE/TRAIT"] = df["MAPPED_TRAIT"]
     df["MAPPED_TRAIT_URI"] = np.where(df["MAPPED_TRAIT"] == "synthetic trait",
                                       "http://www.ebi.ac.uk/efo/EFO_0000001", "http://www.ebi.ac.uk/efo/EFO_0000002")
     df["SNPS"] = [f"rs{i + 1}" for i in range(len(df))]
-    df["P-VALUE"] = [f"{x:.1E}" for x in 10.0 ** -rng.uniform(5, 20, len(df))]
+    df["P-VALUE"] = [f"{x:.1E}" for x in 10.0 ** -rng.uniform(8, 20, len(df))]
     df["PUBMEDID"] = "1"
     with zipfile.ZipFile(path, "w") as z:
         z.writestr("associations.tsv", df[COLS].to_csv(sep="\t", index=False))
@@ -155,7 +156,7 @@ def main(argv=None):
     log(f"{n_rows:,} associations from {n_studies:,} studies -> {len(df):,} variants -> {tsv}")
     if args.test:                                   # the planted hotspot must survive the filter
         c, a, b = TEST_HOTSPOT
-        if ((df["CHR"] == c) & df["POS"].between(a, b)).sum() != 25 or (df["P"] > 1e-5).any():
+        if ((df["CHR"] == c) & df["POS"].between(a, b)).sum() < 10 or (df["P"] > 1e-5).any():
             die("self-test: the synthetic catalog was not filtered as expected")
         log("self-test checks passed")
     return str(tsv)

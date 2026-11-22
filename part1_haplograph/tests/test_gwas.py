@@ -59,16 +59,18 @@ def test_hit_list_is_not_mistaken_for_summary_statistics(pipeline, tmp_path):
     assert tasks["gwas_enrichment"]["summary"]["file_type"] == "hits only"
 
 
-def test_planted_hotspot_is_found(pipeline, tmp_path):
-    """download_gwas --test plants 25 hits in one 1 kb window; it must be the top enriched haploblock."""
-    tsv = download_gwas.main(["--test"])
+def test_planted_loci_are_found_and_clumping_merges_them(pipeline, tmp_path):
+    """10 hits ~1.8 kb apart inside one haploblock: as independent loci (clump=500) that haploblock is
+    the top enriched one and the rotation null sees the cluster; at the default clump (25 kb) they are
+    one locus and nothing is called."""
+    tsv, region = script("5_validate_evo2").planted_gwas(pipeline["G"], tmp_path)
     _, tasks = run_validate(["--model", pipeline["model"], "--graph-dir", pipeline["G"],
-                             "--task", f"gwas_enrichment gwas={tsv} permutations=20"], tmp_path / "v")
+                             "--task", f"gwas_enrichment gwas={tsv} clump=500 permutations=50"], tmp_path / "v")
     s = tasks["gwas_enrichment"]["summary"]
-    chrom, a, b = download_gwas.TEST_HOTSPOT
-    region = s["top_region"]
-    start, end = map(int, region.rsplit("_", 1)[1].split("-"))
-    assert region.startswith(chrom + "_") and start <= b and end >= a and s["regions_enriched_q<0.05"] >= 1
+    assert s["top_region"] == region and s["regions_enriched_q<0.05"] >= 1 and s["regions_q<0.05_under_rotation"] >= 0.5 and s["empirical_fdr"] < 0.2
+    _, tasks = run_validate(["--model", pipeline["model"], "--graph-dir", pipeline["G"],
+                             "--task", f"gwas_enrichment gwas={tsv} permutations=50"], tmp_path / "v2")
+    assert tasks["gwas_enrichment"]["summary"]["regions_enriched_q<0.05"] == 0
 
 
 def test_missing_gwas_file_names_the_download_step(pipeline, tmp_path):
