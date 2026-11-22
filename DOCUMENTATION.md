@@ -81,7 +81,7 @@ haplograph/
 └── genome_train_half_A/               one GRAPH FOLDER  (= --graph-dir for steps 3, 4 and 6)
     ├── nodes.csv.gz, individuals.txt, carriers.npz, graph.npz, graph_info.json    step 2
     ├── train_individuals.txt, test_individuals.txt                                step 2
-    ├── features_svd128_<set id>_<graph id>[_rapids].npy   step 3 (cache)
+    ├── features_svd128_<set id>_<graph id>_s<seed>[_rapids].npy   step 3 (cache)
     ├── node_emb_<method>.npy / .json            step 3 (+ .csv.gz with --csv)
     ├── evo2[_bionemo|_mock]_next_<method>.pt    step 4
     └── validation_<model name>/                 step 6
@@ -294,8 +294,8 @@ Validates one fine-tuned model on the test set. By default it uses the graph fol
 model_info
 test_set_performance max_examples=500 train_examples=200
 embedding_cooccurrence min_lift=2 min_support=5 min_expected=5 pairs=50000
-cluster_consistency permutations=200
-gwas_enrichment gwas=haplograph/gwas/height.tsv pvalue=5e-8 clump=25000 label=height
+cluster_consistency min_carriers=1 permutations=200
+gwas_enrichment gwas=haplograph/gwas/height.tsv pvalue=5e-8 clump=auto label=height
 ```
 
 | Task | Checks |
@@ -391,11 +391,12 @@ On a CPU-only machine (Apple M5, 16 GB RAM, Python 3.9, torch 2.8, xgboost 2.1),
 
 | Step | Result | Time |
 |---|---|---|
-| 1 | chr21 downloaded (~85 MB), MD5 verified, split written (45 haplograph individuals in neither half) | ~1 min |
-| 2 | 166,754 nodes, 1,520,370 edges, 161,937 isolated nodes at `--min-lift 2` | 26 s |
-| 3 | node2vec, GNN and XGBoost embeddings, CPU, reduced settings (`--walks-per-node 2 --walk-length 20 --window 3 --gnn-epochs 50 --xgb-trees 20 --xgb-depth 4`) | 94 s |
-| 4 | `--mock-evo2 --max-len 128`, 1 epoch: validation loss 12.7 → 9.5 | 68 s |
-| 6 | split consistent (3.7% of regions outside the 95% interval), no leakage; `test_set_performance` on 300 test sequences (bigram baseline top-1 accuracy 0.41) | ~15 s |
+| 1 | chr21 downloaded (~85 MB), MD5 verified, split written (45 haplograph individuals in neither half) | 22 s |
+| 2 | 166,754 nodes, 1,520,370 edges, 161,937 isolated nodes at `--min-lift 2` | 14 s |
+| 3 | node2vec, GNN and XGBoost embeddings, CPU, reduced settings (`--walks-per-node 2 --walk-length 20 --window 3 --gnn-epochs 50 --xgb-trees 20 --xgb-depth 4`); XGBoost region accuracy 0.070 vs 0.066 majority | 60 s |
+| 4a | `--mock-evo2 --max-len 128`, 1 epoch: validation loss 10.8 → 8.2 | 13 s |
+| 5 | GWAS Catalog downloaded (~73 MB), body height: 45,250 associations from 68 studies → 29,486 variants | 48 s |
+| 6 | split consistent (3.4% of regions outside the 95% interval), no leakage; `test_set_performance` on 500 test sequences (bigram baseline top-1 0.437); embedding AUC GNN 0.978, XGBoost 0.968, node2vec 0.881; GWAS: 216 hits → 128 loci, 0 haploblocks enriched | 8 s |
 
 Every script's `--test` also passes, and step 6 rebuilds a step-4 model exactly (the same validation accuracy as stored in the checkpoint, when step 4 evaluated all its validation sequences, i.e. at most `--val-examples` of them; otherwise step 4 evaluated a random subset). **Not run, because no GPU was available:** Evo 2 itself (the `evo2` package), the BioNeMo backbone (written against the BioNeMo API, never executed), RAPIDS `--cudf` / `--rapids`, XGBoost on CUDA, `setup.py --evo2` beyond a dry run, and the Nemotron request against the real NVIDIA endpoint (tested against a local fake endpoint). Expect to fix small API or version issues on first real runs, especially in the parts marked `VERSION-SENSITIVE`.
 
@@ -497,7 +498,7 @@ source ~/evo2-env/bin/activate
 
 `PYTHON` and `VENV` (`--python`, `--venv`) also apply to the CPU mode of 10.1. On sm_120 (Blackwell) `setup.py` sets `FLASH_ATTENTION_FORCE_BUILD=TRUE` and `FLASH_ATTN_CUDA_ARCHS`, so flash-attn is compiled for the GPU instead of downloading a prebuilt wheel. evo2 is installed from its git repository at `--evo2-ref` (a branch is checked out at its latest remote state), with torch kept at the CUDA 12.8 build.
 
-Requirements: Linux, Python 3.11 or 3.12, NVIDIA driver for CUDA 12.8 (≥ 570), an 80 GB GPU recommended for 7B. Manual equivalent:
+Requirements: Linux, Python 3.11 or 3.12 (the CPU core of 10.1 also runs on Python ≥ 3.9), NVIDIA driver for CUDA 12.8 (≥ 570), an 80 GB GPU recommended for 7B. Manual equivalent:
 
 ```bash
 pip install numpy pandas scipy torch xgboost
@@ -573,6 +574,8 @@ python 4b_finetune_evo2_hash.py --test
 python 5_download_gwas.py --test              # synthetic GWAS Catalog
 python 6_validate_evo2.py --test            # runs steps 1-3, 4a and 5 itself (not 4b), then every validation task
 ```
+
+Regression tests (synthetic data, CPU, about 5 s): `pip install pytest`, then from the repository root `python -m pytest part1_haplograph/tests -q`.
 
 ### 11.2 Real data on a CPU (chr21, stand-in model, about 5 minutes)
 

@@ -64,7 +64,8 @@ def raw_file(args, chrom, name):
     p = Path(args.raw_dir) / chrom / name
     if not p.exists():
         die(f"{p} not found - download it first: python 1_download_haplograph.py --chroms {chrom}"
-            + (" --edges lift5" if name.startswith("edges_lift") else ""))
+            + (" --edges lift5" if name.startswith("edges_lift") else "")
+            + (f" --workdir {args.workdir}" if args.workdir != "haplograph" else ""))
     return str(p)
 
 

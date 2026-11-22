@@ -66,6 +66,10 @@ def graph_copy(pipeline, tmp_path):
 
 def run_validate(args, out_dir):
     """Run step 6 in-process; return summary.json as a dict and the task records by name."""
-    script("6_validate_evo2").main(list(map(str, args)) + ["--out-dir", str(out_dir)])
+    try:
+        script("6_validate_evo2").main(list(map(str, args)) + ["--out-dir", str(out_dir)])
+    except SystemExit:                       # a failed task: the summary is still written
+        if not (Path(out_dir) / "summary.json").exists():
+            raise
     summary = json.loads((Path(out_dir) / "summary.json").read_text())
     return summary, {t["name"]: t for t in summary["tasks"]}

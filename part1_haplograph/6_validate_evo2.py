@@ -1412,7 +1412,8 @@ def main(argv=None):
     if not args.model:
         ap.error("--model is required")
     if not os.path.exists(args.model):
-        raise SystemExit(f"model file {args.model} not found")
+        raise SystemExit(f"error: model file {args.model} not found - run 4a_finetune_evo2_embeddings.py "
+                         "(or 4b_finetune_evo2_hash.py) first")
 
     model = Model(args.model)                     # loaded once, on first use, shared with the tasks
     try:
@@ -1484,6 +1485,8 @@ def main(argv=None):
             die(f"self-test: {n_fail} task(s) failed")
         check_self_test({r["name"] + (":" + r["summary"]["label"] if r["name"] == "gwas_enrichment" else ""):
                          r["summary"] for r in results}, args.hotspot)
+    elif n_fail:                                  # a chained run (set -e, CI) must not report success
+        die(f"{n_fail} task(s) failed - see {os.path.join(args.out_dir, 'report.md')}")
 
 
 if __name__ == "__main__":

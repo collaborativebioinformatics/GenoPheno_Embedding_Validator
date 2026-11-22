@@ -90,9 +90,16 @@ def make_venv(python, venv, args):
     py = Path(venv).expanduser() / "bin" / "python"
     if py.exists():
         log(f"using the existing venv {venv}")
-    else:
-        run([python, "-m", "venv", Path(venv).expanduser()], f"creating the venv {venv} with {python}", args,
-            hint="on Debian/Ubuntu: sudo apt install python3-venv (or python3.12-venv)")
+        return str(py)
+    if not shutil.which(python):
+        raise SetupError(f"{python} not found\n  hint: install it, or pass --python with an installed Python")
+    parent = next(p for p in Path(venv).expanduser().absolute().parents if p.exists())
+    if not parent.is_dir() or not os.access(parent, os.W_OK):
+        raise SetupError(f"cannot create the venv {venv}: {parent} is not a writable folder\n"
+                         "  hint: pass --venv with a path in a folder you can write to")
+    run([python, "-m", "venv", Path(venv).expanduser()], f"creating the venv {venv} with {python}", args,
+        hint="on Debian/Ubuntu: sudo apt install python3-venv (or python3.12-venv)" if platform.system() == "Linux"
+        else "check that this Python can create venvs (python -m venv --help)")
     return str(py)
 
 
@@ -263,6 +270,8 @@ def main(argv=None):
         raise SystemExit(1)
     except KeyboardInterrupt:
         raise SystemExit("[setup] interrupted")
+    if args.dry_run:
+        return log("dry run: nothing was installed")
     log("done." + (f" Activate with: source {Path(py).parent}/activate." if py != sys.executable else "")
         + " Check the pipeline with: python 6_validate_evo2.py --test")
 

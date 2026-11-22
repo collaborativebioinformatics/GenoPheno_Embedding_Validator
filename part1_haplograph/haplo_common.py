@@ -71,7 +71,7 @@ def download(url, dest, quiet=False, hint=""):
     tmp = dest.with_name(dest.name + ".part")
 
     def hook(blocks, bs, total):
-        if total > 0 and not quiet:
+        if total > 0 and not quiet and sys.stdout.isatty():      # no \r progress lines in log files
             sys.stdout.write(f"\r    {min(blocks * bs, total) / 1e6:9.1f} / {total / 1e6:.1f} MB")
             sys.stdout.flush()
 

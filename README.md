@@ -89,7 +89,7 @@ Without a GPU, add `--mock-evo2` to step 4 (the model is then `$G/evo2_mock_next
 
 ## Dependencies
 
-- Python 3.11 or 3.12, Linux, NVIDIA GPU with a driver for CUDA 12.8 (≥ 570; 80 GB recommended for step 4); the CPU checks (`--test`, `--mock-evo2`) run on any OS
+- CPU core (every `--test`, `--mock-evo2`): Python ≥ 3.9 on any OS; Evo 2: Python 3.11 or 3.12, Linux, NVIDIA GPU with a driver for CUDA 12.8 (≥ 570; 80 GB recommended for step 4)
 - numpy, pandas, scipy (all steps)
 - torch (node2vec and GNN embeddings, Evo 2, reading models in step 6)
 - xgboost (XGBoost embeddings)
@@ -105,7 +105,7 @@ cd part1_haplograph
 python setup.py                          # CPU core (numpy, pandas, scipy, torch, xgboost) into the current Python
 python setup.py --venv ~/haplograph-env  # the same, in a new venv
 python setup.py --evo2                   # Linux + NVIDIA GPU: CUDA 12.8 toolkit, torch, flash-attn, evo2 in ~/evo2-env
-python setup.py --evo2 --dry-run         # show the commands without running them
+python setup.py --evo2 --dry-run         # on the GPU machine: check it and show the commands without running them
 ```
 
 Manual equivalent: `pip install numpy pandas scipy torch xgboost`, then `pip install flash-attn==2.8.0.post2 --no-build-isolation` and `pip install evo2` on a GPU machine (`setup.py` installs evo2 from its git repository at `--evo2-ref`).
