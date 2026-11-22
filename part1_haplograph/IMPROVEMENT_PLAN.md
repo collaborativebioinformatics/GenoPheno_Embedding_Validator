@@ -1,7 +1,7 @@
 # Part 1 improvement plan
 
 Plan produced with a structured brainstorm-and-review workflow, starting from the existing part 1 pipeline
-(steps 0-5, see [../DOCUMENTATION.md](../DOCUMENTATION.md)). It is updated after each improvement
+(steps 1-6, see [../DOCUMENTATION.md](../DOCUMENTATION.md)). It is updated after each improvement
 iteration; implemented items are marked **[done]**.
 
 ## Introduction
@@ -33,7 +33,7 @@ next-cluster prediction is a well-posed task.
 | H4 | Accuracy within the true next region separates haplotype knowledge from position knowledge | Pursue (iteration 1) |
 | H5 | Collapsing clusters with train support < k into one per-region rare token makes the task well-posed | Pursue (iteration 2) |
 | H6 | One comparison table across embedding methods and frozen/fine-tuned models | Dropped in iteration 2 (summary.json already holds it; minimalism) |
-| H7 | One config-driven runner for steps 0-5 | Dropped in iteration 2 (duplicates DOCUMENTATION section 11; minimalism) |
+| H7 | One config-driven runner for steps 1-6 | Dropped in iteration 2 (duplicates DOCUMENTATION section 11; minimalism) |
 | H8 | Test accuracy stratified by population | Dropped for now (ancestry removed from the pipeline by design) |
 | H9 | Phenotype prediction from individual embeddings | Dropped (no real phenotypes in 1000G) |
 | H10 | Genome-wide (cross-chromosome) sequences | Dropped (memory / context) |
@@ -79,7 +79,7 @@ model-baseline difference; round 3 had no substantive change, so the review stop
 
 | Item | Change |
 |---|---|
-| H5 + H11 | `--min-support k` in step 4 (`GenomeData`): clusters with training support < k become one token per haploblock region (embedding = mean of its members); default 2 (the second audit showed that at 1 the merged token never occurs in training, so it cannot be learned); carriers counted on step 4's own training individuals. Stored in the checkpoint and reapplied by step 5, which also reports the share of test targets that are merged |
+| H5 + H11 | `--min-support k` in step 4 (`GenomeData`): clusters with training support < k become one token per haploblock region (embedding = mean of its members); default 2 (the second audit showed that at 1 the merged token never occurs in training, so it cannot be learned); carriers counted on step 4's own training individuals. Stored in the checkpoint and reapplied by step 6, which also reports the share of test targets that are merged |
 | M1 | Module docstrings keep purpose, input/output files and usage; option tables and prose duplicated in DOCUMENTATION.md / `--help` are removed |
 | M2 | Remove dead or duplicated code across part 1 |
 
@@ -90,7 +90,7 @@ round 3 had no substantive change.
 
 ## Development plan
 
-- Iteration 1: H1-H4 in step 5 (no GPU needed), tested on synthetic data and chr21.
+- Iteration 1: H1-H4 in step 6 (no GPU needed), tested on synthetic data and chr21.
 - Iteration 2: H5/H11 and the minimalism pass M1-M2.
 - Iteration 3: H12 positive control (regression test + chr21 CPU experiment); fix what it reveals.
 
@@ -117,7 +117,7 @@ needed to know whether Evo 2 beats the bigram there.
 - Every script: `--test` (synthetic haplograph, CPU, seconds).
 - `embedding_cooccurrence`: on the synthetic graph (no positional linkage) genomic proximity must stay
   near AUC 0.5 and the train-lift reference well above it; GNN / XGBoost should approach that
-  reference (node2vec is weak there under the tiny self-test walk budget, so it is not asserted). The step-5
+  reference (node2vec is weak there under the tiny self-test walk budget, so it is not asserted). The step-6
   `--test` asserts these properties. On chr21, compare methods.
 - `test_set_performance`: the CIs must contain the point estimates; with `--splits none` the
   model's stored validation accuracy must still be reproduced exactly (when step 4 evaluated all

@@ -36,12 +36,12 @@ def _step4_default_min_support(G):
 
 
 # ---------------------------------------------------------------------------
-# Index consistency between steps 4 and 5 (guard; passes)
+# Index consistency between steps 4 and 6 (guard; passes)
 # ---------------------------------------------------------------------------
 
 def test_step5_reproduces_stored_val_accuracy_with_min_support(graph_copy, tmp_path):
-    """Steps 4 and 5 must build the same merged vocabulary (tokens, local indices, mean
-    embeddings): with --splits none, step 5 on the model's own validation individuals must
+    """Steps 4 and 6 must build the same merged vocabulary (tokens, local indices, mean
+    embeddings): with --splits none, step 6 on the model's own validation individuals must
     reproduce the validation accuracy stored in the checkpoint."""
     out = tmp_path / "k3.pt"
     script("4a_finetune_evo2_embeddings").main(
@@ -110,5 +110,5 @@ def test_splits_none_train_set_is_models_training_set(pipeline, tmp_path):
                   "--task", "model_info"], tmp_path / "val")
     with open(tmp_path / "val" / "split.csv") as f:
         train = {r["individual"] for r in csv.DictReader(f) if r["set"] == "train"}
-    assert not train & set(pipeline["test"]), "graph test-half individuals are in step 5's train set"
+    assert not train & set(pipeline["test"]), "graph test-half individuals are in step 6's train set"
     assert train == set(meta["train_individuals"])

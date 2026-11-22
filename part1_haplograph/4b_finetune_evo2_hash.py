@@ -1,5 +1,5 @@
 """
-Step 4b (optional, independent of steps 0-3) - fine-tune Evo 2 to predict a phenotype from a
+Step 4b (optional, independent of steps 1-3) - fine-tune Evo 2 to predict a phenotype from a
 genomic hash. Every bit of the 0/1 hash is one Evo 2 token (hashes longer than --hash-window are
 split into windows); the read-out layer is mean-pooled and a head predicts the phenotype:
 regression for numbers (RMSE, Pearson r, R^2) or classification for labels / <= 10 distinct
@@ -15,7 +15,7 @@ USAGE
   python 4b_finetune_evo2_hash.py --hash-pheno hash_height.tsv
   python 4b_finetune_evo2_hash.py --hash-pheno hash_pop.tsv --task classification --train-blocks 0
   python 4b_finetune_evo2_hash.py --test        # synthetic TSV, --mock-evo2, CPU
-Evo 2 needs Linux, CUDA 12.8+ (install_evo2.sh) and ~80 GB of GPU memory for 7B.
+Evo 2 needs Linux, CUDA 12.8+ (python setup.py --evo2) and ~80 GB of GPU memory for 7B.
 """
 import argparse
 import os

@@ -132,14 +132,14 @@ def set_id(names):
 def read_graph_individuals(graph_dir):
     p = Path(graph_dir) / "individuals.txt"
     if not p.exists():
-        die(f"missing {p} - run 1_build_graph.py first")
+        die(f"missing {p} - run 2_build_graph.py first")
     return [x for x in p.read_text().split("\n") if x]
 
 
 def train_columns(args, individuals):
     """Training individuals as column indices into individuals.txt / carriers.npz.
     Source: --train-individuals if given, else the graph's train_individuals.txt (written by
-    1_build_graph.py), else every individual. It must be the set the graph was built from (so the
+    2_build_graph.py), else every individual. It must be the set the graph was built from (so the
     test individuals can never enter training). Returns (indices, source description, set id)."""
     src = getattr(args, "train_individuals", None)
     default = Path(args.graph_dir) / "train_individuals.txt"
@@ -153,7 +153,7 @@ def train_columns(args, individuals):
     graph_sid = json.loads(info.read_text()).get("train_set_id", "all") if info.exists() else sid
     if sid != graph_sid:
         die(f"the training set {sid} ({src}) is not the one the graph was built from ({graph_sid}): every step "
-            "must train on the graph's train_individuals.txt; rebuild the graph with step 1 to use another set")
+            "must train on the graph's train_individuals.txt; rebuild the graph with step 2 to use another set")
     return idx, src, sid
 
 
@@ -224,10 +224,10 @@ def test_workdir(name):
 
 
 def selftest_graph_dir():
-    """Graph folder written by 1_build_graph.py --test."""
+    """Graph folder written by 2_build_graph.py --test."""
     hits = sorted((Path(tempfile.gettempdir()) / "haplograph_selftest" / "build_graph").glob("*_train_*"))
     if not hits:
-        die("self-test graph was not built (run 1_build_graph.py --test)")
+        die("self-test graph was not built (run 2_build_graph.py --test)")
     return str(hits[0])
 
 

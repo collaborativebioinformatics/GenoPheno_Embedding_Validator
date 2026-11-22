@@ -345,7 +345,7 @@ def embed_xgboost(args, A):
     rng = np.random.default_rng(args.seed)
     nodes = pd.read_csv(gfile(args, "nodes.csv.gz"), usecols=["node", "chrom", "region", "start"])
     if len(nodes) != A.shape[0]:
-        die(f"nodes.csv.gz has {len(nodes)} rows but graph.npz has {A.shape[0]} nodes; rebuild with step 1")
+        die(f"nodes.csv.gz has {len(nodes)} rows but graph.npz has {A.shape[0]} nodes; rebuild with step 2")
     y, n_cls = region_bins(nodes, args.xgb_region_bins)
     if n_cls < 2:
         die("xgboost needs at least 2 haploblock regions in the graph")
@@ -454,9 +454,9 @@ def run_method(args, method, A):
 
 
 def self_test_settings(args):
-    """Build the synthetic test graph (1_build_graph.py --test) and shrink every method."""
+    """Build the synthetic test graph (2_build_graph.py --test) and shrink every method."""
     import importlib
-    importlib.import_module("1_build_graph").main(["--test"])
+    importlib.import_module("2_build_graph").main(["--test"])
     args.graph_dir = selftest_graph_dir()
     args.dim, args.svd_dim, args.walks_per_node, args.walk_length = 8, 8, 2, 10
     args.gnn_epochs, args.gnn_hidden, args.xgb_trees, args.xgb_depth = 20, 16, 5, 3
@@ -467,7 +467,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--method", default="all",
                     help="node2vec, gnn, xgboost, a comma-separated list, or all (default)")
-    ap.add_argument("--graph-dir", default="haplograph/genome_train_half_A", help="output folder of 1_build_graph.py")
+    ap.add_argument("--graph-dir", default="haplograph/genome_train_half_A", help="output folder of 2_build_graph.py")
     ap.add_argument("--dim", type=int, default=64, help="embedding size")
     ap.add_argument("--csv", action="store_true", help="also write node_emb_<method>.csv.gz")
     ap.add_argument("--device", help="cpu / cuda (default: cuda if available)")
@@ -527,7 +527,7 @@ def main(argv=None):
 
     require_files(args.graph_dir, ["graph.npz", "individuals.txt"]
                   + (["carriers.npz"] if {"gnn", "xgboost"} & set(methods) else [])
-                  + (["nodes.csv.gz"] if "xgboost" in methods or args.csv else []), "1_build_graph.py")
+                  + (["nodes.csv.gz"] if "xgboost" in methods or args.csv else []), "2_build_graph.py")
     individuals = read_graph_individuals(args.graph_dir)
     args.train_idx, args.train_src, args.train_id = train_columns(args, individuals)
     args.graph_id = graph_id(args.graph_dir)

@@ -1,6 +1,6 @@
 """
 Evo 2 on haplograph node embeddings: shared by 4a_finetune_evo2_embeddings.py (training),
-4b_finetune_evo2_hash.py and 5_validate_evo2.py (querying the fine-tuned model on the test set).
+4b_finetune_evo2_hash.py and 6_validate_evo2.py (querying the fine-tuned model on the test set).
 
   GenomeData        node embeddings + each individual's clusters per chromosome, in genomic order
   Evo2Runner        Evo 2 through the `evo2` package (Arc Institute; plain PyTorch, CUDA)
@@ -74,7 +74,7 @@ class GenomeData:
                        for i, c in enumerate(present)}
         C = sp.load_npz(os.path.join(graph_dir, "carriers.npz")).tocsr()
         if C.shape[1] != len(read_graph_individuals(graph_dir)):
-            die("individuals.txt and carriers.npz disagree; rebuild the graph with step 1")
+            die("individuals.txt and carriers.npz disagree; rebuild the graph with step 2")
         self.by_ind = C[self.order].T.tocsr()                            # [I, N], columns = ranks
         self.by_ind.sort_indices()
         self.rare = np.asarray(C[:, support_from].sum(axis=1)).ravel() < min_support
@@ -198,7 +198,7 @@ class Evo2Runner:
         try:
             from evo2 import Evo2
         except ImportError as e:
-            die(f"could not import evo2 ({e}); install it with install_evo2.sh (see DOCUMENTATION.md)")
+            die(f"could not import evo2 ({e}); install it with: python setup.py --evo2 (see DOCUMENTATION.md)")
         self.torch = torch
         self.evo = Evo2(evo2_model)
         net = self.net = self.evo.model
@@ -403,7 +403,7 @@ class BioNeMoEvo2Runner:
 class MockEvo2Runner:
     """A small causal transformer standing in for Evo 2 (same interface), for CPU checks of the
     pipeline. Its 'pre-trained' weights are random; the whole backbone state is saved in the
-    checkpoint so step 5 can rebuild exactly the same model."""
+    checkpoint so step 6 can rebuild exactly the same model."""
 
     backend = "mock"
 

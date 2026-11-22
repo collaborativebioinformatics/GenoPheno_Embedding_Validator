@@ -1,9 +1,9 @@
 """
-Step 0 - download the 1000 Genomes haplograph and write the train / test split of individuals.
+Step 1 - download the 1000 Genomes haplograph and write the train / test split of individuals.
 
 Downloads nodes.csv.gz and the edge file of every chromosome (chr1-chr22, or --chroms) from
 https://data.haploblocks.org/haplograph/1000G/, checks them against checksums.md5, and writes the
-TRAINING set (steps 1-4 learn from it) and the TEST set (step 5 validates on it): the BH_26 halves
+TRAINING set (steps 2-4 learn from it) and the TEST set (step 6 validates on it): the BH_26 halves
 (--split bh26, default) or a new population-stratified random split (--split random).
 
 OUTPUT (in --workdir, default haplograph/)
@@ -14,10 +14,10 @@ OUTPUT (in --workdir, default haplograph/)
   splits/split.json               split name, source, sizes, set ids
 
 USAGE
-  python download_haplograph.py                          # whole genome (~15 GB), BH_26 split
-  python download_haplograph.py --chroms chr21,chr22
-  python download_haplograph.py --split random --test-fraction 0.3 --seed 1
-  python download_haplograph.py --test                   # synthetic data, no network
+  python 1_download_haplograph.py                          # whole genome (~15 GB), BH_26 split
+  python 1_download_haplograph.py --chroms chr21,chr22
+  python 1_download_haplograph.py --split random --test-fraction 0.3 --seed 1
+  python 1_download_haplograph.py --test                   # synthetic data, no network
 """
 import argparse
 import gzip

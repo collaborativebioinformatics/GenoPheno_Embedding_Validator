@@ -1,5 +1,5 @@
 """
-Spec-test regressions for the GWAS step (download_gwas.py and gwas_enrichment in step 5).
+Spec-test regressions for the GWAS step (5_download_gwas.py and gwas_enrichment in step 6).
 Each test guards a confirmed issue; tests for unfixed issues fail until the fix lands.
 Run:  python -m pytest part1_haplograph/tests -q
 """
@@ -11,7 +11,7 @@ import pytest
 
 from conftest import run_validate, script
 
-download_gwas = script("download_gwas")
+download_gwas = script("5_download_gwas")
 
 
 @pytest.fixture

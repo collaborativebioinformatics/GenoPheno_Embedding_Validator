@@ -1,5 +1,5 @@
 """
-Step 4 - fine-tune Evo 2 on the step-3 node embeddings (no DNA). One example = one training
+Step 4a - fine-tune Evo 2 on the step-3 node embeddings (no DNA). One example = one training
 individual on one chromosome: their clusters in genomic order, each replaced by its embedding,
 projected into Evo 2 in place of its nucleotide embeddings (plus a per-chromosome vector; every
 embedding first gets a sin/cos encoding of its genomic start appended, --pos-freqs). Evo 2
@@ -9,7 +9,7 @@ carried by fewer than --min-support (default 2) of these training individuals sh
 haploblock region.
 Only the graph's training individuals are used (split again into train / validation).
 
-Backbone: Evo 2 via the `evo2` package (default; one CUDA GPU, install_evo2.sh), via NVIDIA
+Backbone: Evo 2 via the `evo2` package (default; one CUDA GPU, python setup.py --evo2), via NVIDIA
 BioNeMo (--bionemo --ckpt-dir NeMo2 checkpoint; experimental, VERSION-SENSITIVE parts in
 evo2_model.py), or --mock-evo2 (a small random stand-in for CPU checks; results mean nothing).
 
@@ -17,7 +17,7 @@ OUTPUT  --out, default <graph-dir>/evo2[_bionemo|_mock]_next_<method>.pt (torch 
   mode "embeddings", objective "next", backend and backbone settings, graph_method, chroms,
   n_chrom_slots, graph_id, embeddings_sha1, trained_blocks, proj_in, chrom_emb, head,
   train_individuals, val_individuals, train_set_id, train_source, metrics {before, after}, config.
-  Step 5 rebuilds it with evo2_model.load_finetuned().
+  Step 6 rebuilds it with evo2_model.load_finetuned().
 
 USAGE
   python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir $G
@@ -121,7 +121,7 @@ def self_test(args):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--method", choices=METHODS, help="which node embeddings from 3_node_embeddings.py to use")
-    ap.add_argument("--graph-dir", default="haplograph/genome_train_half_A", help="output folder of 1_build_graph.py")
+    ap.add_argument("--graph-dir", default="haplograph/genome_train_half_A", help="output folder of 2_build_graph.py")
     ap.add_argument("--chroms", help="train on these chromosomes of the graph only (default: all)")
     ap.add_argument("--train-individuals",
                     help="file or URL of training individuals (default: <graph-dir>/train_individuals.txt, else all)")
@@ -160,7 +160,7 @@ def main(argv=None):
         die("--max-len must be >= 2")
     if args.pos_freqs < 0:
         die("--pos-freqs must be >= 0")
-    require_files(args.graph_dir, ["nodes.csv.gz", "individuals.txt", "carriers.npz"], "1_build_graph.py")
+    require_files(args.graph_dir, ["nodes.csv.gz", "individuals.txt", "carriers.npz"], "2_build_graph.py")
     require_files(args.graph_dir, [f"node_emb_{args.method}.npy"], f"3_node_embeddings.py --method {args.method}")
     train(args)
     log("done.")

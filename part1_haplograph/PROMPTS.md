@@ -3,20 +3,20 @@
 Each prompt is self-contained for a fresh agent session working in `part1_haplograph/` of this
 repository. Read `../DOCUMENTATION.md` and `IMPROVEMENT_PLAN.md` first. Never modify `part2_proteomics/`.
 
-## Iteration 1 (step 5, no GPU needed)
+## Iteration 1 (step 6, no GPU needed)
 
-**H1 implement.** In `5_validate_evo2.py`, add a task `embedding_cooccurrence` that, for every
+**H1 implement.** In `6_validate_evo2.py`, add a task `embedding_cooccurrence` that, for every
 `node_emb_<method>.npy` in the graph folder, samples cluster pairs from different haploblock regions
 on the same chromosome whose co-occurrence lift among the TEST individuals (carriers.npz columns of
 the test set) is at least `min_lift` (both clusters with test support >= `min_support`), samples
 negatives at matched genomic distance, and reports the ROC AUC of embedding cosine similarity per
 method, with a bootstrap CI. Use scipy only.
 
-**H1 test.** Extend the step-5 `--test` so `embedding_cooccurrence` runs on the synthetic graph, and
+**H1 test.** Extend the step-6 `--test` so `embedding_cooccurrence` runs on the synthetic graph, and
 assert that genomic proximity stays near 0.5, the train-lift reference is clearly above 0.5, and GNN is above 0.5 (node2vec is too weak under the tiny self-test settings to assert).
 
 **H1 wire.** Add the task to `validation_tasks.txt` and the default task list, and document it in
-DOCUMENTATION.md section 4 (step 5).
+DOCUMENTATION.md section 4 (step 6).
 
 **H2-H4 implement.** In `test_set_performance`, record per-individual correct counts for the model
 and the bigram baseline; add a paired bootstrap over test individuals (95% CI of model top-1, bigram
@@ -40,7 +40,7 @@ collapsed vocabulary. Add `--min-support` to step 4, store it in the checkpoint,
 Keep it to a few dozen lines.
 
 **H5 test.** On the synthetic data, check that with a high `--min-support` the number of candidates
-per chromosome drops, the model still trains and step 5 reproduces the stored validation accuracy.
+per chromosome drops, the model still trains and step 6 reproduces the stored validation accuracy.
 
 **M1-M2 implement.** In every part 1 script, cut the module docstring to purpose, input/output files
 and usage (options live in `--help`, the rest in DOCUMENTATION.md); remove dead code and helpers

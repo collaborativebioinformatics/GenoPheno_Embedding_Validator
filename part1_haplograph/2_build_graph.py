@@ -1,6 +1,6 @@
 """
-Step 1 - build the haplograph co-occurrence graph, genome-wide or for --chroms, from step 0's
-downloads. Edge weight, support and lift are counted on the TRAINING individuals only (step 0's
+Step 2 - build the haplograph co-occurrence graph, genome-wide or for --chroms, from step 1's
+downloads. Edge weight, support and lift are counted on the TRAINING individuals only (step 1's
 split, or --train-individuals; --no-split = all individuals), so the test set never shapes the
 graph: weight = training individuals carrying both clusters of a pair listed in the edge file,
 lift = weight / (support_A * support_B / n_train), edges with lift < --min-lift are dropped.
@@ -10,7 +10,7 @@ OUTPUT (in --out; default <workdir>/genome or <workdir>/<chrA>_<chrB>, + _train_
   nodes.csv.gz      row i = node i: node, id, chrom, region, start, end, support, support_train
   individuals.txt   one individual per line = the columns of carriers.npz
   train_individuals.txt / test_individuals.txt   the split, restricted to the graph's individuals
-  carriers.npz      scipy.sparse CSR uint8 [nodes, individuals], ALL individuals (step 5 needs the test ones)
+  carriers.npz      scipy.sparse CSR uint8 [nodes, individuals], ALL individuals (step 6 needs the test ones)
   graph.npz         scipy.sparse CSR float32 [nodes, nodes], symmetric, value log(1 + lift);
                     within-chromosome edges only
   graph_info.json   settings, counts, training/test set ids (rerunning with other settings stops
@@ -18,10 +18,10 @@ OUTPUT (in --out; default <workdir>/genome or <workdir>/<chrA>_<chrB>, + _train_
 Parsed chromosomes are cached in <workdir>/parts/<chrom>/, keyed by the raw files.
 
 USAGE
-  python 1_build_graph.py                       # all downloaded chromosomes -> haplograph/genome_train_half_A
-  python 1_build_graph.py --chroms chr21,chr22  # -> haplograph/chr21_chr22_train_half_A
-  python 1_build_graph.py --cudf --chunksize 0  # pandas parts on the GPU (RAPIDS cuDF)
-  python 1_build_graph.py --test                # synthetic data, CPU, seconds
+  python 2_build_graph.py                       # all downloaded chromosomes -> haplograph/genome_train_half_A
+  python 2_build_graph.py --chroms chr21,chr22  # -> haplograph/chr21_chr22_train_half_A
+  python 2_build_graph.py --cudf --chunksize 0  # pandas parts on the GPU (RAPIDS cuDF)
+  python 2_build_graph.py --test                # synthetic data, CPU, seconds
 """
 import argparse
 import hashlib
@@ -63,7 +63,7 @@ def file_stamp(path):
 def raw_file(args, chrom, name):
     p = Path(args.raw_dir) / chrom / name
     if not p.exists():
-        die(f"{p} not found - download it first: python download_haplograph.py --chroms {chrom}"
+        die(f"{p} not found - download it first: python 1_download_haplograph.py --chroms {chrom}"
             + (" --edges lift5" if name.startswith("edges_lift") else ""))
     return str(p)
 
@@ -236,7 +236,7 @@ def build(args):
             return
         die(f"{out} holds a graph built with other settings "
             + ", ".join(f"{k}: {a!r} there, {b!r} now" for k, (a, b) in differ.items())
-            + ". Pass --force to rebuild it in place (steps 3-5 outputs in that folder then become stale "
+            + ". Pass --force to rebuild it in place (steps 3, 4 and 6 outputs in that folder then become stale "
               "and are recomputed / refused), or --out for a new folder.")
     os.makedirs(out, exist_ok=True)
     log(f"building graph for {len(chroms)} chromosome(s) -> {out}")
@@ -322,7 +322,7 @@ def build(args):
 
 
 def resolve_split(args):
-    """Default training/test sets: the split written by download_haplograph.py (--workdir/splits)."""
+    """Default training/test sets: the split written by 1_download_haplograph.py (--workdir/splits)."""
     split_json = Path(args.workdir) / "splits" / "split.json"
     args.split_name = None
     if args.no_split:
@@ -338,10 +338,10 @@ def resolve_split(args):
                 args.split_name = info.get("name", args.split_name)
         if not args.test_individuals:
             log("  warning: no --test-individuals given, so the graph folder gets no test_individuals.txt; "
-                "step 5 will then need --test-individuals or --splits")
+                "step 6 will then need --test-individuals or --splits")
         return
     if not split_json.exists():
-        die(f"no train/test split in {split_json.parent} - run download_haplograph.py first, pass "
+        die(f"no train/test split in {split_json.parent} - run 1_download_haplograph.py first, pass "
             "--train-individuals, or use --no-split to build the graph from all individuals")
     info = json.loads(split_json.read_text())
     args.train_individuals = str(split_json.parent / info["train_file"])
@@ -351,9 +351,9 @@ def resolve_split(args):
 
 def run_self_test(args):
     """Synthetic 2-chromosome haplograph -> graph, on CPU, in a few seconds."""
-    import download_haplograph
+    import importlib
     wd = test_workdir("build_graph")
-    download_haplograph.main(["--test"])                   # writes <tmp>/haplograph_selftest/download
+    importlib.import_module("1_download_haplograph").main(["--test"])                   # writes <tmp>/haplograph_selftest/download
     src = wd.parent / "download"
     shutil.copytree(src, wd, dirs_exist_ok=True)
     args.workdir, args.raw_dir, args.chroms, args.min_lift, args.force = str(wd), str(wd / "raw"), None, 1.2, True
@@ -363,7 +363,7 @@ def run_self_test(args):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--chroms", help="comma-separated selection, e.g. chr21,chr22 (default: every downloaded chromosome)")
-    ap.add_argument("--workdir", default="haplograph", help="root folder of download_haplograph.py (raw/, splits/); "
+    ap.add_argument("--workdir", default="haplograph", help="root folder of 1_download_haplograph.py (raw/, splits/); "
                                                             "the graph and cache are written here too")
     ap.add_argument("--raw-dir", help="folder with <chrom>/nodes.csv.gz etc. (default <workdir>/raw)")
     ap.add_argument("--out", help="output folder (default <workdir>/genome or <workdir>/<chroms>, "
@@ -372,7 +372,7 @@ def main(argv=None):
                     help="file or URL of training individuals (default: <workdir>/splits/train_individuals.txt); "
                          "edge weights, support and lift are computed from them only")
     ap.add_argument("--test-individuals",
-                    help="file of test individuals, copied into the graph folder for step 5 "
+                    help="file of test individuals, copied into the graph folder for step 6 "
                          "(default: <workdir>/splits/test_individuals.txt)")
     ap.add_argument("--no-split", action="store_true", help="build the graph from ALL individuals (no train/test split)")
     ap.add_argument("--sample-map", help="CSV: graph individual name, sample ID (if they differ)")
@@ -392,14 +392,14 @@ def main(argv=None):
         run_self_test(args)
     args.raw_dir = args.raw_dir or os.path.join(args.workdir, "raw")
     if not os.path.isdir(args.raw_dir):
-        die(f"{args.raw_dir} not found - run download_haplograph.py first (or pass --raw-dir)")
+        die(f"{args.raw_dir} not found - run 1_download_haplograph.py first (or pass --raw-dir)")
     resolve_split(args)
 
     downloaded = sorted((p.name for p in Path(args.raw_dir).iterdir() if (p / "nodes.csv.gz").exists()),
                         key=chrom_key)
     args.chroms = parse_chroms(args.chroms) or [c for c in ALL_CHROMS if c in downloaded] or downloaded
     if not args.chroms:
-        die(f"no <chrom>/nodes.csv.gz in {args.raw_dir} - run download_haplograph.py first")
+        die(f"no <chrom>/nodes.csv.gz in {args.raw_dir} - run 1_download_haplograph.py first")
     genome_wide = set(args.chroms) == set(ALL_CHROMS)
     name = "genome" if genome_wide else "_".join(args.chroms)
     if args.split_name:

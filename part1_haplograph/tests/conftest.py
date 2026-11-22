@@ -3,7 +3,7 @@ Shared fixtures for the part 1 regression tests (CPU only, synthetic data, no ne
 
 `pipeline` builds a tiny synthetic haplograph once per test session, in a pytest temp folder
 (never the shared <system temp>/haplograph_selftest used by the scripts' --test flags):
-  step 0 equivalent (synthetic raw/ + splits/), step 1, step 3 (gnn only), step 4 (--mock-evo2).
+  step 1 equivalent (synthetic raw/ + splits/), step 2, step 3 (gnn only), step 4 (--mock-evo2).
 Tests that change files must work on a copy (see `graph_copy`).
 """
 import importlib
@@ -47,7 +47,7 @@ def pipeline(tmp_path_factory):
     (splits / "split.json").write_text(json.dumps({
         "name": SPLIT_NAME, "train_file": "train_individuals.txt", "test_file": "test_individuals.txt",
         "train_set_id": set_id(train), "test_set_id": set_id(test)}))
-    script("1_build_graph").main(["--workdir", str(wd), "--min-lift", "1.2"])
+    script("2_build_graph").main(["--workdir", str(wd), "--min-lift", "1.2"])
     G = wd / f"chr21_chr22_train_{SPLIT_NAME}"
     script("3_node_embeddings").main(["--graph-dir", str(G)] + STEP3_FAST)
     script("4a_finetune_evo2_embeddings").main(["--graph-dir", str(G)] + STEP4_FAST)
@@ -65,7 +65,7 @@ def graph_copy(pipeline, tmp_path):
 
 
 def run_validate(args, out_dir):
-    """Run step 5 in-process; return summary.json as a dict and the task records by name."""
-    script("5_validate_evo2").main(list(map(str, args)) + ["--out-dir", str(out_dir)])
+    """Run step 6 in-process; return summary.json as a dict and the task records by name."""
+    script("6_validate_evo2").main(list(map(str, args)) + ["--out-dir", str(out_dir)])
     summary = json.loads((Path(out_dir) / "summary.json").read_text())
     return summary, {t["name"]: t for t in summary["tasks"]}

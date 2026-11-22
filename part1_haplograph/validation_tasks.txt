@@ -1,6 +1,6 @@
-# Tasks for 5_validate_evo2.py - one task per line: <task name> [key=value ...]
+# Tasks for 6_validate_evo2.py - one task per line: <task name> [key=value ...]
 # '#' starts a comment; quote values that contain spaces.
-# List all tasks and their parameters with:  python 5_validate_evo2.py --list-tasks
+# List all tasks and their parameters with:  python 6_validate_evo2.py --list-tasks
 
 # what the model is, its stored metrics, and whether test individuals were seen in training
 model_info
@@ -16,7 +16,7 @@ embedding_cooccurrence min_lift=2 min_support=5 min_expected=5 pairs=50000
 cluster_consistency min_carriers=1 permutations=200
 
 # 4. GWAS enrichment of haploblocks (data-level): which haploblocks hold more independent GWAS loci than expected?
-#    Hit file from:  python download_gwas.py --trait "^body height$" --label height   (GWAS Catalog,
+#    Hit file from:  python 5_download_gwas.py --trait "^body height$" --label height   (GWAS Catalog,
 #    GRCh38 like the haplograph). Full summary statistics also work (same genome build, mode=summary).
 #    Add one line per trait or threshold.
 #    Hits are clumped into independent loci (clump=auto: 25 kb for hit lists, 250 kb for summary

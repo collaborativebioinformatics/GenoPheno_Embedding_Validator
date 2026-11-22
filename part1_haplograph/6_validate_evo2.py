@@ -1,5 +1,5 @@
 """
-Step 5 - validate a fine-tuned Evo 2 model (step 4) on the held-out TEST individuals.
+Step 6 - validate a fine-tuned Evo 2 model (step 4) on the held-out TEST individuals.
 
 A small task runner: the checks to run are listed one per line in a tasks file (validation_tasks.txt;
 `--list-tasks` shows every task and its parameters); new checks go in a --plugins file using the
@@ -13,9 +13,9 @@ A small task runner: the checks to run are listed one per line in a tasks file (
   gwas_enrichment         haploblocks with more independent GWAS loci than expected (hits clumped by
                           distance), chance levels from randomly placed loci (empirical FDR) and from
                           rotations that keep the hits' spacing, and whether nearby hits share a haploblock (same genome build needed; columns
-                          auto-detected, see GWAS_COLS; hit files from download_gwas.py)
+                          auto-detected, see GWAS_COLS; hit files from 5_download_gwas.py)
 
-Split: by default the graph's train_individuals.txt / test_individuals.txt (steps 0-1); --splits
+Split: by default the graph's train_individuals.txt / test_individuals.txt (steps 1-2); --splits
 DIR_OR_URL (half_A.txt / half_B.txt), --train/--test-individuals, or --splits none (the model's own
 held-out individuals). Split files: one sample ID per line, or a CSV with an "individual" column.
 
@@ -34,9 +34,9 @@ OUTPUT (--out-dir, default <graph-dir>/validation_<model name>/)
   (a task listed twice writes its files with a _2, _3 ... suffix)
 
 USAGE
-  python 5_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt
-  python 5_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --gwas haplograph/gwas/height.tsv
-  python 5_validate_evo2.py --test                       # synthetic data, mock backbone, CPU
+  python 6_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt
+  python 6_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --gwas haplograph/gwas/height.tsv
+  python 6_validate_evo2.py --test                       # synthetic data, mock backbone, CPU
 """
 import argparse
 import glob
@@ -156,7 +156,7 @@ def load_plugin(path):
 # ===========================================================================
 
 class Graph:
-    """Lazy access to the files written by 1_build_graph.py."""
+    """Lazy access to the files written by 2_build_graph.py."""
 
     def __init__(self, graph_dir):
         self.dir = graph_dir
@@ -165,7 +165,7 @@ class Graph:
     def _f(self, name):
         p = os.path.join(self.dir, name)
         if not os.path.exists(p):
-            raise SystemExit(f"missing {p} - run 1_build_graph.py first")
+            raise SystemExit(f"missing {p} - run 2_build_graph.py first")
         return p
 
     @property
@@ -298,7 +298,7 @@ class Context:
             if os.path.exists(g_test):
                 test_src, train_src = g_test, (g_train if os.path.exists(g_train) else None)
             elif os.path.exists(g_train):
-                die(f"{self.graph.dir} has a training set but no test_individuals.txt (step 1 ran with "
+                die(f"{self.graph.dir} has a training set but no test_individuals.txt (step 2 ran with "
                     "--train-individuals but no test file). Pass the matching --test-individuals (and "
                     "--train-individuals) or --splits; falling back to another split could overlap the "
                     "training set")
@@ -351,7 +351,7 @@ class Context:
             train_set, n_train_file = set(inds) - test_set, None
             train_source = "all other graph individuals"
 
-        # the graph's own training set (1_build_graph.py --train-individuals) must not contain test individuals
+        # the graph's own training set (2_build_graph.py --train-individuals) must not contain test individuals
         graph_train_file = os.path.join(self.graph.dir, "train_individuals.txt")
         if os.path.exists(graph_train_file):
             graph_train = set(read_individual_list(graph_train_file))
@@ -360,15 +360,15 @@ class Context:
             self.split_info["test_individuals_in_graph_training_set"] = len(in_both)
             if in_both:
                 log(f"WARNING: {len(in_both):,} test individuals are in the graph's training set "
-                    f"(e.g. {sorted(in_both)[:3]}): steps 1-4 saw them. Rebuild the graph from the "
-                    "train half (download_haplograph.py, then 1_build_graph.py)")
+                    f"(e.g. {sorted(in_both)[:3]}): steps 2-4 saw them. Rebuild the graph from the "
+                    "train half (1_download_haplograph.py, then 2_build_graph.py)")
             elif graph_train != train_set:
                 log(f"note: the graph was built on {len(graph_train):,} training individuals, the train set "
                     f"here has {len(train_set):,} ({len(graph_train - train_set):,} / {len(train_set - graph_train):,} "
                     "differ); test individuals are not in it")
         else:
             self.split_info["graph_built_on"] = "all individuals (no train_individuals.txt)"
-            log("note: the graph was built from ALL individuals (1_build_graph.py --no-split), "
+            log("note: the graph was built from ALL individuals (2_build_graph.py --no-split), "
                 "so its edge weights include the test individuals")
 
         excluded = len(inds) - len(train_set) - len(test_set)
@@ -695,8 +695,8 @@ def gwas_enrichment(ctx, gwas: str, pvalue: float = 5e-8, clump: str = "auto", w
     if clump != "auto" and not (re.fullmatch(r"\d+", str(clump))):
         raise ValueError(f"clump must be 'auto' or a number of bp >= 0, not {clump!r}")
     if not os.path.exists(gwas):
-        raise ValueError(f"GWAS file {gwas} not found (download_gwas.py writes haplograph/gwas/<label>.tsv)")
-    sidecar = re.sub(r"\.tsv$", ".json", gwas)                 # written by download_gwas.py
+        raise ValueError(f"GWAS file {gwas} not found (5_download_gwas.py writes haplograph/gwas/<label>.tsv)")
+    sidecar = re.sub(r"\.tsv$", ".json", gwas)                 # written by 5_download_gwas.py
     if sidecar != gwas and os.path.exists(sidecar):
         build = json.load(open(sidecar)).get("genome_build")
         if build and build != "GRCh38":
@@ -1321,8 +1321,8 @@ def self_test(args):
 
 def planted_gwas(graph_dir, workdir):
     """Synthetic catalog with 10 hits ~1.8 kb apart in the middle of the graph's longest chr21
-    haploblock, filtered by download_gwas.py. Returns (hit file, that haploblock)."""
-    dg = importlib.import_module("download_gwas")
+    haploblock, filtered by 5_download_gwas.py. Returns (hit file, that haploblock)."""
+    dg = importlib.import_module("5_download_gwas")
     reg = pd.read_csv(os.path.join(graph_dir, "nodes.csv.gz"), usecols=["region", "chrom", "start", "end"])
     r = reg[reg["chrom"] == "chr21"].assign(n=lambda d: d["end"] - d["start"]).sort_values("n").iloc[-1]
     assert r.n > 16_000, f"self-test graph: longest chr21 haploblock {r.region} is too short to plant 10 hits"
@@ -1373,7 +1373,7 @@ def list_tasks():
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", help="fine-tuned model file from step 4 (.pt)")
-    ap.add_argument("--graph-dir", default="haplograph/genome_train_half_A", help="output folder of 1_build_graph.py")
+    ap.add_argument("--graph-dir", default="haplograph/genome_train_half_A", help="output folder of 2_build_graph.py")
     sg = ap.add_argument_group("train / test split")
     sg.add_argument("--splits", default=GRAPH_SPLIT,
                     help="'graph' (default) = the graph folder's train/test_individuals.txt; a folder or URL "

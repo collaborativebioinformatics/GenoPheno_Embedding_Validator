@@ -29,12 +29,12 @@ class _WritesMarker:
 
 
 def test_model_load_does_not_unpickle_arbitrary_objects(tmp_path):
-    """A malicious model file must not execute code when step 5 reads it."""
+    """A malicious model file must not execute code when step 6 reads it."""
     import torch
     marker = tmp_path / "PWNED"
     evil = tmp_path / "evil.pt"
     torch.save({"mode": "embeddings", "x": _WritesMarker(str(marker))}, evil)
-    v = script("5_validate_evo2")
+    v = script("6_validate_evo2")
     try:
         v.Model(str(evil)).meta
     except (SystemExit, Exception):
@@ -44,7 +44,7 @@ def test_model_load_does_not_unpickle_arbitrary_objects(tmp_path):
 
 def test_step4_checkpoints_load_with_weights_only(pipeline, tmp_path):
     """Guards the fix above: 4a and 4b checkpoints must stay loadable with weights_only=True,
-    so step 5 never needs the unsafe full unpickler."""
+    so step 6 never needs the unsafe full unpickler."""
     import torch
     torch.load(pipeline["model"], map_location="cpu", weights_only=True)
     m4b = script("4b_finetune_evo2_hash")
@@ -59,7 +59,7 @@ def test_step4_checkpoints_load_with_weights_only(pipeline, tmp_path):
 
 def test_nemotron_scrub_removes_relative_and_windows_paths():
     """DOCUMENTATION section 6: file paths are removed before anything is sent to Nemotron."""
-    v = script("5_validate_evo2")
+    v = script("6_validate_evo2")
     for path, secret in [("patient_cohort_X/model.pt", "patient_cohort_X"),
                          ("haplograph/secret_study/evo2_next_gnn.pt", "secret_study"),
                          (r"C:\Users\alice\study\model.pt", "alice")]:
@@ -70,7 +70,7 @@ def test_nemotron_key_not_sent_over_plain_http(tmp_path, monkeypatch):
     """The NVIDIA API key must not travel unencrypted."""
     import argparse
     import urllib.request
-    v = script("5_validate_evo2")
+    v = script("6_validate_evo2")
     calls = []
     monkeypatch.setenv("NVIDIA_API_KEY", "dummy-test-key")
 
@@ -123,7 +123,7 @@ def test_embedding_cooccurrence_not_held_out_when_embeddings_saw_test_set(graph_
 
 
 # ---------------------------------------------------------------------------
-# Step 5 must refuse (or at least report) a model from another graph build / other embeddings
+# Step 6 must refuse (or at least report) a model from another graph build / other embeddings
 # ---------------------------------------------------------------------------
 
 def _stale_flagged(task):
@@ -156,11 +156,11 @@ def test_step5_reports_changed_embeddings(graph_copy, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Spec vs code: step 5 task selection
+# Spec vs code: step 6 task selection
 # ---------------------------------------------------------------------------
 
 def test_gwas_shortcut_keeps_default_tasks(pipeline, tmp_path):
-    """README step-5 example `--splits ... --gwas height_hg38.tsv` must still run the default checks."""
+    """README step-6 example `--splits ... --gwas height_hg38.tsv` must still run the default checks."""
     gwas = tmp_path / "gwas.tsv"
     rows = ["CHR\tPOS\tRSID\tP"] + [f"chr21\t{1_000_000 + 10_000 * i}\trs{i}\t{1e-9 if i < 5 else 0.5}"
                                      for i in range(40)]
@@ -179,7 +179,7 @@ def test_step1_cache_follows_raw_dir(tmp_path):
     """A graph built with --raw-dir B must contain B's clusters, not those cached from raw/."""
     make_synthetic_haplograph(tmp_path / "raw", ("chr21",), n_ind=30, n_regions=12, seed=0)
     make_synthetic_haplograph(tmp_path / "rawB", ("chr21",), n_ind=30, n_regions=4, seed=1)
-    b1 = script("1_build_graph")
+    b1 = script("2_build_graph")
     b1.main(["--workdir", str(tmp_path), "--no-split"])
     b1.main(["--workdir", str(tmp_path), "--raw-dir", str(tmp_path / "rawB"), "--no-split",
              "--out", str(tmp_path / "graphB")])
@@ -205,7 +205,7 @@ def test_step0_new_splits_url_is_used(tmp_path):
         d.mkdir()
         write_individual_list(d / "half_A.txt", a)
         write_individual_list(d / "half_B.txt", b)
-    dl = script("download_haplograph")
+    dl = script("1_download_haplograph")
     common = ["--workdir", str(tmp_path / "wd"), "--chroms", "chr21", "--no-verify"]
     dl.main(common + ["--splits-url", (tmp_path / "A").as_uri()])
     dl.main(common + ["--splits-url", (tmp_path / "B").as_uri()])

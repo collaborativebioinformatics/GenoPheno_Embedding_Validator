@@ -1,21 +1,21 @@
 """
-Step 0b - download GWAS hits for one trait, for the gwas_enrichment task of step 5.
+Step 5 - download GWAS hits for one trait, for the gwas_enrichment task of step 6.
 
 Downloads the NHGRI-EBI GWAS Catalog (all associations, ontology-annotated, about 75 MB zipped,
 cached in <workdir>/gwas/catalog/), keeps the associations of one trait (--trait regular expression on the trait
 names, --trait-id ontology IDs, or both: the union) and writes one row per variant (lowest p-value).
 Catalog positions are GRCh38, the same build as the haplograph regions. The catalog lists reported
-hits only (p < 1e-5), so step 5 compares hits per haploblock with the haploblock's length.
+hits only (p < 1e-5), so step 6 compares hits per haploblock with the haploblock's length.
 
 OUTPUT (in --workdir, default haplograph/)
   gwas/<label>.tsv     CHR, POS, SNP, P, PUBMEDID   (one row per chromosome position)
   gwas/<label>.json    source, catalog file sha1, filter, row counts
 
 USAGE
-  python download_gwas.py --trait "^body height$" --label height     # trait name (regular expression)
-  python download_gwas.py --trait-id OBA_VT0001253 --label height_id   # by ontology ID (+ multi-trait rows)
-  python download_gwas.py --test                                    # synthetic catalog, no network
-  python 5_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --gwas haplograph/gwas/height.tsv
+  python 5_download_gwas.py --trait "^body height$" --label height     # trait name (regular expression)
+  python 5_download_gwas.py --trait-id OBA_VT0001253 --label height_id   # by ontology ID (+ multi-trait rows)
+  python 5_download_gwas.py --test                                    # synthetic catalog, no network
+  python 6_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --gwas haplograph/gwas/height.tsv
 """
 import argparse
 import hashlib
@@ -110,7 +110,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     if args.test:
-        args.workdir = str(test_workdir("download_gwas"))
+        args.workdir = str(test_workdir("5_download_gwas"))
         args.catalog = str(Path(args.workdir) / "catalog.zip")
         args.trait_id, args.trait, args.label = "EFO_0000001", None, "synthetic"
         make_test_catalog(args.catalog)

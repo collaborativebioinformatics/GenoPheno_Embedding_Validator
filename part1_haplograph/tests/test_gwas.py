@@ -1,5 +1,5 @@
 """
-GWAS step: download_gwas.py (catalog filtering) and gwas_enrichment in step 5.
+GWAS step: 5_download_gwas.py (catalog filtering) and gwas_enrichment in step 6.
 Run:  python -m pytest part1_haplograph/tests -q
 """
 import json
@@ -9,7 +9,7 @@ import pandas as pd
 
 from conftest import run_validate, script
 
-download_gwas = script("download_gwas")
+download_gwas = script("5_download_gwas")
 COLS = download_gwas.COLS
 
 
@@ -63,7 +63,7 @@ def test_planted_loci_are_found_and_clumping_merges_them(pipeline, tmp_path):
     """10 hits ~1.8 kb apart inside one haploblock: as independent loci (clump=500) that haploblock is
     the top enriched one and the rotation null sees the cluster; at the default clump (25 kb) they are
     one locus and nothing is called."""
-    tsv, region = script("5_validate_evo2").planted_gwas(pipeline["G"], tmp_path)
+    tsv, region = script("6_validate_evo2").planted_gwas(pipeline["G"], tmp_path)
     _, tasks = run_validate(["--model", pipeline["model"], "--graph-dir", pipeline["G"],
                              "--task", f"gwas_enrichment gwas={tsv} clump=500 permutations=50"], tmp_path / "v")
     s = tasks["gwas_enrichment"]["summary"]
@@ -76,4 +76,4 @@ def test_planted_loci_are_found_and_clumping_merges_them(pipeline, tmp_path):
 def test_missing_gwas_file_names_the_download_step(pipeline, tmp_path):
     _, tasks = run_validate(["--model", pipeline["model"], "--graph-dir", pipeline["G"],
                              "--task", "gwas_enrichment gwas=no/such/file.tsv"], tmp_path / "v")
-    assert "download_gwas.py" in tasks["gwas_enrichment"].get("error", "")
+    assert "5_download_gwas.py" in tasks["gwas_enrichment"].get("error", "")

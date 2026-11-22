@@ -19,7 +19,7 @@ def _tiny_graph(path, starts):
 
 
 def test_pos_freqs_encoding_unique_on_chr21_like_graph(tmp_path):
-    """Guard (passes): steps 4 and 5 rely on the default encoding telling regions apart, including
+    """Guard (passes): steps 4 and 6 rely on the default encoding telling regions apart, including
     regions whose starts differ by a multiple of the shortest (10 kb) wavelength."""
     from evo2_model import GenomeData
     starts = [14_000_000, 14_010_000, 14_020_000, 30_000_000, 46_000_000]

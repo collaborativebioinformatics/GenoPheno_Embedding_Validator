@@ -1,5 +1,5 @@
 """
-Spec-test regressions (round 2) for gwas_enrichment in step 5: calibration and edge cases.
+Spec-test regressions (round 2) for gwas_enrichment in step 6: calibration and edge cases.
 Each test guards a confirmed issue and passes once it is fixed. Synthetic regions, no network.
 Run:  python -m pytest part1_haplograph/tests -q
 """
@@ -12,7 +12,7 @@ import pytest
 
 from conftest import script
 
-V = script("5_validate_evo2")
+V = script("6_validate_evo2")
 
 
 class Ctx:
