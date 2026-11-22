@@ -1,0 +1,85 @@
+# Part 1 improvement plan (post-hackathon)
+
+Plan produced with the hackathon-brainstorm workflow, starting from the existing part 1 pipeline
+(steps 0-5, see [../DOCUMENTATION.md](../DOCUMENTATION.md)). It is updated after each improvement
+iteration; implemented items are marked **[done]**.
+
+## Introduction
+
+Haploblock clusters discretize the genome into a vocabulary of inherited haplotype states, and the
+1000 Genomes haplograph records how these states co-occur across 2,548 individuals. Part 1 asks
+whether graph embeddings of these states, fed to the DNA foundation model Evo 2 in place of
+nucleotide tokens, let Evo 2 learn haplotype structure that generalizes to individuals it has never
+seen. The core question is therefore one of held-out generalization, not of fit on the training
+half. The first chr21 runs show why this is hard: the median cluster is carried by one person, 97%
+of nodes have no edge, 61,892 clusters occur only in the test half, and a simple bigram baseline
+already predicts the next cluster 41% of the time. The improvements below make the evaluation
+honest before any expensive GPU run: a held-out test of the embeddings themselves, uncertainty
+estimates, and an information-theoretic reference for next-cluster prediction. Information theory and
+population genetics give the interdisciplinary angle: conditional entropy measures how predictable the next state is from the current one, and replication of linkage (co-occurrence) in independent individuals is the classic test
+of a real LD signal. The data is the public haplograph and the BH_26 split; nothing else is needed.
+The deliverable is a validation report per fine-tuned model that says, with confidence intervals,
+whether it beats simple baselines on the test half. Known risks: the Evo 2 and BioNeMo paths have
+not yet run on a GPU, and the rare-cluster vocabulary may need collapsing (iteration 2) before
+next-cluster prediction is a well-posed task.
+
+## Hypotheses (scored)
+
+| # | Hypothesis | Verdict |
+|---|---|---|
+| H1 | Embeddings learned on train individuals predict cluster co-occurrence in the test individuals | Pursue (iteration 1) |
+| H2 | Model-vs-baseline claims need paired bootstrap CIs over test individuals | Pursue (iteration 1) |
+| H3 | Bigram conditional entropy on train is the reference cross-entropy a model with more context should beat | Pursue (iteration 1) |
+| H4 | Accuracy within the true next region separates haplotype knowledge from position knowledge | Pursue (iteration 1) |
+| H5 | Collapsing clusters with train support < k into one per-region rare token makes the task well-posed | Backup (iteration 2) |
+| H6 | One comparison table across embedding methods and frozen/fine-tuned models | Backup (iteration 2) |
+| H7 | One config-driven runner for steps 0-5 | Backup (iteration 2-3) |
+| H8 | Test accuracy stratified by population | Dropped for now (ancestry removed from the pipeline by design) |
+| H9 | Phenotype prediction from individual embeddings | Dropped (no real phenotypes in 1000G) |
+| H10 | Genome-wide (cross-chromosome) sequences | Dropped (memory / context) |
+
+## Pipeline changes
+
+| Stage | Change | Hypothesis |
+|---|---|---|
+| 5 `embedding_cooccurrence` **[done, iteration 1]** | New CPU-only task: AUC of embedding cosine for cluster pairs that co-occur (lift >= threshold) among TEST individuals vs distance-matched random pairs, per embedding method; pairs in different regions only | H1 |
+| 5 `test_set_performance` **[done, iteration 1]** | Paired cluster bootstrap over test individuals (95% CIs for model, bigram and their difference); region-conditioned top-1; bigram conditional entropy on train as a reference cross-entropy | H2, H3, H4 |
+| 4 / 5 | Optional rare-cluster collapsing (`--min-support`) | H5 |
+| 6 | Model comparison table | H6 |
+| runner | Config-driven `run_pipeline.py` | H7 |
+
+Review changelog: round 1 restricted H1 to pairs in different regions with a minimum test support and
+distance-matched negatives (avoids "nearby = similar" and noisy rare-cluster lift); round 2 made
+the bootstrap resample individuals (predictions within one person are correlated) and paired the
+model-baseline difference; round 3 had no substantive change, so the review stopped.
+
+## Iteration 1 results (chr21, BH_26, CPU)
+
+- `embedding_cooccurrence`, first version (41,098 pairs): XGBoost AUC 0.713, node2vec 0.546, GNN
+  0.534. The code review showed these labels mostly encoded cluster FREQUENCY (one chance co-carrier
+  of two rare clusters gives a huge lift). Corrected version (distinct pairs, >= 5 expected test
+  co-carriers, frequency-matched AUC, region-block bootstrap; 3,228 pairs, 116 positive): GNN 0.978
+  [0.960, 0.989], XGBoost 0.968 [0.957, 0.979], node2vec 0.881 [0.855, 0.906], train-lift reference
+  0.991, genomic proximity 0.618 (0.53 distance-matched), cluster frequency 0.354. For common clusters
+  all three embeddings carry linkage that replicates in unseen individuals, close to the train-lift
+  ceiling; rare clusters remain untestable this way (H5).
+- `test_set_performance` (mock backbone): bigram top-1 0.414 [0.406, 0.423]; bigram plug-in
+  conditional entropy 1.82 nats on train (a reference, not a floor: models with more context can
+  go below it). A real Evo 2 run has to beat the bigram top-1 with a CI excluding 0.
+
+## Development plan
+
+- Iteration 1: H1-H4 in step 5 (no GPU needed), tested on synthetic data and chr21.
+- Iteration 2: H5 and H6, re-brainstormed against the iteration-1 results.
+- Iteration 3: H7 and whatever iteration 2's review leaves open.
+
+## Testing steps
+
+- Every script: `--test` (synthetic haplograph, CPU, seconds).
+- `embedding_cooccurrence`: on the synthetic graph (no positional linkage) genomic proximity must stay
+  near AUC 0.5 and the train-lift reference well above it; GNN / XGBoost should approach that
+  reference (node2vec is weak there under the tiny self-test walk budget, so it is not asserted). The step-5
+  `--test` asserts these properties. On chr21, compare methods.
+- `test_set_performance`: the CIs must contain the point estimates; with `--splits none` the
+  model's stored validation accuracy must still be reproduced exactly.
+- End to end: the real chr21 run of DOCUMENTATION.md section 11.2.

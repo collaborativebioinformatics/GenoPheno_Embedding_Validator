@@ -9,10 +9,13 @@ model_info
 #    accuracy vs the training individuals and a bigram baseline (needs the step-4 backbone: GPU for Evo 2)
 test_set_performance max_examples=500 train_examples=200
 
-# 2. train vs test consistency of the haploblock clusters (data-level)
+# 2. the step-3 embeddings alone (no GPU): do they predict cluster co-occurrence in the test individuals?
+embedding_cooccurrence min_lift=2 min_support=5 min_expected=5 pairs=50000
+
+# 3. train vs test consistency of the haploblock clusters (data-level)
 cluster_consistency min_carriers=1 permutations=200
 
-# 3. GWAS enrichment of haploblocks (data-level); positions must use the same genome build
+# 4. GWAS enrichment of haploblocks (data-level); positions must use the same genome build
 #    as the haploblock regions. Add one line per trait or threshold.
 # gwas_enrichment gwas=Yengo.2022.height.GWAS.ALL.gz pvalue=5e-8 label=height
 # gwas_enrichment gwas=gwas_catalog_height.tsv pvalue=5e-8 window=10000 label=height_catalog

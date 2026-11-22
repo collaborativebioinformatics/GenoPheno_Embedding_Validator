@@ -42,12 +42,14 @@ import gzip
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 
 import numpy as np
 
 from haplo_common import (ALL_CHROMS, BASE_URL, BH26_SPLITS, die, download, log, make_synthetic_haplograph,
-                          parse_chroms, read_individual_list, set_id, test_workdir, write_individual_list)
+                          parse_chroms, read_individual_list, set_id, test_workdir, url_cache_path,
+                          write_individual_list)
 
 EDGE_FILES = {"all": ["edges.csv.gz"], "lift5": ["edges_lift_above_threshold.csv.gz"],
               "both": ["edges.csv.gz", "edges_lift_above_threshold.csv.gz"]}
@@ -139,8 +141,12 @@ def make_split(args, individuals):
     present = set(individuals)
     info = {"split": args.split, "n_haplograph_individuals": len(individuals)}
     if args.split == "bh26":
-        a = read_individual_list(download(f"{args.splits_url}/half_A.txt", splits / "half_A.txt"))
-        b = read_individual_list(download(f"{args.splits_url}/half_B.txt", splits / "half_B.txt"))
+        halves = []
+        for name in ("half_A.txt", "half_B.txt"):      # cached per URL; the copy in splits/ is always current
+            url = f"{args.splits_url.rstrip('/')}/{name}"
+            shutil.copyfile(download(url, url_cache_path(url, splits)), splits / name)
+            halves.append(read_individual_list(splits / name))
+        a, b = halves
         overlap = set(a) & set(b)
         if overlap:
             die(f"the BH_26 halves overlap ({len(overlap)} IDs, e.g. {sorted(overlap)[:3]})")

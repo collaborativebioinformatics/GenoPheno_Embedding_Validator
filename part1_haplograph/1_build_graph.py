@@ -78,6 +78,7 @@ REQUIRES  numpy, pandas, scipy.  Run download_haplograph.py first.
           and matching nodes/edges) on the GPU; add --chunksize 0 so the edge files are parsed on the GPU too
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -105,6 +106,13 @@ from haplo_common import (ALL_CHROMS, REGION_RE, chrom_key, die, load_sample_map
 
 OUTPUTS = ("nodes.csv.gz", "individuals.txt", "carriers.npz", "graph.npz", "graph_info.json")
 EDGE_FILE = {"all": "edges.csv.gz", "lift5": "edges_lift_above_threshold.csv.gz"}
+
+
+def file_stamp(path):
+    """Short id of a raw file (absolute path, size, modification time): caches built from another raw
+    folder or an older download are never reused."""
+    st = os.stat(path)
+    return hashlib.sha1(f"{os.path.realpath(path)}|{st.st_size}|{st.st_mtime_ns}".encode()).hexdigest()[:8]
 
 
 def raw_file(args, chrom, name):
@@ -161,10 +169,15 @@ def read_nodes(nodes_path, chunksize=20_000):
     dtypes = {c: np.uint8 for c in inds}
     dtypes.update({"id": str, "high_dim_edge": str})
     ids, regions, blocks = [], [], []
-    for chunk in pd.read_csv(nodes_path, dtype=dtypes, chunksize=chunksize):
-        ids.append(chunk["id"].to_numpy())
-        regions.append(chunk["high_dim_edge"].to_numpy())
-        blocks.append(sp.csr_matrix(chunk[inds].to_numpy(dtype=np.uint8)))
+    try:
+        for chunk in pd.read_csv(nodes_path, dtype=dtypes, chunksize=chunksize):
+            ids.append(chunk["id"].to_numpy())
+            regions.append(chunk["high_dim_edge"].to_numpy())
+            blocks.append(sp.csr_matrix(chunk[inds].to_numpy(dtype=np.uint8)))
+    except (EOFError, OSError, ValueError) as e:
+        die(f"{nodes_path} is truncated or malformed ({type(e).__name__}: {e}); delete it and download it again")
+    if any(b.nnz and b.data.max() > 1 for b in blocks):
+        die(f"{nodes_path}: carrier values must be 0 or 1")
     ids = np.concatenate(ids)
     if len(pd.unique(ids)) != len(ids):
         die(f"{nodes_path}: duplicate cluster ids")
@@ -205,19 +218,20 @@ def chrom_part(args, chrom, train_names=None, train_tag=""):
     d = os.path.join(args.workdir, "parts", chrom)
     os.makedirs(d, exist_ok=True)
     edges_name = EDGE_FILE[args.edges]
+    nodes_raw, edges_raw = raw_file(args, chrom, "nodes.csv.gz"), raw_file(args, chrom, edges_name)
     f_meta, f_car = os.path.join(d, "nodes.npz"), os.path.join(d, "carriers.npz")
     tag = f"_train-{train_tag}" if train_tag else ""
-    f_edges = os.path.join(d, f"edges_{args.edges}_minlift{args.min_lift:g}{tag}.npz")
+    f_edges = os.path.join(d, f"edges_{args.edges}_minlift{args.min_lift:g}{tag}_{file_stamp(edges_raw)}.npz")
 
-    if not args.force and os.path.exists(f_meta) and os.path.exists(f_car):
-        meta = np.load(f_meta)
+    meta = np.load(f_meta) if os.path.exists(f_meta) and os.path.exists(f_car) else None
+    if not args.force and meta is not None and str(meta.get("source", "")) == file_stamp(nodes_raw):
         ids, regions, inds = meta["ids"], meta["regions"], meta["individuals"].tolist()
         carriers = sp.load_npz(f_car).tocsr()
     else:
-        ids, regions, carriers, inds = read_nodes(raw_file(args, chrom, "nodes.csv.gz"))
+        ids, regions, carriers, inds = read_nodes(nodes_raw)
         sp.save_npz(f_car, carriers)
         np.savez(f_meta, ids=ids.astype(str), regions=regions.astype(str),
-                 individuals=np.array(inds, dtype=str))
+                 individuals=np.array(inds, dtype=str), source=np.array(file_stamp(nodes_raw)))
 
     if train_names is not None:
         cols = [j for j, c in enumerate(inds) if c in train_names]
@@ -236,7 +250,7 @@ def chrom_part(args, chrom, train_names=None, train_tag=""):
         status = "cached"
     else:
         packed = pack_rows(C_train) if train_names is not None else None
-        s, t, lift, n_read, n_unk = read_edges(raw_file(args, chrom, edges_name), ids, support,
+        s, t, lift, n_read, n_unk = read_edges(edges_raw, ids, support,
                                               n_used, args.min_lift, args.chunksize, packed)
         np.savez(f_edges, s=s, t=t, lift=lift)
         status = f"{len(s):,}/{n_read:,} edge rows kept" + (f", {n_unk:,} with unknown ids" if n_unk else "")
@@ -258,7 +272,8 @@ def build(args):
         train_tag = set_id(train_names)
         log(f"train-only mode: {len(raw):,} training individuals from {args.train_individuals}")
         if args.test_individuals:
-            test_names = {to_graph.get(x, x) for x in read_individual_list(args.test_individuals)}
+            test_names = {to_graph.get(x, x) for x in read_individual_list(args.test_individuals,
+                                                                          os.path.join(args.workdir, "splits"))}
             overlap = train_names & test_names
             if overlap:
                 die(f"{len(overlap):,} individuals are in both the train and the test set (e.g. {sorted(overlap)[:3]})")

@@ -46,7 +46,7 @@ USAGE
 
   --mock-evo2 replaces Evo 2 by a small random stand-in model (CPU check of the script only).
 
-REQUIRES  numpy, pandas, torch, evo2 (pip install evo2; Linux, CUDA 12.1+, Python 3.11/3.12;
+REQUIRES  numpy, pandas, torch, evo2 (pip install evo2; Linux, CUDA 12.8+ and driver >= 570 (install_evo2.sh), Python 3.11/3.12;
           the 7B models run in bf16 without Transformer Engine; an 80 GB GPU is recommended).
 
 NOTE  The official Evo 2 training paths are Savanna and NVIDIA BioNeMo. This script uses the `evo2`

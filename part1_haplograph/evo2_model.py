@@ -527,11 +527,15 @@ def load_finetuned(meta, graph_dir, device=None, ckpt_dir=None):
     cfg = meta.get("config", {})
     backend = meta.get("backend", "evo2")
     data = GenomeData(graph_dir, meta["graph_method"], meta.get("chroms"))
+    from haplo_common import graph_id
+    if meta.get("graph_id") and meta["graph_id"] != graph_id(graph_dir):
+        raise ValueError(f"the model was trained on another build of this graph (graph_id {meta['graph_id']}, "
+                         f"now {graph_id(graph_dir)}); rerun steps 3-4 on the current graph")
     if meta.get("embeddings_sha1") and meta["embeddings_sha1"] != data.emb_sha1:
-        log(f"  WARNING: node_emb_{meta['graph_method']}.npy changed since the model was trained "
-            "(different checksum); results may be meaningless")
+        raise ValueError(f"node_emb_{meta['graph_method']}.npy changed since the model was trained (different "
+                         "checksum); rerun step 4 on the current embeddings")
     if data.n_chrom_slots != meta.get("n_chrom_slots", data.n_chrom_slots):
-        die("this graph has a different set of chromosomes than the one the model was trained on")
+        raise ValueError("this graph has a different set of chromosomes than the one the model was trained on")
     a = argparse.Namespace(
         bionemo=backend == "bionemo", mock_evo2=backend == "mock", seed=cfg.get("seed", 0), device=device,
         evo2_model=meta.get("evo2_model", "evo2_7b_base"), layer=meta.get("layer", "blocks.28.mlp.l3"),
@@ -626,15 +630,16 @@ def fit(args, blocks, new_modules, n_examples, example_loss, evaluate, describe,
         die("no training examples")
     for epoch in range(args.epochs):
         order = rng.permutation(n_examples)
-        for b in range(0, n_examples - batch + 1, batch):
+        for b in range(0, n_examples, batch):            # the last batch may be smaller
             opt.zero_grad()
             for p in blocks:
                 p.grad = None
+            chunk = order[b:b + batch]
             batch_loss = 0.0
-            for j in order[b:b + batch]:                  # gradient accumulation over the batch
+            for j in chunk:                               # gradient accumulation over the batch
                 loss = example_loss(int(j))
-                (loss / batch).backward()
-                batch_loss += loss.item() / batch
+                (loss / len(chunk)).backward()
+                batch_loss += loss.item() / len(chunk)
             if not np.isfinite(batch_loss):
                 die(f"loss became {batch_loss} at step {step}; lower --lr / --head-lr")
             if step == 0:

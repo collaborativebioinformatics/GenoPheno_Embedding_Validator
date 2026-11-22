@@ -57,7 +57,7 @@ USAGE
   python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir $G --mock-evo2          # CPU check
   python 4a_finetune_evo2_embeddings.py --test                                           # synthetic, CPU
 
-REQUIRES  numpy, pandas, scipy, torch; evo2 (default: Linux, CUDA 12.1+, Python 3.11/3.12, an
+REQUIRES  numpy, pandas, scipy, torch; evo2 (default: Linux, CUDA 12.8+ and driver >= 570 (install_evo2.sh), Python 3.11/3.12, an
           80 GB GPU recommended for 7B) or the BioNeMo container (--bionemo).
 
 NOTE  The official Evo 2 training paths are Savanna and NVIDIA BioNeMo. The default backbone uses

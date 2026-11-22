@@ -119,7 +119,7 @@ pip install evo2
 
 Optional: `pip install cudf-cu12` (RAPIDS cuDF) enables `--cudf` in steps 1 and 5, which reads and processes their tables on the GPU. In step 1, add `--chunksize 0` so the edge files are also parsed on the GPU.
 
-> The core packages are also listed in [`part1_haplograph/requirements.txt`](part1_haplograph/requirements.txt), and [`part1_haplograph/install_evo2.sh`](part1_haplograph/install_evo2.sh) installs Evo 2 on a GPU machine. CPU-only, RAPIDS and BioNeMo setups are in [DOCUMENTATION.md](DOCUMENTATION.md).
+> The core packages are also listed in [`part1_haplograph/requirements.txt`](part1_haplograph/requirements.txt), and [`part1_haplograph/install_evo2.sh`](part1_haplograph/install_evo2.sh) installs Evo 2 on a GPU machine. CPU-only, RAPIDS and BioNeMo setups are in [DOCUMENTATION.md](DOCUMENTATION.md). `install_evo2.sh` installs the CUDA 12.8 toolkit, which needs an NVIDIA driver ≥ 570.
 
 ## Usage
 

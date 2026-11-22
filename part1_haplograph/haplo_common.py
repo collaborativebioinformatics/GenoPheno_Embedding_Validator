@@ -137,13 +137,25 @@ def read_graph_individuals(graph_dir):
 def train_columns(args, individuals):
     """Training individuals as column indices into individuals.txt / carriers.npz.
     Source: --train-individuals if given, else the graph's train_individuals.txt (written by
-    1_build_graph.py), else every individual. Returns (indices, source description, set id)."""
+    1_build_graph.py), else every individual. It must be the set the graph was built from (so the
+    test individuals can never enter training). Returns (indices, source description, set id)."""
     src = getattr(args, "train_individuals", None)
     default = Path(args.graph_dir) / "train_individuals.txt"
     if not src and default.exists():
         src = str(default)
     if not src:
-        return np.arange(len(individuals)), "all individuals", "all"
+        idx, src, sid = np.arange(len(individuals)), "all individuals", "all"
+    else:
+        idx, sid = _train_idx(args, src, individuals)
+    info = Path(args.graph_dir) / "graph_info.json"
+    graph_sid = json.loads(info.read_text()).get("train_set_id", "all") if info.exists() else sid
+    if sid != graph_sid:
+        die(f"the training set {sid} ({src}) is not the one the graph was built from ({graph_sid}): every step "
+            "must train on the graph's train_individuals.txt; rebuild the graph with step 1 to use another set")
+    return idx, src, sid
+
+
+def _train_idx(args, src, individuals):
     raw = read_individual_list(src, args.graph_dir)
     to_graph = load_sample_map(args.sample_map) if getattr(args, "sample_map", None) else {}
     names = {to_graph.get(x, x) for x in raw}
@@ -154,7 +166,7 @@ def train_columns(args, individuals):
             f"graph's individuals (e.g. {individuals[:2]}); pass --sample-map")
     if len(idx) < len(names):
         log(f"  warning: {len(names) - len(idx):,} training IDs from {src} are not in the graph, ignored")
-    return idx, src, set_id(individuals[i] for i in idx)
+    return idx, set_id(individuals[i] for i in idx)
 
 
 def graph_id(graph_dir):

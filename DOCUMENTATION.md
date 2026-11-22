@@ -74,7 +74,7 @@ haplograph/
 │   ├── split.json                     split name, source, sizes, set ids
 │   └── half_A.txt, half_B.txt         (BH_26 originals)
 ├── parts/                             per-chromosome cache (step 1), reused across graphs
-│   └── chr1/ nodes.npz, carriers.npz, edges_all_minlift2_train-<id>.npz
+│   └── chr1/ nodes.npz, carriers.npz, edges_all_minlift2_train-<id>_<raw file id>.npz   (re-parsed when the raw file changes)
 └── genome_train_half_A/               one GRAPH FOLDER  (= --graph-dir for steps 3-5)
     ├── nodes.csv.gz, individuals.txt, carriers.npz, graph.npz, graph_info.json    step 1
     ├── train_individuals.txt, test_individuals.txt                                step 1
@@ -87,7 +87,7 @@ haplograph/
         ├── cluster_consistency_regions.csv.gz
         ├── gwas_enrichment_<label>_regions.csv.gz
         ├── nemotron_summary.md                  (--nemotron-summary)
-        └── inputs/                              split files downloaded by step 5
+        └── inputs/downloads/<URL hash>/         split files downloaded by step 5
 ```
 
 Graph folder names: `genome` (all 22 chromosomes) or e.g. `chr21_chr22` (a selection), plus `_train_<split name>` (`half_A` for BH_26, e.g. `random50_seed0` for a random split, or the stem of a `--train-individuals` file). Step 4b writes its model next to its input TSV.
@@ -225,6 +225,7 @@ Validates one fine-tuned model on the test set. By default it uses the graph fol
 ```
 model_info
 test_set_performance max_examples=500 train_examples=200
+embedding_cooccurrence min_lift=2 min_support=5 min_expected=5 pairs=50000
 cluster_consistency permutations=200
 gwas_enrichment gwas=height_hg38.tsv pvalue=5e-8 label=height
 ```
@@ -232,7 +233,8 @@ gwas_enrichment gwas=height_hg38.tsv pvalue=5e-8 label=height
 | Task | Checks |
 |---|---|
 | `model_info` | model type and backbone, stored metrics, train/test leakage |
-| `test_set_performance` | **queries the fine-tuned model** on the test individuals: next-cluster cross-entropy, perplexity, top-1 / top-5 accuracy per chromosome; the same on a sample of training individuals (generalization gap); a bigram baseline (most frequent next cluster after the current one, counted on the training individuals) that the model should beat; the stored validation metrics. Needs the backbone used in step 4 (a GPU for Evo 2 / BioNeMo) |
+| `test_set_performance` | **queries the fine-tuned model** on the test individuals: next-cluster cross-entropy, perplexity, top-1 / top-5 accuracy per chromosome, top-1 within the target's own region; 95% CIs from a paired bootstrap over test individuals (model, bigram, model − bigram); the bigram conditional entropy of the training sequences as a reference cross-entropy (not a floor: a model with more context can go below it); the same on a sample of training individuals (generalization gap); a bigram baseline (most frequent next cluster after the current one, counted on the training individuals) that the model should beat; the stored validation metrics. Needs the backbone used in step 4 (a GPU for Evo 2 / BioNeMo) |
+| `embedding_cooccurrence` | **held-out test of the step-3 embeddings, no GPU**: for distinct cluster pairs in different regions (≤ `max_distance` bp apart, ≥ `min_support` test carriers each, ≥ `min_expected` co-carriers expected among the test individuals, so that one chance co-carrier of two rare clusters can't make a pair "linked"), ROC AUC of embedding cosine similarity for pairs that co-occur among the TEST individuals (lift ≥ `min_lift`) vs pairs that don't (lift ≤ 1); overall, within distance bins and within frequency bins, with a 95% CI that resamples haploblock regions; references: genomic proximity, cluster frequency, and the lift counted on the training individuals. Warns when the graph was built with test individuals |
 | `cluster_consistency` | per haploblock: do train and test individuals carry the same clusters, at the same frequencies, compared with random splits of the same size? |
 | `gwas_enrichment` | which haploblocks hold more GWAS hits than expected (positions must use the haplograph's genome build) |
 
@@ -242,7 +244,7 @@ gwas_enrichment gwas=height_hg38.tsv pvalue=5e-8 label=height
 | Option | Default | Meaning |
 |---|---|---|
 | `--model` | required | fine-tuned model |
-| `--tasks` / `--task` | `model_info` + `test_set_performance` + `cluster_consistency` | tasks file / one task line |
+| `--tasks` / `--task` | `model_info` + `test_set_performance` + `embedding_cooccurrence` + `cluster_consistency` | tasks file / one task line |
 | `--gwas` | none | shortcut adding a `gwas_enrichment` line |
 | `--splits` | `graph` | `graph`, a folder or URL with `half_A.txt` / `half_B.txt`, or `none` |
 | `--plugins` | none | Python file(s) with extra tasks |
@@ -263,7 +265,7 @@ The pipeline is designed so the test individuals never influence anything that i
 | 4 | the individuals trained and validated on | none |
 | 5 | (checks this, then evaluates on the test individuals) | |
 
-Each step stores the training set's id and the graph build's id and the next step checks them: step 4 stops if the embeddings came from another training set or graph build, and step 3 recomputes automatically if either changed. To use a different split, rerun step 0 with other `--split` settings (or give step 1 another `--train-individuals` file); step 1 then creates a new graph folder.
+Each step stores the training set's id and the graph build's id and the next step checks them: steps 3 and 4 refuse any training set other than the graph's own; step 4 stops if the embeddings came from another training set or graph build; step 3 recomputes automatically if the graph, training set or its settings changed; step 5 fails `test_set_performance` for a model trained on another graph build or other embeddings, and `embedding_cooccurrence` marks embeddings made from another training set as not held-out. Step 5 only loads checkpoints with `torch.load(weights_only=True)`, so a model file can't run code. To use a different split, rerun step 0 with other `--split` settings (or give step 1 another `--train-individuals` file); step 1 then creates a new graph folder.
 
 ## 6. GPU acceleration: RAPIDS, CuPy, BioNeMo, Nemotron
 
@@ -279,7 +281,7 @@ The pipeline detects the GPU itself (torch and XGBoost use CUDA when available; 
 
 **RAPIDS in step 3, honestly.** Step 3 is CPU/RAM-bound, not GPU-bound, so `--rapids` is not a large speedup: the dominant cost is the CPU-side chunked embedding of all ~11M genome-wide nodes, which `--rapids` does not change. It only accelerates the two SVDs; tree fitting uses XGBoost's own GPU path, the rest is numpy. The carrier SVD is fitted on a `--rapids-fit-rows` sample (default 150k) and applied in `--rapids-chunk` dense chunks (default 200k). The sampling is an approximation: on the genome run (with the former ancestry target) it gave val-accuracy 0.986 vs 0.992/0.993 for the exact CPU SVD. Raise `--rapids-fit-rows` (e.g. 300000) to close that gap; the carrier matrix has only ~1,250 training columns, so a larger sample is cheap. The cached features are stored separately for `--rapids` (`features_svd*_rapids.npy`), so the CPU and GPU SVDs never mix.
 
-**Nemotron.** `--nemotron-summary` sends the task summaries of the report to an NVIDIA Nemotron model on an OpenAI-compatible NIM endpoint and writes the answer to `nemotron_summary.md`. Only aggregate numbers are sent: sample IDs (`HG…`/`NA…`) and file paths are removed first. Defaults: `--nemotron-url https://integrate.api.nvidia.com/v1` (build.nvidia.com; or a self-hosted NIM) and `--nemotron-model nvidia/llama-3.3-nemotron-super-49b-v1` (change it if the catalogue has moved on). The API key is read from `$NVIDIA_API_KEY`. Without a key, or if the request fails, step 5 prints a warning and still writes its report.
+**Nemotron.** `--nemotron-summary` sends the task summaries of the report to an NVIDIA Nemotron model on an OpenAI-compatible NIM endpoint and writes the answer to `nemotron_summary.md`. Only aggregate numbers are sent: sample IDs (`HG…`/`NA…` and the graph's own individual names) and the directories of file paths are removed, and file names and GWAS column names are dropped. The key is only sent over https (or to localhost), and redirects are not followed. Defaults: `--nemotron-url https://integrate.api.nvidia.com/v1` (build.nvidia.com; or a self-hosted NIM) and `--nemotron-model nvidia/llama-3.3-nemotron-super-49b-v1` (change it if the catalogue has moved on). The API key is read from `$NVIDIA_API_KEY`. Without a key, or if the request fails, step 5 prints a warning and still writes its report.
 
 ## 7. Extending the pipeline
 
@@ -333,6 +335,7 @@ Earlier versions of this document described LoRA adapters, `--micro-batch` and a
   - Training sequences are per chromosome; there's no genome-wide sequence per person.
 - **Most nodes are rare and isolated.** On chr21, 97% of the nodes have no edge at `--min-lift 2` (the dataset lists edges only for clusters with support ≥ 25), so node2vec and the GNN learn little for them beyond their carrier features.
 - **XGBoost predicts the haploblock region.** On chr21 it reached only 0.070 accuracy on 16 region bins against a 0.066 majority baseline: the carrier profile of a rare cluster says little about where it is. The XGBoost embeddings may therefore carry little signal; compare them with node2vec and GNN in step 5.
+- **Embeddings on held-out individuals (chr21).** `embedding_cooccurrence` (pairs with ≥ 5 expected test co-carriers) gave AUC 0.978 for GNN, 0.968 for XGBoost and 0.881 for node2vec (reduced CPU settings), against 0.991 for the lift counted on the training individuals, 0.618 for genomic proximity and 0.354 for cluster frequency: for common clusters, all three embeddings carry linkage that replicates in unseen individuals. Rare clusters (most nodes) cannot be tested this way.
 - **Clusters only seen in the test set** have embeddings, but the model never trained on them; step 5 counts them (61,892 on chr21).
 
 ### Data and leakage
@@ -401,7 +404,7 @@ bash install_evo2.sh rtx                 # or force RTX PRO 6000 Blackwell (sm_1
 source ~/evo2-env/bin/activate
 ```
 
-Options as environment variables: `PYTHON=python3.11`, `VENV=...`, `EVO2_SRC=...`, `MAX_JOBS=8` (faster flash-attn compile), `SKIP_CUDA_TOOLKIT=1`, `SKIP_EVO2_TEST=1` (the test downloads the 7B weights, ~15 GB). Requirements: Linux, Python 3.11 or 3.12, NVIDIA driver for CUDA 12.8 (≥ 570), an 80 GB GPU recommended for 7B. Manual equivalent:
+Options as environment variables: `PYTHON=python3.11`, `VENV=...`, `EVO2_SRC=...`, `EVO2_REF=<tag>` (pin the evo2 version; default `main`), `MAX_JOBS=8` (faster flash-attn compile), `SKIP_CUDA_TOOLKIT=1`, `SKIP_EVO2_TEST=1` (the test generates with `evo2_7b_base`, downloading its weights, ~15 GB). Requirements: Linux, Python 3.11 or 3.12, NVIDIA driver for CUDA 12.8 (≥ 570), an 80 GB GPU recommended for 7B. Manual equivalent:
 
 ```bash
 pip install numpy pandas scipy torch xgboost

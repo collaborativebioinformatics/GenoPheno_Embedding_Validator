@@ -51,8 +51,8 @@ OUTPUT (in --graph-dir)
                               (train_source, n_train, train_set_id)
   node_emb_<method>.csv.gz    (with --csv) gzipped CSV: id, chrom, e0 ... e<dim-1>
   features_svd<k>_<set id>_<graph id>[_rapids].npy  cached SVD carrier features [N, k] (gnn, xgboost)
-  Existing outputs are reused only if they were made from the same graph build (graph_info.json)
-  and training set; otherwise they are recomputed.
+  Existing outputs are reused only if they were made from the same graph build (graph_info.json),
+  training set and result-affecting settings; otherwise they are recomputed.
 
 USAGE
   python 3_node_embeddings.py --graph-dir haplograph/genome_train_half_A            # all three
@@ -65,6 +65,7 @@ REQUIRES  numpy, pandas, scipy; torch (node2vec, gnn); xgboost (xgboost);
           cuml + cupy (only for --rapids, see DOCUMENTATION.md). Run 1_build_graph.py first.
 """
 import argparse
+import hashlib
 import json
 import os
 import time
@@ -135,8 +136,8 @@ def svd_basis(M, k, seed, rapids):
 
 def carrier_features(args):
     """SVD-compressed, standardized carrier profiles of the TRAINING individuals [N, svd_dim] (cached)."""
-    tag = "_rapids" if args.rapids else ""
-    f = gfile(args, f"features_svd{args.svd_dim}_{args.train_id}_{args.graph_id}{tag}.npy")
+    tag = f"_rapids{args.rapids_fit_rows}" if args.rapids else ""
+    f = gfile(args, f"features_svd{args.svd_dim}_{args.train_id}_{args.graph_id}_s{args.seed}{tag}.npy")
     if os.path.exists(f) and not args.force:
         return np.load(f)
     C = sp.load_npz(gfile(args, "carriers.npz")).tocsc()[:, args.train_idx].tocsr().astype(np.float32)
@@ -453,15 +454,27 @@ def embed_xgboost(args, A):
 
 # ---------------------------------------------------------------------------
 
+NOT_RESULT_SETTINGS = ("force", "csv", "train_idx", "test", "device", "method", "graph_dir", "train_src",
+                       "train_individuals", "sample_map", "graph_id", "train_id")
+
+
+def settings_id(args):
+    """Id of every setting that can change the embeddings (not where or on which device they run)."""
+    keep = {k: v for k, v in vars(args).items() if k not in NOT_RESULT_SETTINGS}
+    return hashlib.sha1(json.dumps(keep, sort_keys=True, default=str).encode()).hexdigest()[:8]
+
+
 def run_method(args, method, A):
     out = gfile(args, f"node_emb_{method}.npy")
     info_file = gfile(args, f"node_emb_{method}.json")
+    current = {"train_set_id": args.train_id, "graph_id": args.graph_id, "settings_id": settings_id(args)}
     if os.path.exists(out) and not args.force:
         old = json.load(open(info_file)) if os.path.exists(info_file) else {}
-        if old.get("train_set_id") == args.train_id and old.get("graph_id") == args.graph_id:
-            log(f"{out} already exists for this graph and training set (use --force to recompute)")
+        if all(old.get(k) == v for k, v in current.items()):
+            log(f"{out} already exists for this graph, training set and settings (use --force to recompute)")
             return
-        log(f"existing {os.path.basename(out)} was made from another graph build or training set; recomputing")
+        log(f"existing {os.path.basename(out)} was made from another graph build, training set or settings; "
+            "recomputing")
     t0 = time.time()
     log(f"[{method}] graph {args.graph_dir}: {A.shape[0]:,} nodes, {A.nnz // 2:,} edges; "
         f"training individuals: {len(args.train_idx):,} ({args.train_src})")
@@ -475,8 +488,7 @@ def run_method(args, method, A):
     with open(info_file, "w") as f:
         json.dump({"method": method, "shape": list(Z.shape), "settings": settings,
                    "train_source": args.train_src, "n_train": int(len(args.train_idx)),
-                   "train_set_id": args.train_id, "graph_id": args.graph_id,
-                   "summary": summary, "seconds": round(time.time() - t0)}, f, indent=2)
+                   **current, "summary": summary, "seconds": round(time.time() - t0)}, f, indent=2)
     if args.csv:
         nodes = pd.read_csv(gfile(args, "nodes.csv.gz"), usecols=["id", "chrom"])
         df = pd.DataFrame(Z, columns=[f"e{j}" for j in range(Z.shape[1])])

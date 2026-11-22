@@ -12,6 +12,7 @@
 #   PYTHON=python3.12        Python used for the venv (3.11 or 3.12)
 #   VENV=~/evo2-env          where the venv is created
 #   EVO2_SRC=~/evo2-src      where the evo2 repository is cloned
+#   EVO2_REF=main            evo2 git tag / commit to install (set a release tag for reproducible installs)
 #   MAX_JOBS=4               parallel compile jobs for flash-attn (more = faster, more RAM)
 #   SKIP_CUDA_TOOLKIT=1      do not apt-install the CUDA 12.8 toolkit (e.g. it is already installed)
 #   SKIP_EVO2_TEST=1         skip the final generation test (it downloads the 7B weights, ~15 GB)
@@ -22,6 +23,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="${PYTHON:-python3.12}"
 VENV="${VENV:-$HOME/evo2-env}"
 EVO2_SRC="${EVO2_SRC:-$HOME/evo2-src}"
+EVO2_REF="${EVO2_REF:-main}"
 
 fail() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -107,6 +109,8 @@ MAX_JOBS="${MAX_JOBS:-4}" pip install flash-attn==2.8.0.post2 --no-build-isolati
 # 5. Evo 2 light install (no Transformer Engine)
 # ---------------------------------------------------------------------------
 [ -d "$EVO2_SRC" ] || git clone https://github.com/arcinstitute/evo2 "$EVO2_SRC"
+git -C "$EVO2_SRC" fetch --tags --quiet && git -C "$EVO2_SRC" checkout --quiet "$EVO2_REF"
+echo ">>> evo2 at $(git -C "$EVO2_SRC" rev-parse --short HEAD) ($EVO2_REF)"
 pip install -e "$EVO2_SRC"
 
 # ---------------------------------------------------------------------------
@@ -119,7 +123,7 @@ pip install -r "$SCRIPT_DIR/requirements.txt"
 # ---------------------------------------------------------------------------
 python -c "import torch, flash_attn; print('torch', torch.__version__, '| capability', torch.cuda.get_device_capability(), '| flash-attn', flash_attn.__version__)"
 if [ "${SKIP_EVO2_TEST:-0}" != "1" ]; then
-  python -m evo2.test.test_evo2_generation --model_name evo2_7b
+  python -m evo2.test.test_evo2_generation --model_name evo2_7b_base   # the pipeline's default model
 fi
 
 echo ">>> Done. Activate later with: source $VENV/bin/activate"

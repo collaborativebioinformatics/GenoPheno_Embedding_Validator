@@ -116,3 +116,56 @@ Findings and fixes (all in part1_haplograph/):
       log, is_url, download and read_graph_individuals.
 Docs: README (own "Now:" note on the step-5 fallback) and DOCUMENTATION updated for 1, 2, 3, 5, 9.
 Tests: all six --test flags pass; targeted checks for every fix; the real chr21 pipeline rerun on CPU.
+
+Prompt 4 - Three improvement iterations on part 1 (brainstorm -> code review -> spec-tester)
+--------------------------------------------------------------------------------------------
+Request: iterate 3 times; each time run /hackathon-brainstorm on the CURRENT part 1 (not from
+scratch) and implement its suggestions, run /code-review on the modified code and apply its
+findings, then run the spec-tester agent on part 1 and fix the inconsistencies it finds. Leave
+part 2 entirely alone.
+
+Iteration 1
+  Brainstorm: 10 hypotheses scored; pursued H1 (held-out co-occurrence test of the embeddings),
+  H2 (paired bootstrap CIs over test individuals), H3 (bigram conditional entropy floor), H4
+  (region-conditioned accuracy); H5-H7 deferred to later iterations, H8-H10 dropped. Plan written to
+  part1_haplograph/IMPROVEMENT_PLAN.md and PROMPTS.md (README.md not overwritten: the skill's
+  README/requirements outputs were redirected there; no new dependencies).
+  Implemented: 5_validate_evo2.py task embedding_cooccurrence (AUC of embedding cosine for test-set
+  co-occurrence, distance-matched, references: genomic proximity and train lift); test_set_performance
+  gained paired bootstrap CIs, region-conditioned top-1 and the bigram entropy floor;
+  validation_tasks.txt and DOCUMENTATION.md updated.
+  First chr21 result: co-occurrence AUC XGBoost 0.713, node2vec 0.546, GNN 0.534 (later shown to be
+  a cluster-frequency artifact, see code review).
+  Code review (10 findings, all fixed in 5_validate_evo2.py): (1) warn when the graph used test
+  individuals (AUC not held-out); (2) distinct pairs and a bootstrap over haploblock regions instead
+  of over correlated pairs; (3) the bigram entropy is a reference, not a floor (renamed
+  bigram_reference_entropy, test_loss_minus_bigram_reference); (4) labels were dominated by cluster
+  frequency: pairs now need >= min_expected (5) expected test co-carriers, plus frequency-matched AUC
+  and a cluster-frequency reference; (5) the self-test now asserts CI coverage, region top-1 >= top-1,
+  proximity ~0.5, train lift and GNN > 0.5; (6) mismatched embedding files reported in notes; (7)
+  embedding_cooccurrence only in the default task list when embeddings exist, skips instead of
+  failing; (8) docstring outputs updated; (9) region-conditioned top-1 counts ties as misses; (10)
+  one random generator per task.
+  Corrected chr21 result (3,228 pairs, 116 positive): GNN 0.978, XGBoost 0.968, node2vec 0.881,
+  train-lift reference 0.991, proximity 0.618, cluster frequency 0.354. Bigram top-1 0.418
+  [0.410, 0.426]; bigram reference entropy 1.82 nats.
+  Spec-tester (9 findings, all fixed; 13 regression tests added in part1_haplograph/tests/, all pass):
+    1. HIGH security: step 5 fell back to torch.load(weights_only=False), so a crafted .pt ran code.
+       Now weights_only=True only; anything else is refused.
+    2. HIGH leakage: steps 3/4 accepted any --train-individuals (even the test set). train_columns now
+       refuses any set other than the graph's; embedding_cooccurrence marks embeddings from another
+       training set as not held-out; model_info also counts test individuals among val_individuals.
+    3. --gwas replaced the default step-5 tasks; it now adds to them (docstring updated).
+    4. Step 5 did not check a model's graph build / embeddings; load_finetuned now fails the task.
+    5. Step 1's per-chromosome cache ignored --raw-dir / re-downloads; now keyed by raw file
+       (path, size, mtime).
+    6. Nemotron: relative/Windows paths and non-1000G sample names leaked, the key went to any URL
+       incl. http and across redirects. Now: directories scrubbed, file-name/column fields dropped,
+       graph individual names scrubbed, https or localhost only, redirects not followed.
+    7. Step 3 reused embeddings after settings changed; outputs now record a settings id; the
+       features cache includes seed and RAPIDS sample size.
+    8. Step 0 kept old half_A/B.txt when --splits-url changed; downloads now cached per URL.
+    9. Minor: step 1 --test-individuals URL cached in the workdir (not shared /tmp); the training loop
+       no longer drops the last partial batch; clear errors for truncated/malformed nodes files,
+       non-0/1 carriers, bad task lines and permutations=0; install_evo2.sh gets EVO2_REF and tests
+       evo2_7b_base; docs: CUDA 12.8 / driver 570, cache and download paths.

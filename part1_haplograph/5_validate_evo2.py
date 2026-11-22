@@ -20,7 +20,14 @@ BUILT-IN TASKS
                            next cluster after the current one): the model should beat it,
                          - the validation metrics stored in the checkpoint before / after training.
                        Needs the same backbone as in training (a GPU for Evo 2 / BioNeMo; the
-                       mock backbone runs on CPU). Writes test_set_performance_chroms.csv.
+                       mock backbone runs on CPU). Reports 95% CIs from a paired bootstrap over
+                       test individuals (model, bigram, model - bigram), top-1 within the target's own
+                       region, and the bigram conditional entropy of the training sequences as a
+                       reference cross-entropy. Writes test_set_performance_chroms.csv.
+  embedding_cooccurrence  Held-out test of the step-3 EMBEDDINGS (no GPU): do clusters with similar
+                       embeddings co-occur (lift >= min_lift) among the TEST individuals? ROC AUC per
+                       embedding method, overall and distance-matched, against genomic proximity and
+                       train-individual lift as references. Writes embedding_cooccurrence.csv.
   cluster_consistency  Data-level internal consistency of the haploblock clusters between the train
                        and the test individuals, per haploblock region:
                          - number of distinct clusters carried in train and in test
@@ -68,7 +75,8 @@ INPUT
                             sample ID (e.g. IND1, IND2 ...): 2 columns, graph name, sample ID
                             (same file format as in steps 1-4)
   --tasks FILE              tasks file (see below); default: model_info + test_set_performance
-                            (4a models) + cluster_consistency (+ gwas_enrichment if --gwas is given)
+                            (4a models) + embedding_cooccurrence (if the graph has embeddings) +
+                            cluster_consistency; --gwas adds gwas_enrichment to whichever list
   --gwas FILE               shortcut: adds "gwas_enrichment gwas=FILE"
   GWAS file (gwas_enrichment gwas=...): tab-, comma- or whitespace-separated text, may be .gz/.zip.
       Needs chromosome, position (bp, SAME GENOME BUILD as the haploblock regions) and p-value
@@ -84,6 +92,7 @@ INPUT
 TASKS FILE  (plain text, one task per line; '#' starts a comment; values with spaces need quotes)
     model_info
     test_set_performance max_examples=500
+    embedding_cooccurrence min_lift=2 min_support=5 min_expected=5
     cluster_consistency min_carriers=1 permutations=200
     gwas_enrichment gwas=Yengo.2022.height.GWAS.ALL.gz pvalue=5e-8 label=height
     gwas_enrichment gwas=bmi_catalog.tsv pvalue=1e-6 window=10000 label=bmi_hits
@@ -108,7 +117,9 @@ OUTPUT  (--out-dir, default <graph-dir>/validation_<model file name>/)
                                        notes, files}]}
   split.csv                          individual, set (train / test)
   test_set_performance_chroms.csv    per chromosome: chrom, test_sequences, test_predictions, test_loss,
-                                     test_top1, test_top5, bigram_top1
+                                     test_top1, test_top5, test_region_top1, bigram_top1
+  embedding_cooccurrence.csv         per score (references + one row per embedding method): name, kind,
+                                     auc, auc_distance_matched, auc_frequency_matched, auc_95ci
   nemotron_summary.md                (--nemotron-summary) plain-language reading of the report
   cluster_consistency_regions.csv.gz per region: region, chrom, start, end, n_clusters_total,
                                      n_clusters_train, n_clusters_test, test_expected, test_ci_low,
@@ -140,6 +151,7 @@ REQUIRES  numpy, pandas, scipy; torch to read the model file; for test_set_perfo
           reading GWAS summary statistics) on the GPU
 """
 import argparse
+import glob
 import inspect
 import json
 import os
@@ -147,6 +159,7 @@ import re
 import shlex
 import time
 import traceback
+import zlib
 
 import sys
 
@@ -332,12 +345,10 @@ class Model:
                 import torch
             except ImportError:
                 raise SystemExit("reading the model file needs torch")
-            try:
+            try:       # step-4 checkpoints are plain dicts of tensors: never run a file's pickled code
                 self._meta = torch.load(self.path, map_location="cpu", weights_only=True)
-            except Exception:
-                # checkpoints from steps 4a/4b are plain dicts, but older torch versions or extra
-                # objects may need the full unpickler; this is the user's own file
-                self._meta = torch.load(self.path, map_location="cpu", weights_only=False)
+            except Exception as e:
+                die(f"{self.path}: not a plain step-4 checkpoint ({type(e).__name__}: {e}); refusing to unpickle it")
         return self._meta
 
     @property
@@ -556,13 +567,13 @@ def model_info(ctx):
         held, trained = ctx.model.held_out_individuals(), ctx.model.trained_individuals()
         test_names = [ctx.graph.individuals[i] for i in ctx.test_idx] if ctx.test_idx is not None else []
         if trained is not None and test_names:
-            # the checkpoint lists exactly who it was trained on
-            trained = set(trained)
+            # the checkpoint lists who it was trained and validated on; both must exclude the test set
+            trained = set(trained) | set(held or [])
             leaked = [x for x in test_names if x in trained]
             s["test_individuals_seen_in_training"] = len(leaked)
             notes.append(f"WARNING: {len(leaked):,} of {len(test_names):,} test individuals are in the model's "
-                         f"training set (e.g. {leaked[:3]})" if leaked else
-                         "no leakage: no test individual is in the model's training set")
+                         f"training or validation set (e.g. {leaked[:3]})" if leaked else
+                         "no leakage: no test individual is in the model's training or validation set")
         elif held is not None and test_names:
             # 4a checkpoints without a training list: trained on every graph individual except val_individuals
             held = set(held)
@@ -586,6 +597,8 @@ def model_info(ctx):
 def cluster_consistency(ctx, min_carriers: int = 1, permutations: int = 200, alpha: float = 0.05,
                         batch: int = 32):
     """A cluster counts as present in a set when at least `min_carriers` individuals of it carry it."""
+    if permutations < 1:
+        raise ValueError("permutations must be >= 1")
     C = ctx.graph.carriers.astype(np.float32)
     codes, regions = ctx.graph.region_codes, ctx.graph.regions.copy()
     n_reg, n_ind = len(regions), C.shape[1]
@@ -881,7 +894,9 @@ def gwas_enrichment(ctx, gwas: str, pvalue: float = 5e-8, window: int = 0, permu
 
 def bigram_table(data, chrom, individuals):
     """Most frequent next cluster after each cluster (local indices), counted on `individuals`;
-    clusters never seen as 'current' fall back to the most frequent next cluster overall."""
+    clusters never seen as 'current' fall back to the most frequent next cluster overall.
+    Returns (best next [n], sum over transitions of -log p(next | current), number of transitions):
+    the plug-in conditional entropy H(next | current) of the training sequences."""
     n = data.bounds[chrom][1] - data.bounds[chrom][0]
     keys = []
     for i in individuals:
@@ -890,7 +905,7 @@ def bigram_table(data, chrom, individuals):
             keys.append(local[:-1].astype(np.int64) * n + local[1:])
     best = np.full(n, -1, np.int64)
     if not keys:
-        return best
+        return best, 0.0, 0
     keys, counts = np.unique(np.concatenate(keys), return_counts=True)
     cur, nxt = keys // n, keys % n
     order = np.lexsort((-counts, cur))                      # per current cluster: highest count first
@@ -898,16 +913,32 @@ def bigram_table(data, chrom, individuals):
     best[cur[order][first]] = nxt[order][first]
     fallback = np.bincount(nxt, weights=counts, minlength=n).argmax()
     best[best < 0] = fallback
-    return best
+    per_cur = np.bincount(cur, weights=counts, minlength=n)
+    nll = float(-(counts * np.log(counts / per_cur[cur])).sum())
+    return best, nll, int(counts.sum())
+
+
+def paired_bootstrap(per_ind, n_boot, rng, alpha=0.05):
+    """per_ind: [individuals, 3] sums of (model correct, bigram correct, predictions). Resamples
+    INDIVIDUALS (their predictions are correlated). Returns CIs of model, bigram and model - bigram."""
+    m, b, n = per_ind[:, 0], per_ind[:, 1], per_ind[:, 2]
+    idx = rng.integers(0, len(per_ind), (n_boot, len(per_ind)))
+    tot = n[idx].sum(1)
+    tot = np.where(tot > 0, tot, 1)
+    stats_ = np.stack([m[idx].sum(1) / tot, b[idx].sum(1) / tot, (m[idx].sum(1) - b[idx].sum(1)) / tot])
+    lo, hi = np.percentile(stats_, [100 * alpha / 2, 100 * (1 - alpha / 2)], axis=1)
+    return [(round(float(a), 4), round(float(c), 4)) for a, c in zip(lo, hi)]
 
 
 @task("test_set_performance", "Query the fine-tuned model on the test individuals (next-cluster prediction)")
 def test_set_performance(ctx, max_examples: int = 500, train_examples: int = 200, top_k: int = 5,
-                         baseline_individuals: int = 0, device: str = "", ckpt_dir: str = ""):
+                         baseline_individuals: int = 0, bootstrap: int = 1000, device: str = "",
+                         ckpt_dir: str = ""):
     """max_examples / train_examples = (individual, chromosome) sequences evaluated from the test set /
     from the model's training individuals (0 = all); baseline_individuals = training individuals used
-    to count the bigram baseline (0 = all); device = cpu/cuda for the mock backbone; ckpt_dir overrides
-    the NeMo2 checkpoint folder stored in a --bionemo model."""
+    to count the bigram baseline (0 = all); bootstrap = resamples of test individuals for the 95% CIs
+    (0 = none); device = cpu/cuda for the mock backbone; ckpt_dir overrides the NeMo2 checkpoint
+    folder stored in a --bionemo model."""
     import torch
     from evo2_model import load_finetuned
     meta = ctx.model.meta
@@ -934,37 +965,63 @@ def test_set_performance(ctx, max_examples: int = 500, train_examples: int = 200
     base_pool = ctx.train_idx
     if baseline_individuals and len(base_pool) > baseline_individuals:
         base_pool = np.sort(rng.choice(base_pool, baseline_individuals, replace=False))
-    bigram = {c: bigram_table(data, c, base_pool) for c in sorted({c for c, _ in test_ex})}
+    chroms = sorted({c for c, _ in test_ex})
+    bigram, h_nll, h_n = {}, 0.0, 0
+    for c in chroms:
+        bigram[c], nll_c, n_c = bigram_table(data, c, base_pool)
+        h_nll += nll_c; h_n += n_c
+    # region of every local cluster index (clusters of one region are contiguous in genomic order)
+    region_local = {c: torch.from_numpy(pd.factorize(ctx.graph.region_codes[data.candidates(c)])[0]).to(model.rnr.dev)
+                    for c in chroms}
 
     def run(examples, with_baseline):
-        rows = {}
+        rows, per_ind = {}, {}
         with torch.no_grad():
             for chrom, i in examples:
                 logits, target = model.logits(chrom, i)
                 k = min(top_k, logits.shape[1])
                 nll = torch.nn.functional.cross_entropy(logits, target, reduction="sum").item()
                 top = logits.topk(k, dim=-1).indices
-                r = rows.setdefault(chrom, {"seq": 0, "n": 0, "nll": 0.0, "top1": 0, "topk": 0, "bigram": 0})
+                r = rows.setdefault(chrom, {"seq": 0, "n": 0, "nll": 0.0, "top1": 0, "topk": 0, "bigram": 0,
+                                            "region_top1": 0})
                 r["seq"] += 1; r["n"] += len(target); r["nll"] += nll
-                r["top1"] += int((top[:, 0] == target).sum()); r["topk"] += int((top == target[:, None]).any(1).sum())
+                hit = int((top[:, 0] == target).sum())
+                r["top1"] += hit; r["topk"] += int((top == target[:, None]).any(1).sum())
+                big_hit = 0
                 if with_baseline:
+                    # region-conditioned: is the target the best-scored cluster of its own region?
+                    reg = region_local[chrom]
+                    n_reg = int(reg.max()) + 1
+                    others = logits.scatter(1, target[:, None], float("-inf"))      # all but the target
+                    rmax = torch.full((logits.shape[0], n_reg), float("-inf"), device=logits.device)
+                    rmax = rmax.scatter_reduce(1, reg.expand_as(others), others, reduce="amax")
+                    t_logit = logits.gather(1, target[:, None])[:, 0]
+                    # strictly above every other cluster of its region (a tie is a miss)
+                    r["region_top1"] += int((t_logit > rmax.gather(1, reg[target][:, None])[:, 0]).sum())
                     _, local = data.tokens(chrom, i)
                     s, e = model.window(len(local))
-                    r["bigram"] += int((bigram[chrom][local[s:e - 1]] == local[s + 1:e]).sum())
-        return rows
+                    big_hit = int((bigram[chrom][local[s:e - 1]] == local[s + 1:e]).sum())
+                    r["bigram"] += big_hit
+                acc = per_ind.setdefault(i, [0, 0, 0])
+                acc[0] += hit; acc[1] += big_hit; acc[2] += len(target)
+        return rows, np.array(list(per_ind.values()), dtype=np.float64).reshape(-1, 3)
 
-    t_rows, tr_rows = run(test_ex, True), run(train_ex, False)
+    (t_rows, t_ind), (tr_rows, _) = run(test_ex, True), run(train_ex, False)
     tot = lambda rows, key: sum(r[key] for r in rows.values())
     n_test, n_train = tot(t_rows, "n"), max(tot(tr_rows, "n"), 1)
     loss = tot(t_rows, "nll") / n_test
     top1, topk = tot(t_rows, "top1") / n_test, tot(t_rows, "topk") / n_test
     tr_top1 = tot(tr_rows, "top1") / n_train
     big = tot(t_rows, "bigram") / n_test
+    region_top1 = tot(t_rows, "region_top1") / n_test
+    floor = h_nll / h_n if h_n else float("nan")          # bigram reference cross-entropy
+    cis = paired_bootstrap(t_ind, bootstrap, rng) if bootstrap > 0 and len(t_ind) > 1 else None
 
     path = ctx.out("test_set_performance_chroms.csv")
     pd.DataFrame([{"chrom": c, "test_sequences": r["seq"], "test_predictions": r["n"],
                    "test_loss": r["nll"] / r["n"], "test_top1": r["top1"] / r["n"],
-                   f"test_top{top_k}": r["topk"] / r["n"], "bigram_top1": r["bigram"] / r["n"]}
+                   f"test_top{top_k}": r["topk"] / r["n"], "test_region_top1": r["region_top1"] / r["n"],
+                   "bigram_top1": r["bigram"] / r["n"]}
                   for c, r in t_rows.items()]).to_csv(path, index=False, float_format="%.6g")
     stored = (meta.get("metrics") or {})
     s = {
@@ -972,11 +1029,20 @@ def test_set_performance(ctx, max_examples: int = 500, train_examples: int = 200
         "test_individuals": len({i for _, i in test_ex}), "test_sequences": len(test_ex),
         "test_predictions": n_test,
         "test_loss": round(loss, 4), "test_perplexity": round(float(np.exp(min(loss, 50))), 2),
-        "test_top1_accuracy": round(top1, 4), f"test_top{top_k}_accuracy": round(topk, 4),
+        "test_top1_accuracy": round(top1, 4),
+        "test_top1_95ci": cis[0] if cis else None,
+        f"test_top{top_k}_accuracy": round(topk, 4),
+        "test_region_conditioned_top1": round(region_top1, 4),
         "train_sample_top1_accuracy": round(tr_top1, 4) if tr_rows else None,
         "generalization_gap_top1": round(tr_top1 - top1, 4) if tr_rows else None,
         "bigram_baseline_top1_accuracy": round(big, 4),
-        "beats_bigram_baseline": "yes" if top1 > big else "no",
+        "bigram_baseline_top1_95ci": cis[1] if cis else None,
+        "model_minus_bigram_top1": round(top1 - big, 4),
+        "model_minus_bigram_95ci": cis[2] if cis else None,
+        "beats_bigram_baseline": ("yes" if cis[2][0] > 0 else "no" if cis[2][1] < 0 else "not significant")
+                                 if cis else ("yes" if top1 > big else "no"),
+        "bigram_reference_entropy": round(floor, 4),
+        "test_loss_minus_bigram_reference": round(loss - floor, 4),
         "stored_val_top1_before_training": round(float((stored.get("before") or {}).get("accuracy", np.nan)), 4),
         "stored_val_top1_after_training": round(float((stored.get("after") or {}).get("accuracy", np.nan)), 4),
     }
@@ -987,39 +1053,215 @@ def test_set_performance(ctx, max_examples: int = 500, train_examples: int = 200
     leaked = {x for x in (ctx.graph.individuals[i] for _, i in test_ex) if x in trained}
     if leaked:
         notes.append(f"WARNING: {len(leaked)} evaluated test individuals were in the model's training set")
-    if top1 <= big:
-        notes.append("the model does not beat the bigram baseline on the test set: it has not learned more "
-                     "than which cluster usually follows the current one")
+    if s["beats_bigram_baseline"] != "yes":
+        notes.append("the model does not beat the bigram baseline on the test set (paired bootstrap over test "
+                     "individuals): it has not shown more than which cluster usually follows the current one")
+    notes.append("bigram_reference_entropy is the plug-in H(next | current) of the training sequences (nats), "
+                 "measured on the data it is counted from: a reference, not a floor. A model that uses more "
+                 "context than the current cluster can go below it (negative test_loss_minus_bigram_reference "
+                 "is good); far above it, the model does not even capture the bigram's predictability")
+    notes.append("region-conditioned top-1 asks whether the target is the model's best cluster within the "
+                 "target's own haploblock region: it separates 'which haplotype' from 'where on the chromosome'")
     if tr_rows and tr_top1 - top1 > 0.1:
         notes.append("training accuracy is much higher than test accuracy: likely overfitting")
+    return {"summary": s, "notes": notes, "files": [path]}
+
+
+def auc(scores, labels):
+    """ROC AUC (Mann-Whitney U / n_pos n_neg), ties averaged; NaN if a class is missing."""
+    labels = np.asarray(labels, bool)
+    n_pos, n_neg = int(labels.sum()), int((~labels).sum())
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    ranks = stats.rankdata(scores)
+    return float((ranks[labels].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
+
+
+def binned_auc(scores, labels, dist, n_bins=4):
+    """Mean AUC within genomic-distance quantile bins: compares pairs at similar distance only, so a
+    score that merely encodes position cannot do well."""
+    edges = np.unique(np.quantile(dist, np.linspace(0, 1, n_bins + 1)))
+    b = np.clip(np.searchsorted(edges, dist, side="right") - 1, 0, max(len(edges) - 2, 0))
+    vals = [auc(scores[b == k], labels[b == k]) for k in np.unique(b)]
+    vals = [v for v in vals if np.isfinite(v)]
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+@task("embedding_cooccurrence", "Do the node embeddings predict cluster co-occurrence in the TEST individuals?")
+def embedding_cooccurrence(ctx, min_lift: float = 2.0, min_support: int = 5, min_expected: float = 5.0,
+                           pairs: int = 50000, max_distance: int = 1_000_000, bootstrap: int = 200):
+    """Held-out test of the step-3 embeddings, no GPU needed. Samples distinct pairs of clusters in
+    DIFFERENT haploblock regions of the same chromosome, at most max_distance bp apart, each carried by
+    at least min_support test individuals and with at least min_expected co-carriers expected under
+    independence among the test individuals (so that one chance co-carrier of two rare clusters cannot
+    make a pair 'linked'). A pair is positive when its test-individual lift is >= min_lift and negative
+    when it is <= 1. Reports, per node_emb_<method>.npy in the graph folder, the ROC AUC of the
+    embeddings' cosine similarity: overall, within genomic-distance bins and within expected-co-count
+    (cluster frequency) bins, with a bootstrap CI that resamples haploblock regions (pairs sharing a
+    region are not independent). References: genomic proximity, cluster frequency (expected co-count),
+    and the lift counted on the TRAINING individuals."""
+    import glob
+    notes = []
+    leaked = ctx.split_info.get("test_individuals_in_graph_training_set") or 0
+    built_on_all = str(ctx.split_info.get("graph_built_on", "")).startswith("all individuals")
+    if leaked or built_on_all:
+        notes.append("WARNING: the graph (and so the embeddings) was built with test individuals "
+                     f"({'all individuals' if built_on_all else f'{leaked:,} of them'}): this AUC is NOT held-out")
+    nodes, C = ctx.graph.nodes, ctx.graph.carriers
+    te, tr = ctx.test_idx, ctx.train_idx
+    C_te = C[:, te].tocsr().astype(np.float32)
+    C_tr = C[:, tr].tocsr().astype(np.float32)
+    sup_te = np.asarray(C_te.sum(1)).ravel()
+    sup_tr = np.asarray(C_tr.sum(1)).ravel()
+    codes = ctx.graph.region_codes
+    start = nodes["start"].to_numpy(dtype=np.float64)
+    chrom = nodes["chrom"].to_numpy()
+    rng = ctx.rng
+
+    eligible = np.where((sup_te >= min_support) & np.isfinite(start))[0]
+    if len(eligible) < 2:
+        return {"summary": {"status": "skipped"}, "notes": notes + [
+            f"skipped: fewer than 2 clusters with >= {min_support} test carriers"]}
+    order = eligible[np.lexsort((start[eligible], chrom[eligible]))]
+    key_c, key_s = chrom[order], start[order]
+    s_idx, t_idx = [], []
+    for c in pd.unique(key_c):        # a random eligible cluster + a random one within max_distance
+        sel = np.where(key_c == c)[0]
+        k = int(round(pairs * len(sel) / len(order)))
+        if len(sel) < 2 or k == 0:
+            continue
+        cs = key_s[sel]
+        i = rng.integers(0, len(sel), k)
+        lo = np.searchsorted(cs, cs[i] - max_distance, side="left")
+        hi = np.searchsorted(cs, cs[i] + max_distance, side="right")
+        j = np.minimum(lo + (rng.random(k) * (hi - lo)).astype(np.int64), len(sel) - 1)
+        s_idx.append(order[sel[i]]); t_idx.append(order[sel[j]])
+    if not s_idx:
+        return {"summary": {"status": "skipped"}, "notes": notes + ["skipped: no chromosome has two eligible clusters"]}
+    s_idx, t_idx = np.concatenate(s_idx), np.concatenate(t_idx)
+    pair = np.unique(np.stack([np.minimum(s_idx, t_idx), np.maximum(s_idx, t_idx)], 1), axis=0)   # distinct pairs
+    s_idx, t_idx = pair[:, 0], pair[:, 1]
+    n_te = len(te)
+    expected = sup_te[s_idx] * sup_te[t_idx] / n_te
+    keep = (codes[s_idx] != codes[t_idx]) & (expected >= min_expected)
+    s_idx, t_idx, expected = s_idx[keep], t_idx[keep], expected[keep]
+
+    def lift(Cm, sup, n):
+        shared = np.asarray(Cm[s_idx].multiply(Cm[t_idx]).sum(1)).ravel()
+        return shared * n / np.maximum(sup[s_idx] * sup[t_idx], 1e-12)
+
+    lift_te, lift_tr = lift(C_te, sup_te, n_te), lift(C_tr, sup_tr, len(tr))
+    pos, neg = lift_te >= min_lift, lift_te <= 1.0
+    use = pos | neg
+    s_idx, t_idx, labels = s_idx[use], t_idx[use], pos[use]
+    expected, lift_tr = expected[use], lift_tr[use]
+    dist = np.abs(start[s_idx] - start[t_idx])
+    if labels.sum() == 0 or (~labels).sum() == 0:
+        return {"summary": {"status": "skipped", "positive_pairs": int(labels.sum()),
+                            "negative_pairs": int((~labels).sum())},
+                "notes": notes + [f"skipped: need both positive (lift >= {min_lift}) and negative (lift <= 1) "
+                                  "test pairs; lower min_lift, min_support or min_expected"]}
+    block = codes[s_idx]                                          # bootstrap unit: haploblock region
+
+    def evaluate(scores):
+        res = {"auc": round(auc(scores, labels), 4),
+               "auc_distance_matched": round(binned_auc(scores, labels, dist), 4),
+               "auc_frequency_matched": round(binned_auc(scores, labels, expected), 4)}
+        if bootstrap:
+            blocks = np.unique(block)
+            members = pd.Series(np.arange(len(block))).groupby(block).apply(np.array)
+            boots = []
+            for _ in range(bootstrap):
+                take = np.concatenate(members.loc[rng.choice(blocks, len(blocks))].to_list())
+                boots.append(auc(scores[take], labels[take]))
+            lo_, hi_ = np.nanpercentile(boots, [2.5, 97.5])
+            res["auc_95ci"] = (round(float(lo_), 4), round(float(hi_), 4))
+        return res
+
+    rows = [{"name": "genomic_proximity", "kind": "reference", **evaluate(-dist)},
+            {"name": "cluster_frequency", "kind": "reference", **evaluate(np.log(expected))},
+            {"name": "train_lift", "kind": "reference", **evaluate(lift_tr)}]
+    files = sorted(glob.glob(os.path.join(ctx.graph.dir, "node_emb_*.npy")))
+    gi = os.path.join(ctx.graph.dir, "graph_info.json")
+    graph_sid = json.load(open(gi)).get("train_set_id", "all") if os.path.exists(gi) else "all"
+    leaked_methods = []
+    if not files:
+        notes.append("no node_emb_<method>.npy in the graph folder (run 3_node_embeddings.py): references only")
+    for f in files:
+        name = re.sub(r"^node_emb_|\.npy$", "", os.path.basename(f))
+        Z = np.load(f).astype(np.float32)
+        if len(Z) != len(nodes):
+            notes.append(f"{os.path.basename(f)} has {len(Z):,} rows but the graph has {len(nodes):,} nodes "
+                         "(stale file from another graph build?): skipped")
+            continue
+        info_f = f[:-4] + ".json"
+        emb_sid = json.load(open(info_f)).get("train_set_id", "?") if os.path.exists(info_f) else "?"
+        if emb_sid != graph_sid:
+            leaked_methods.append(name)
+            notes.append(f"WARNING: node_emb_{name} was made from training set {emb_sid}, not the graph's "
+                         f"({graph_sid}): its AUC is NOT held-out")
+        Zn = Z / np.maximum(np.linalg.norm(Z, axis=1, keepdims=True), 1e-12)
+        rows.append({"name": name, "kind": "embedding", **evaluate((Zn[s_idx] * Zn[t_idx]).sum(1))})
+
+    path = ctx.out("embedding_cooccurrence.csv")
+    pd.DataFrame(rows).to_csv(path, index=False)
+    s = {"pairs": int(len(labels)), "positive_pairs": int(labels.sum()), "negative_pairs": int((~labels).sum()),
+         "eligible_clusters": int(len(eligible)), "regions_in_pairs": int(len(np.unique(block))),
+         "median_distance_bp": int(np.median(dist)), "held_out": "no" if (leaked or built_on_all or leaked_methods) else "yes"}
+    for r in rows:
+        for k in ("auc", "auc_distance_matched", "auc_frequency_matched", "auc_95ci"):
+            if k in r:
+                s[f"{k}_{r['name']}"] = r[k]
+    notes += ["AUC 0.5 = no information about which clusters are co-inherited in individuals never seen; "
+              "distance- and frequency-matched AUCs compare pairs of similar genomic distance / expected "
+              "co-count only, so a score that merely encodes position or cluster frequency cannot do well",
+              "references: genomic_proximity (position only), cluster_frequency (expected co-count only), "
+              "train_lift (the linkage table of the training individuals)",
+              "the 95% CI resamples haploblock regions, since pairs sharing a region are not independent"]
     return {"summary": s, "notes": notes, "files": [path]}
 
 
 # ---- Nemotron summary ------------------------------------------------------
 
 _SAMPLE_ID = re.compile(r"\b(HG|NA)\d{5}\b")
-_PATH = re.compile(r"(?:[A-Za-z]:)?(?:/[^\s/'\"]+){2,}")
+_DROP_KEYS = {"model_file", "gwas_file", "columns_used"}      # paths / user file contents
 
 
-def _scrub(v):
-    """Remove sample IDs and file paths before anything leaves the machine."""
+def _scrub(v, names=()):
+    """Remove sample IDs (1000G-style and the graph's own individual names) and directories of file
+    paths (POSIX or Windows, absolute or relative) before anything leaves the machine."""
     if isinstance(v, str):
-        return _PATH.sub(lambda m: os.path.basename(m.group(0)), _SAMPLE_ID.sub("<sample>", v))
+        v = _SAMPLE_ID.sub("<sample>", v)
+        v = re.sub(r"\S*[/\\]\S*", lambda m: re.split(r"[/\\]", m.group(0).rstrip("/\\"))[-1], v)
+        for n in names:
+            v = re.sub(rf"\b{re.escape(n)}\b", "<sample>", v)
+        return v
     if isinstance(v, dict):
-        return {k: _scrub(x) for k, x in v.items()}
+        return {k: _scrub(x, names) for k, x in v.items() if k not in _DROP_KEYS}
     if isinstance(v, (list, tuple)):
-        return [_scrub(x) for x in v]
+        return [_scrub(x, names) for x in v]
     return v
 
 
-def nemotron_summary(args, results, out_path):
+def nemotron_summary(args, results, out_path, names=()):
+    import urllib.parse
     import urllib.request
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):     # never forward the API key to another location
+            return None
+
     key = os.environ.get("NVIDIA_API_KEY")
     if not key:
         log("warning: --nemotron-summary needs $NVIDIA_API_KEY (from build.nvidia.com); skipped")
         return
+    url = urllib.parse.urlparse(args.nemotron_url)
+    if url.scheme != "https" and url.hostname not in ("localhost", "127.0.0.1", "::1"):
+        log(f"warning: refusing to send the API key to {args.nemotron_url}: use https (or a local NIM); skipped")
+        return
+    names = [n for n in names if not _SAMPLE_ID.fullmatch(n)]   # 1000G IDs are already covered
     payload = _scrub([{"task": r["name"], "status": r["status"], "summary": r.get("summary", {}),
-                       "notes": r.get("notes", [])} for r in results])
+                       "notes": r.get("notes", [])} for r in results], names)
     prompt = ("These are validation results of an Evo 2 DNA language model fine-tuned on haplograph node "
               "embeddings (1000 Genomes haploblock clusters) to predict the next haploblock cluster along a "
               "chromosome, evaluated on held-out test individuals. Explain in plain language, in at most "
@@ -1033,7 +1275,7 @@ def nemotron_summary(args, results, out_path):
                                  headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
                                           "Accept": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=180) as r:
+        with urllib.request.build_opener(NoRedirect).open(req, timeout=180) as r:
             text = json.loads(r.read())["choices"][0]["message"]["content"]
     except Exception as e:
         log(f"warning: Nemotron request failed ({type(e).__name__}: {e}); no summary written")
@@ -1046,6 +1288,38 @@ def nemotron_summary(args, results, out_path):
     log(f"Nemotron summary: {out_path}")
 
 
+def check_self_test(summaries):
+    """Properties the synthetic self-test must satisfy (see IMPROVEMENT_PLAN.md, testing steps)."""
+    problems = []
+
+    def ci_ok(value, ci, what):
+        if ci is not None and not (ci[0] - 1e-9 <= value <= ci[1] + 1e-9):
+            problems.append(f"{what} {value} outside its 95% CI {ci}")
+
+    t = summaries["test_set_performance"]
+    ci_ok(t["test_top1_accuracy"], t["test_top1_95ci"], "test top-1")
+    ci_ok(t["bigram_baseline_top1_accuracy"], t["bigram_baseline_top1_95ci"], "bigram top-1")
+    ci_ok(t["model_minus_bigram_top1"], t["model_minus_bigram_95ci"], "model - bigram")
+    if t["test_region_conditioned_top1"] + 1e-9 < t["test_top1_accuracy"]:
+        problems.append("region-conditioned top-1 is below unconditioned top-1")
+    e = summaries["embedding_cooccurrence"]
+    if e.get("status") == "skipped":
+        problems.append("embedding_cooccurrence was skipped on the synthetic data")
+    else:
+        if not 0.3 <= e["auc_genomic_proximity"] <= 0.7:   # the synthetic data has no positional linkage
+            problems.append(f"genomic proximity AUC {e['auc_genomic_proximity']} should be near 0.5")
+        if e["auc_train_lift"] <= 0.55:                    # planted group structure replicates in test
+            problems.append(f"train-lift AUC {e['auc_train_lift']} should be clearly above 0.5")
+        if e["auc_gnn"] <= 0.5:
+            problems.append(f"GNN AUC {e['auc_gnn']} should be above 0.5")
+        for k, v in e.items():
+            if k.startswith("auc_95ci_"):
+                ci_ok(e["auc_" + k[len("auc_95ci_"):]], v, k)
+    if problems:
+        die("self-test checks failed:\n  " + "\n  ".join(problems))
+    log("self-test checks passed")
+
+
 def self_test(args):
     """Synthetic data -> step 4 --test (mock backbone) -> validate it with every data-level task."""
     import importlib
@@ -1053,7 +1327,8 @@ def self_test(args):
     args.graph_dir = selftest_graph_dir()
     args.model = os.path.join(args.graph_dir, "evo2_mock_next_gnn.pt")
     args.splits, args.tasks, args.gwas, args.out_dir = GRAPH_SPLIT, None, [], None
-    args.task = ["model_info", "test_set_performance max_examples=40 train_examples=20 device=cpu",
+    args.task = ["model_info", "test_set_performance max_examples=40 train_examples=20 bootstrap=200 device=cpu",
+                 "embedding_cooccurrence min_lift=1.5 min_support=3 min_expected=1 pairs=5000 bootstrap=50",
                  "cluster_consistency permutations=20"]
 
 
@@ -1139,14 +1414,19 @@ def main(argv=None):
         raise SystemExit(f"model file {args.model} not found")
 
     model = Model(args.model)                     # loaded once, on first use, shared with the tasks
-    specs = read_tasks_file(args.tasks) if args.tasks else []
-    specs += [parse_task_line(t, "--task") for t in args.task]
-    specs += [("gwas_enrichment", {"gwas": g}) for g in args.gwas]
+    try:
+        specs = read_tasks_file(args.tasks) if args.tasks else []
+        specs += [parse_task_line(t, "--task") for t in args.task]
+    except (OSError, ValueError) as e:
+        die(f"bad task list: {e}")
     if not specs:
         specs = [("model_info", {})]
         if model.kind.startswith("4a"):
             specs.append(("test_set_performance", {}))
+        if glob.glob(os.path.join(args.graph_dir, "node_emb_*.npy")):
+            specs.append(("embedding_cooccurrence", {}))
         specs.append(("cluster_consistency", {}))
+    specs += [("gwas_enrichment", {"gwas": g}) for g in args.gwas]
     jobs = []
     for name, raw in specs:
         if name not in TASKS:
@@ -1163,8 +1443,12 @@ def main(argv=None):
     ctx.setup_split()
 
     results = []
+    seen = {}
     for name, params in jobs:
         log(f"[{name}] " + " ".join(f"{k}={v}" for k, v in params.items()))
+        # each task gets its own generator, so adding / changing one task never shifts another's results
+        seen[name] = seen.get(name, 0) + 1
+        ctx.rng = np.random.default_rng([args.seed, zlib.crc32(name.encode()), seen[name]])
         t0 = time.time()
         rec = {"name": name, "params": params}
         try:
@@ -1193,9 +1477,11 @@ def main(argv=None):
     log(f"report: {os.path.join(args.out_dir, 'report.md')}"
         + (f"  ({n_fail} task(s) failed)" if n_fail else ""))
     if args.nemotron_summary:
-        nemotron_summary(args, results, os.path.join(args.out_dir, "nemotron_summary.md"))
-    if args.test and n_fail:
-        die(f"self-test: {n_fail} task(s) failed")
+        nemotron_summary(args, results, os.path.join(args.out_dir, "nemotron_summary.md"), ctx.graph.individuals)
+    if args.test:
+        if n_fail:
+            die(f"self-test: {n_fail} task(s) failed")
+        check_self_test({r["name"]: r["summary"] for r in results})
 
 
 if __name__ == "__main__":
