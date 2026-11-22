@@ -61,6 +61,7 @@ The input is the [1000 Genomes haplograph](https://data.haploblocks.org/haplogra
 | Step | Script | Does |
 |---|---|---|
 | 0 | `download_haplograph.py` | downloads the haplograph, writes the training and test sets |
+| 0b | `download_gwas.py` | downloads GWAS hits for one trait from the GWAS Catalog (for step 5) |
 | 1 | `1_build_graph.py` | builds the co-occurrence graph (edge weights from the training individuals) |
 | 3 | `3_node_embeddings.py` | node2vec, GNN and XGBoost node embeddings (`--rapids` for GPU SVD) |
 | 4 | `4a_finetune_evo2_embeddings.py` | fine-tunes Evo 2 on the embeddings (`--bionemo` for BioNeMo, `--mock-evo2` for CPU checks) |
@@ -76,6 +77,7 @@ The step numbers follow the script names; there is no step 2. Every script has a
 ```bash
 cd part1_haplograph
 python download_haplograph.py --chroms chr21,chr22                 # step 0: data + train/test sets
+python download_gwas.py --trait "^body height$" --label height     # step 0b: GWAS hits for step 5
 python 1_build_graph.py                                            # step 1: graph from the training individuals
 G=haplograph/chr21_chr22_train_half_A
 python 3_node_embeddings.py --graph-dir $G                         # step 3: node2vec + gnn + xgboost
@@ -114,6 +116,16 @@ Optional: `pip install cudf-cu12` (RAPIDS cuDF) enables `--cudf` in steps 1 and 
 python download_haplograph.py --test                   # test: synthetic haplograph + split
 python download_haplograph.py --chroms chr21           # test: one chromosome (~85 MB)
 python download_haplograph.py                          # full run: whole genome (chr1-chr22), BH_26 split
+```
+
+## Step 0b: download GWAS hits
+
+`download_gwas.py` downloads the [NHGRI-EBI GWAS Catalog](https://www.ebi.ac.uk/gwas/docs/file-downloads) (all reported associations, about 75 MB zipped) and keeps those of one trait, selected by a regular expression on the trait name (`--trait`) or by ontology ID (`--trait-id`, the last part of the catalog's `MAPPED_TRAIT_URI`, which also matches associations mapped to several traits). It writes `haplograph/gwas/<label>.tsv` with one row per variant (chromosome, position, SNP, lowest p-value) and a `<label>.json` with the source and counts. Catalog positions are GRCh38, the same build as the haplograph regions (they match the hg38 HaploHash blocks), so no liftover is needed. Step 5's `gwas_enrichment` task then tests which haploblocks hold more hits than expected; `validation_tasks.txt` expects `haplograph/gwas/height.tsv`, so run this step before step 5.
+
+```bash
+python download_gwas.py --test                                     # test: synthetic catalog with a planted hotspot
+python download_gwas.py --trait "^body height$" --label height     # full run: body height (~29,500 variants)
+python download_gwas.py --trait-id OBA_VT0001253 --label height_id # by ontology ID: also rows mapped to several traits (~29,500)
 ```
 
 ## Step 1: build the graph
@@ -177,11 +189,12 @@ python 4b_finetune_evo2_hash.py --hash-pheno hash_height.tsv   # full run: Evo 2
 - `test_set_performance`: loads the fine-tuned model and predicts each test individual's next cluster along each chromosome (cross-entropy, perplexity, top-1 / top-5 accuracy with 95% CIs), compared with training individuals (generalization gap) and with a bigram baseline the model should beat. Needs the backbone used in step 4 (a GPU for Evo 2)
 - `embedding_cooccurrence`: without a GPU, whether the step-3 embeddings predict which clusters are carried together by the test individuals (ROC AUC)
 - `cluster_consistency`: per haploblock, whether train and test individuals carry the same clusters, with the same frequencies, compared against random splits of the same size
+- `gwas_enrichment`: which haploblocks hold more GWAS hits than expected (hits from step 0b, compared with the haploblock's length; full summary statistics in the same genome build also work, compared with the SNPs tested in each haploblock). `--gwas FILE` adds this task to the default ones
 
 Results are written to `report.md`, `summary.json` and one CSV per task in `<graph-dir>/validation_<model>/`. New checks go in a Python file loaded with `--plugins my_checks.py`. `--nemotron-summary` sends the task summaries (aggregate numbers only; sample IDs and file paths are removed) to an NVIDIA Nemotron model via the NVIDIA NIM API (key in `$NVIDIA_API_KEY`) and writes a plain-language reading of the results to `nemotron_summary.md`.
 
 ```bash
-python 5_validate_evo2.py --test                       # test: runs steps 0-5 on synthetic data
+python 5_validate_evo2.py --test                       # test: runs steps 0-5 (and 0b) on synthetic data
 G=haplograph/chr21_train_half_A
 python 5_validate_evo2.py --model $G/evo2_mock_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt   # test: chr21, stand-in model
 G=haplograph/genome_train_half_A

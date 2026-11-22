@@ -15,7 +15,8 @@ embedding_cooccurrence min_lift=2 min_support=5 min_expected=5 pairs=50000
 # 3. train vs test consistency of the haploblock clusters (data-level)
 cluster_consistency min_carriers=1 permutations=200
 
-# 4. GWAS enrichment of haploblocks (data-level); positions must use the same genome build
-#    as the haploblock regions. Add one line per trait or threshold.
-# gwas_enrichment gwas=Yengo.2022.height.GWAS.ALL.gz pvalue=5e-8 label=height
-# gwas_enrichment gwas=gwas_catalog_height.tsv pvalue=5e-8 window=10000 label=height_catalog
+# 4. GWAS enrichment of haploblocks (data-level): which haploblocks hold more GWAS hits than expected?
+#    Hit file from:  python download_gwas.py --trait "^body height$" --label height   (GWAS Catalog,
+#    GRCh38 like the haplograph). Full summary statistics also work (same genome build, mode=summary).
+#    Add one line per trait or threshold.
+gwas_enrichment gwas=haplograph/gwas/height.tsv pvalue=5e-8 label=height
