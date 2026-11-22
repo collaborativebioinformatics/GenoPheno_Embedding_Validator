@@ -324,7 +324,7 @@ gwas_enrichment gwas=haplograph/gwas/height.tsv pvalue=5e-8 clump=25000 label=he
 Usage (more in [section 11](#11-running-the-pipeline)):
 
 ```bash
-python 6_validate_evo2.py --test      # test: steps 1-6 and 5 on synthetic data (checks the planted GWAS hotspot is found)
+python 6_validate_evo2.py --test      # test: steps 1-3, 4a, 5 and 6 on synthetic data (checks the planted GWAS loci are found)
 G=haplograph/genome_train_half_A
 python 6_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt   # full run: Evo 2, GPU
 ```
@@ -466,7 +466,7 @@ Part 1 has a CPU core (all steps, with `--mock-evo2` in step 4) and GPU extras (
 cd part1_haplograph
 python setup.py --venv ~/haplograph-env  # numpy, pandas, scipy, torch, xgboost (requirements.txt); or omit --venv
 source ~/haplograph-env/bin/activate
-python 6_validate_evo2.py --test         # runs steps 1-6 on synthetic data; should end with "self-test checks passed"
+python 6_validate_evo2.py --test         # runs steps 1-3, 4a, 5 and 6 on synthetic data; should end with "self-test checks passed"
 ```
 
 `setup.py` prints one line per step and the version of every package it installed; when a command fails it shows that command's last output lines and a hint (`--verbose` shows all output, `--dry-run` only prints the commands). On macOS, XGBoost needs the OpenMP runtime (`brew install libomp`; `setup.py` says so if the import fails). For a smaller CPU-only torch on Linux: `pip install torch --index-url https://download.pytorch.org/whl/cpu` before `setup.py`.
@@ -491,13 +491,18 @@ source ~/evo2-env/bin/activate
 | `--max-jobs` | `MAX_JOBS` | `4` | parallel flash-attn compile jobs (more = faster, more RAM) |
 | `--skip-cuda-toolkit` | `SKIP_CUDA_TOOLKIT=1` | off | CUDA 12.8 is already installed in `/usr/local/cuda-12.8` |
 | `--skip-evo2-test` | `SKIP_EVO2_TEST=1` | off | skip the generation test (it downloads the `evo2_7b_base` weights, ~15 GB) |
+| `--gpu` | | `auto` | `auto` reads the compute capability from `nvidia-smi`; `rtx` = RTX PRO 6000 Blackwell (sm_120, flash-attn built from source), `l40s` = L40S (sm_89) |
+| `--dry-run` | | off | print the commands without running them (the GPU and driver checks still run) |
+| `--verbose` | | off | stream the full output of every command |
+
+`PYTHON` and `VENV` (`--python`, `--venv`) also apply to the CPU mode of 10.1. On sm_120 (Blackwell) `setup.py` sets `FLASH_ATTENTION_FORCE_BUILD=TRUE` and `FLASH_ATTN_CUDA_ARCHS`, so flash-attn is compiled for the GPU instead of downloading a prebuilt wheel. evo2 is installed from its git repository at `--evo2-ref` (a branch is checked out at its latest remote state), with torch kept at the CUDA 12.8 build.
 
 Requirements: Linux, Python 3.11 or 3.12, NVIDIA driver for CUDA 12.8 (≥ 570), an 80 GB GPU recommended for 7B. Manual equivalent:
 
 ```bash
 pip install numpy pandas scipy torch xgboost
 pip install flash-attn==2.8.0.post2 --no-build-isolation
-pip install evo2
+pip install evo2          # setup.py installs evo2 from git at --evo2-ref instead
 ```
 
 ### 10.3 RAPIDS (cuDF, cuML, CuPy) in its own venv
@@ -566,7 +571,7 @@ python 3_node_embeddings.py --test
 python 4a_finetune_evo2_embeddings.py --test   # --mock-evo2
 python 4b_finetune_evo2_hash.py --test
 python 5_download_gwas.py --test              # synthetic GWAS Catalog
-python 6_validate_evo2.py --test            # runs all of the above, then every validation task
+python 6_validate_evo2.py --test            # runs steps 1-3, 4a and 5 itself (not 4b), then every validation task
 ```
 
 ### 11.2 Real data on a CPU (chr21, stand-in model, about 5 minutes)

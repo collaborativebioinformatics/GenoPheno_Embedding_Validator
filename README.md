@@ -85,11 +85,11 @@ python 5_download_gwas.py --trait "^body height$" --label height     # step 5: G
 python 6_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt   # step 6
 ```
 
-Without a GPU, add `--mock-evo2` to step 4 (the model is then `$G/evo2_mock_next_gnn.pt`) to check the pipeline end to end; the results are meaningless. `python 6_validate_evo2.py --test` runs steps 1–6 on synthetic data in under a minute on a CPU.
+Without a GPU, add `--mock-evo2` to step 4 (the model is then `$G/evo2_mock_next_gnn.pt`) to check the pipeline end to end; the results are meaningless. `python 6_validate_evo2.py --test` runs steps 1–3, 4a, 5 and 6 on synthetic data in under a minute on a CPU.
 
 ## Dependencies
 
-- Python 3.11 or 3.12, Linux, NVIDIA GPU with CUDA 12.1+ (80 GB recommended for step 4); the CPU checks (`--test`, `--mock-evo2`) run on any OS
+- Python 3.11 or 3.12, Linux, NVIDIA GPU with a driver for CUDA 12.8 (≥ 570; 80 GB recommended for step 4); the CPU checks (`--test`, `--mock-evo2`) run on any OS
 - numpy, pandas, scipy (all steps)
 - torch (node2vec and GNN embeddings, Evo 2, reading models in step 6)
 - xgboost (XGBoost embeddings)
@@ -108,7 +108,7 @@ python setup.py --evo2                   # Linux + NVIDIA GPU: CUDA 12.8 toolkit
 python setup.py --evo2 --dry-run         # show the commands without running them
 ```
 
-Manual equivalent: `pip install numpy pandas scipy torch xgboost`, then `pip install flash-attn==2.8.0.post2 --no-build-isolation` and `pip install evo2` on a GPU machine.
+Manual equivalent: `pip install numpy pandas scipy torch xgboost`, then `pip install flash-attn==2.8.0.post2 --no-build-isolation` and `pip install evo2` on a GPU machine (`setup.py` installs evo2 from its git repository at `--evo2-ref`).
 
 Optional: `pip install cudf-cu12` (RAPIDS cuDF) enables `--cudf` in steps 2 and 6, which reads and processes their tables on the GPU. In step 2, add `--chunksize 0` so the edge files are also parsed on the GPU.
 
@@ -200,7 +200,7 @@ python 5_download_gwas.py --trait-id OBA_VT0001253 --label height_id # by ontolo
 Results are written to `report.md`, `summary.json` and one CSV per task in `<graph-dir>/validation_<model>/`. New checks go in a Python file loaded with `--plugins my_checks.py`. `--nemotron-summary` sends the task summaries (aggregate numbers only; sample IDs and file paths are removed) to an NVIDIA Nemotron model via the NVIDIA NIM API (key in `$NVIDIA_API_KEY`) and writes a plain-language reading of the results to `nemotron_summary.md`.
 
 ```bash
-python 6_validate_evo2.py --test                       # test: runs steps 1-6 on synthetic data
+python 6_validate_evo2.py --test                       # test: runs steps 1-3, 4a, 5 and 6 on synthetic data
 G=haplograph/chr21_train_half_A
 python 6_validate_evo2.py --model $G/evo2_mock_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt   # test: chr21, stand-in model
 G=haplograph/genome_train_half_A

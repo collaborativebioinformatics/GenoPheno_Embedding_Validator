@@ -131,7 +131,7 @@ def _stale_flagged(task):
     return task["status"] != "ok" or "graph" in text.lower() and ("build" in text.lower() or "graph_id" in text)
 
 
-def test_step5_flags_model_from_other_graph_build(graph_copy, tmp_path):
+def test_step6_flags_model_from_other_graph_build(graph_copy, tmp_path):
     """DOCUMENTATION section 5: each step stores the graph build id and the next step checks it."""
     p = graph_copy / "graph_info.json"
     info = json.loads(p.read_text())
@@ -143,7 +143,7 @@ def test_step5_flags_model_from_other_graph_build(graph_copy, tmp_path):
     assert _stale_flagged(tasks["test_set_performance"])
 
 
-def test_step5_reports_changed_embeddings(graph_copy, tmp_path):
+def test_step6_reports_changed_embeddings(graph_copy, tmp_path):
     """Evaluating a model on embeddings it was not trained with must fail or be recorded in the report."""
     Z = np.load(graph_copy / "node_emb_gnn.npy")
     np.save(graph_copy / "node_emb_gnn.npy", Z[::-1].copy())
@@ -175,13 +175,13 @@ def test_gwas_shortcut_keeps_default_tasks(pipeline, tmp_path):
 # Caches that ignore their inputs
 # ---------------------------------------------------------------------------
 
-def test_step1_cache_follows_raw_dir(tmp_path):
+def test_step2_cache_follows_raw_dir(tmp_path):
     """A graph built with --raw-dir B must contain B's clusters, not those cached from raw/."""
     make_synthetic_haplograph(tmp_path / "raw", ("chr21",), n_ind=30, n_regions=12, seed=0)
     make_synthetic_haplograph(tmp_path / "rawB", ("chr21",), n_ind=30, n_regions=4, seed=1)
-    b1 = script("2_build_graph")
-    b1.main(["--workdir", str(tmp_path), "--no-split"])
-    b1.main(["--workdir", str(tmp_path), "--raw-dir", str(tmp_path / "rawB"), "--no-split",
+    b2 = script("2_build_graph")
+    b2.main(["--workdir", str(tmp_path), "--no-split"])
+    b2.main(["--workdir", str(tmp_path), "--raw-dir", str(tmp_path / "rawB"), "--no-split",
              "--out", str(tmp_path / "graphB")])
     import pandas as pd
     built = pd.read_csv(tmp_path / "graphB" / "nodes.csv.gz")
@@ -197,7 +197,7 @@ def test_step3_recomputes_when_settings_change(graph_copy):
     assert np.load(graph_copy / "node_emb_gnn.npy").shape[1] == 12
 
 
-def test_step0_new_splits_url_is_used(tmp_path):
+def test_step1_new_splits_url_is_used(tmp_path):
     """split.json's 'source' must describe the files actually used."""
     inds = make_synthetic_haplograph(tmp_path / "wd" / "raw", ("chr21",), n_ind=20, seed=0)
     for name, (a, b) in {"A": (inds[:10], inds[10:]), "B": (inds[10:], inds[:10])}.items():

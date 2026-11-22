@@ -39,7 +39,7 @@ def _step4_default_min_support(G):
 # Index consistency between steps 4 and 6 (guard; passes)
 # ---------------------------------------------------------------------------
 
-def test_step5_reproduces_stored_val_accuracy_with_min_support(graph_copy, tmp_path):
+def test_step6_reproduces_stored_val_accuracy_with_min_support(graph_copy, tmp_path):
     """Steps 4 and 6 must build the same merged vocabulary (tokens, local indices, mean
     embeddings): with --splits none, step 6 on the model's own validation individuals must
     reproduce the validation accuracy stored in the checkpoint."""
