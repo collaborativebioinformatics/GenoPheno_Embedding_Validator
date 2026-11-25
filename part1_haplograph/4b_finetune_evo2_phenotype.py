@@ -111,7 +111,10 @@ def simulate(graph_dir, kind, h2, n_causal, seed):
 
 def read_table(path, task, first_pattern):
     """2-column TSV (key, phenotype), optional header -> keys, y, task, classes, name, n_skipped."""
-    raw = pd.read_csv(path, sep="\t", header=None, dtype=str, keep_default_na=False, quoting=3)
+    try:
+        raw = pd.read_csv(path, sep="\t", header=None, dtype=str, keep_default_na=False, quoting=3)
+    except pd.errors.EmptyDataError:
+        die(f"{path} is empty: expected a tab-separated file with 2 columns")
     if raw.shape[1] < 2 or len(raw) == 0:
         die(f"{path}: expected a tab-separated file with 2 columns")
     raw = raw.iloc[:, :2].apply(lambda c: c.str.strip())

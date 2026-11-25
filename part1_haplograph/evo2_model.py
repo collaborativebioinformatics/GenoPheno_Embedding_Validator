@@ -782,18 +782,21 @@ class PhenotypeModel:
     def encode(self, example):
         """example: individual index (tokens) or hash string -> (genome vector, {chrom: (token nodes, weights)})."""
         torch, rnr = self.torch, self.rnr
+        windows = lambda n: range(0, n, self.max_len)          # every token, --max-len per backbone pass
         if self.data is None:
             bits = np.frombuffer(example.encode(), np.uint8) - 48
-            bits = np.pad(bits, (0, (-len(bits)) % self.hash_bits)).reshape(-1, self.hash_bits)[:self.max_len]
+            bits = np.pad(bits, (0, (-len(bits)) % self.hash_bits)).reshape(-1, self.hash_bits)
             x = self.proj_in(torch.from_numpy(bits * 2.0 - 1).float().to(rnr.dev)) + self.chrom_emb.weight[0]
-            return self.pool(rnr.run_soft(x), 0)[0], {}
+            return self.pool(torch.cat([rnr.run_soft(x[s:s + self.max_len]) for s in windows(len(x))]), 0)[0], {}
         vecs, attn = [], {}
         for chrom in self.data.chroms:
             hs, toks = [], []
             for row in (2 * example, 2 * example + 1):
-                t = self.data.tokens(chrom, row)[:self.max_len]
-                x = self.proj_in(self.Z_t[torch.from_numpy(t).to(rnr.dev)]) + self.chrom_emb.weight[self.data.cidx[chrom]]
-                hs.append(rnr.run_soft(x)); toks.append(t)
+                t = self.data.tokens(chrom, row)
+                for s in windows(len(t)):
+                    tt = t[s:s + self.max_len]
+                    x = self.proj_in(self.Z_t[torch.from_numpy(tt).to(rnr.dev)]) + self.chrom_emb.weight[self.data.cidx[chrom]]
+                    hs.append(rnr.run_soft(x)); toks.append(tt)
             v, w = self.pool(torch.cat(hs), 0)
             vecs.append(v)
             attn[chrom] = (np.concatenate(toks), w.detach().cpu().numpy())
