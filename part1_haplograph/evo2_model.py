@@ -175,9 +175,11 @@ def unfreeze_last(blocks, last, n, prefix):
 
 
 def randomize(net, seed):
-    """--init random: replace every pretrained weight by a seeded random init of the same shape
-    (reset_parameters() where a module has one, else N(0, 0.02) for matrices and 0 for vectors), so
-    the architecture and the trainable budget stay and only the pretraining is removed."""
+    """--init random: replace the pretrained weights by a seeded random init of the same architecture.
+    Modules with reset_parameters() (linear, embedding, norm layers) are re-initialised by it; every
+    other parameter (including e.g. nn.MultiheadAttention's in-projection, which has only a private reset) (custom norm scales, Hyena filter poles and residues, ...) has its values shuffled
+    within the tensor, which keeps each tensor's distribution (scales stay near 1, filters stay stable)
+    and removes what pretraining learned."""
     import torch
     g = torch.random.fork_rng(devices=[net_device(net)] if net_device(net).type == "cuda" else [])
     with g, torch.no_grad():
@@ -189,7 +191,7 @@ def randomize(net, seed):
                 done |= {id(p) for p in m.parameters(recurse=False)}
         for p in net.parameters():
             if id(p) not in done:
-                p.normal_(0, 0.02) if p.dim() > 1 else p.zero_()
+                p.copy_(p.flatten()[torch.randperm(p.numel(), device=p.device)].view_as(p))
 
 
 def net_device(net):
