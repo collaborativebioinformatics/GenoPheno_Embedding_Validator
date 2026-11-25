@@ -10,7 +10,7 @@ Two modes:
       no Transformer Engine, from git at --evo2-ref), requirements.txt, then Evo 2's generation test.
 
 Each step prints one line; the output of a failing command is shown with a hint (--verbose shows
-all output). Settings also read the environment variables of the former install_evo2.sh:
+all output). Settings can also be given as environment variables:
 PYTHON and VENV (both modes), EVO2_SRC, EVO2_REF, MAX_JOBS, SKIP_CUDA_TOOLKIT=1, SKIP_EVO2_TEST=1.
 
 USAGE

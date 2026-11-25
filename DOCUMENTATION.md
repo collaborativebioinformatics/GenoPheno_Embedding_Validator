@@ -2,27 +2,28 @@
 
 The repository is a pipeline in two parts:
 
-- **Part 1, [`part1_haplograph/`](part1_haplograph/):** 1000 Genomes haplograph → node embeddings (node2vec, GNN, XGBoost) → fine-tuning Evo 2 → validation of the fine-tuned Evo 2 on held-out test individuals. Most of this document is about part 1.
+- **Part 1, [`part1_haplograph/`](part1_haplograph/):** 1000 Genomes haplograph → phased haplotypes as token sequences → node embeddings → fine-tuning Evo 2 (on haplotypes, and on phenotypes) → validation on held-out test individuals against baselines and controls. Most of this document is about part 1.
 - **Part 2, [`part2_proteomics/`](part2_proteomics/):** paired tumor/normal proteomics → protein embeddings (ProLM) → fusion with the genome model. See [section 9](#9-part-2-proteomics) and the READMEs in its folders.
 
 The short version is in [README.md](README.md). **How to install the dependencies and run the pipeline is at the end: [section 10](#10-installation) and [section 11](#11-running-the-pipeline).**
 
-Contents: [1 What part 1 does](#1-what-part-1-does) · [2 The haplograph](#2-key-concepts-the-haplograph) · [3 Working directory](#3-working-directory-structure) · [4 Script reference](#4-script-reference) · [5 Split and leakage](#5-the-traintest-split-and-leakage-protection) · [6 GPU acceleration](#6-gpu-acceleration-rapids-cupy-bionemo-nemotron) · [7 Extending](#7-extending-the-pipeline) · [8 Limitations](#8-limitations-and-known-issues) · [9 Part 2](#9-part-2-proteomics) · [10 Installation](#10-installation) · [11 Running](#11-running-the-pipeline)
+Contents: [1 What part 1 does](#1-what-part-1-does) · [2 The haplograph](#2-key-concepts-the-haplograph) · [3 Working directory](#3-working-directory-structure) · [4 Script reference](#4-script-reference) · [5 Split and leakage](#5-the-traintest-split-and-leakage-protection) · [6 GPU acceleration](#6-gpu-acceleration-rapids-cupy-bionemo-nemotron) · [7 Extending](#7-extending-the-pipeline) · [8 Results and limitations](#8-results-and-limitations) · [9 Part 2](#9-part-2-proteomics) · [10 Installation](#10-installation) · [11 Running](#11-running-the-pipeline)
 
 ## 1. What part 1 does
 
-The pipeline turns the [1000 Genomes haplograph](https://data.haploblocks.org/haplograph/1000G/) into a form Evo 2 can learn from, fine-tunes Evo 2 on it using the training individuals, and validates the fine-tuned model on the test individuals.
+Haploblock clusters discretize the genome into a vocabulary of inherited haplotype states. Part 1 tests one hypothesis: **graph embeddings of these states, fed to the DNA foundation model Evo 2 in place of nucleotide tokens, let Evo 2 learn haplotype structure that generalizes to haplotypes it has never seen**, and Evo 2's pretraining is what makes the difference. The pipeline therefore builds the task on phased haplotypes (one token per haploblock), gives the model an output head without a cross-entropy floor, and judges it on held-out individuals against count-based baselines (frequency, n-grams, a Li-Stephens HMM) and against two controls: Evo 2's architecture with random weights, and a small transformer trained from scratch.
 
 ```mermaid
 flowchart LR
-    D[(1000G haplograph<br/>nodes + edges<br/>per chromosome)] --> S1[1 download haplograph<br/>+ train/test sets]
-    SP[(BH_26 split<br/>half_A / half_B)] --> S1
-    S1 --> S2[2 build graph<br/>train individuals only]
-    S2 --> S3[3 node embeddings<br/>node2vec + GNN + XGBoost]
-    S3 --> S4[4a fine-tune Evo 2<br/>evo2 / --bionemo / --mock-evo2]
-    H[(hash-phenotype TSV)] -.-> S4b[4b fine-tune Evo 2<br/>on hashes, optional]
-    C[(GWAS Catalog)] --> S5[5 download GWAS hits<br/>one trait]
-    S4 --> S6[6 validate Evo 2<br/>on the test individuals]
+    D[(1000G haplograph<br/>nodes + edges<br/>+ phased haplotypes)] --> S1[1 download<br/>+ train/test sets]
+    SP[(BH_26 split, pedigree,<br/>populations)] --> S1
+    S1 --> S2[2 build graph<br/>train haplotypes only]
+    S2 --> S3[3 node embeddings<br/>carrier_svd, node2vec, GNN<br/>xgboost, evo2_seq]
+    S3 --> S4[4a fine-tune Evo 2<br/>next / masked haploblock<br/>evo2, bionemo, small, random init]
+    S3 --> S4b[4b phenotype model<br/>simulated or real traits]
+    C[(GWAS Catalog)] --> S5[5 download GWAS hits]
+    S4 --> S6[6 validate<br/>baselines, controls, strata]
+    S4b --> S6
     S1 -.test set.-> S6
     S5 -.-> S6
     S6 -.optional.-> N[Nemotron summary]
@@ -30,33 +31,31 @@ flowchart LR
 
 | Step | Script | In one sentence |
 |---|---|---|
-| 1 | `1_download_haplograph.py` | Downloads the haplograph (all chromosomes or a selection), checks it, and writes the training and test sets of individuals. |
-| 2 | `2_build_graph.py` | Builds one graph (genome-wide or selected chromosomes), with edge weights computed from the training individuals. |
-| 3 | `3_node_embeddings.py` | Turns every graph node into a vector with node2vec, a GNN and XGBoost (no labels); `--rapids` runs the SVDs on the GPU. |
-| 4a | `4a_finetune_evo2_embeddings.py` | Fine-tunes Evo 2 7B on each training individual's sequence of node embeddings (no DNA); `--bionemo` runs Evo 2 through NVIDIA BioNeMo. |
-| 4b | `4b_finetune_evo2_hash.py` | Optional, independent of steps 1–3: fine-tunes Evo 2 to predict a phenotype from a genomic hash (0/1 string). |
+| 1 | `1_download_haplograph.py` | Downloads the haplograph and each haplotype's cluster per haploblock, checks them, and writes the training and test sets, populations and related pairs. |
+| 2 | `2_build_graph.py` | Builds one graph (genome-wide or selected chromosomes) from same-haplotype co-occurrence on the training haplotypes, plus the haplotype and transition tables. |
+| 3 | `3_node_embeddings.py` | Turns every graph node into a vector (carrier_svd, node2vec, GNN; XGBoost and evo2_seq on request); `--rapids` runs the SVDs on the GPU. |
+| 4a | `4a_finetune_evo2_embeddings.py` | Fine-tunes Evo 2 7B on training haplotypes, one token per haploblock (no DNA): next-haploblock or masked-haploblock prediction; controls `--init random` and `--backbone small`. |
+| 4b | `4b_finetune_evo2_phenotype.py` | Fine-tunes Evo 2 to predict a phenotype from both haplotypes (traits simulated on the real haplotypes, or real ones); `--input hash` is the unlinked-hash baseline. |
 | 5 | `5_download_gwas.py` | Downloads the GWAS Catalog and writes the reported hits of one trait (GRCh38, like the haplograph) for step 6. |
-| 6 | `6_validate_evo2.py` | Validates one fine-tuned model on the test individuals (the model's own predictions, held-out embedding test, cluster consistency, GWAS enrichment, leakage, plus your own checks). |
+| 6 | `6_validate_evo2.py` | Validates fine-tuned models on the test individuals (predictions against baselines and controls, imputation, phenotypes, GWAS, recombination, embeddings, leakage, plus your own checks). |
 
-Shared code: `haplo_common.py` (downloads, individual lists, training set, device selection, synthetic test data) and `evo2_model.py` (the Evo 2, BioNeMo and mock backbones, the new layers and loss, and `load_finetuned`, which rebuilds a fine-tuned model for step 6).
+Shared code: `haplo_common.py` (downloads, individual lists, training set, device selection, the synthetic block-HMM data of `--test`), `evo2_model.py` (genome data, the Evo 2 / BioNeMo / small backbones, the 4a and 4b models, `load_finetuned`, and the training loop) and `haplo_baselines.py` (frequency, n-gram and Li-Stephens HMM predictors).
 
 ## 2. Key concepts: the haplograph
 
-The haplograph describes how haplotype patterns are shared across the 2,548 individuals of the 1000 Genomes data. There is one set of files per chromosome (chr1–chr22; chrX and chrY are not in the dataset).
+The haplograph describes how haplotype states are shared across the 2,548 individuals of the 1000 Genomes data. There is one set of files per chromosome (chr1–chr22; chrX and chrY are not in the dataset).
 
-**Nodes.** Each chromosome is divided into **haploblocks**, consecutive stretches written as `chr21_14215892-14284114` (chromosome, start and end in bp). Within each haploblock, the individuals' haplotypes are grouped into **clusters** of similar patterns. Each cluster is one node, with an id such as `chr21_14215892-14284114_cluster1`.
-- Every node records its **carriers**: the individuals who carry that cluster, as one 0/1 column per individual.
-- The number of carriers is the cluster's **support**. Most clusters are rare: on chr21 the median support is 1 (166,754 clusters in 597 haploblocks).
+**Haploblocks and clusters.** Each chromosome is divided into **haploblocks**, recombination-defined stretches written as `chr21_14215892-14284114` (chromosome, start and end in bp, GRCh38). Within each haploblock the haplotypes are grouped into **clusters** of similar sequences; each cluster is one node, `chr21_14215892-14284114_cluster1`. Most clusters are rare: on chr21 the median support is 1 (166,754 clusters in 597 haploblocks).
 
-**Edges.** An edge connects two clusters on the **same chromosome** that are carried by the same individuals; there are no edges between chromosomes. Its raw **weight** is the number of individuals carrying both clusters. The dataset's edge files only list clusters with `min(support, N − support) ≥ 25`, so rare clusters have no edges.
-- Common clusters share many carriers just by chance, so the pipeline converts the weight to **lift**: how many times more often the two clusters occur together than expected if they were independent.
+**Phased haplotypes.** Each individual has two haplotypes, and each haplotype carries exactly one cluster per haploblock (the dataset's per-haploblock files list the cluster of each of the 5,096 haplotypes; cluster index + 1 = the node's `cluster<N>`). So a haplotype is a sequence of one token per haploblock, in genomic order, and the same position means the same haploblock for every haplotype. The individual-level view (`nodes.csv.gz`: which individuals carry a cluster on either haplotype) loses phase and dosage: on chr21, 62% of (individual, haploblock) pairs carry two different clusters.
 
-  ```
-  lift = weight / (support_A × support_B / number of individuals)
-  ```
+**Edges and lift.** An edge connects two clusters of the **same chromosome**, at most `--max-span` bp apart, that sit on the same training haplotype more often than expected:
 
-- A lift of 1 means chance level; above 1 means the clusters tend to be inherited together. The dataset README recommends lift over raw counts.
-- In the pipeline's graph, each edge stores `log(1 + lift)`. Edges below `--min-lift` are dropped. Weight, support and lift are counted over the training individuals only.
+```
+lift = n_AB × H / (n_A × n_B)        (H training haplotypes; n_A haplotypes with A, n_AB with both)
+```
+
+A lift of 1 is chance level, above 1 means the clusters tend to be inherited together (in cis). Each edge stores `log(1 + lift)`; edges below `--min-lift` or seen on fewer than `--min-pair-count` training haplotypes are dropped. The individual-level alternative (`--lift individual`) counts co-carriage by the same individual (either haplotype) for the pairs of the dataset's edge file, which mixes cis and trans pairs.
 
 ## 3. Working directory structure
 
@@ -66,89 +65,85 @@ Everything is written under one root folder, `haplograph/` by default (`--workdi
 haplograph/
 ├── raw/                               step 1 downloads (largest part)
 │   ├── checksums.md5, verified.json     (files already MD5-checked: re-runs skip re-hashing them)
-│   ├── chr1/ nodes.csv.gz, edges.csv.gz [, edges_lift_above_threshold.csv.gz]
+│   ├── phenotypes_real.csv, pedigree.txt
+│   ├── chr1/ nodes.csv.gz, edges.csv.gz, haplotypes.csv.gz [, rep_seq.tar.gz, rep_seq.md5]
 │   └── ...
 ├── splits/                            step 1
 │   ├── train_individuals.txt          TRAINING set, one sample ID per line
 │   ├── test_individuals.txt           TEST set
-│   ├── split.json                     split name, source, sizes, set ids
+│   ├── populations.tsv                individual, superpopulation, population
+│   ├── related_pairs.tsv              individual_a, individual_b, relation, across_split
+│   ├── split.json                     split name, source, sizes, set ids, superpopulations per set, related pairs
 │   └── half_A.txt, half_B.txt         (BH_26 originals)
 ├── gwas/                              step 5
 │   ├── <label>.tsv, <label>.json      GWAS hits of one trait (CHR, POS, SNP, P, PUBMEDID)
 │   └── catalog/                       the downloaded GWAS Catalog zip (cached)
 ├── parts/                             per-chromosome cache (step 2), reused across graphs
-│   └── chr1/ nodes.npz, carriers.npz, edges_all_minlift2_train-<id>_<raw file id>.npz   (re-parsed when the raw file changes)
 └── genome_train_half_A/               one GRAPH FOLDER  (= --graph-dir for steps 3, 4 and 6)
     ├── nodes.csv.gz, individuals.txt, carriers.npz, graph.npz, graph_info.json    step 2
-    ├── train_individuals.txt, test_individuals.txt                                step 2
+    ├── haplotypes.npz, junctions.npz                                              step 2
+    ├── train_individuals.txt, test_individuals.txt, populations.tsv, related_pairs.tsv   step 2
     ├── features_svd128_<set id>_<graph id>_s<seed>[_rapids].npy   step 3 (cache)
     ├── node_emb_<method>.npy / .json            step 3 (+ .csv.gz with --csv)
-    ├── evo2[_bionemo|_mock]_next_<method>.pt    step 4
-    └── validation_<model name>/                 step 6
-        ├── report.md, summary.json, split.csv
-        ├── test_set_performance_chroms.csv
-        ├── cluster_consistency_regions.csv.gz
-        ├── gwas_enrichment_<label>_regions.csv.gz
-        ├── nemotron_summary.md                  (--nemotron-summary)
-        └── inputs/downloads/<URL hash>/         split files downloaded by step 6
+    ├── evo2_seq_cache/<id>/<haploblock>.npz     step 3 evo2_seq
+    ├── <backbone>[-random]_<objective>_<method>.pt     step 4a, e.g. evo2_next_gnn.pt, small_masked_gnn.pt
+    ├── <backbone>_pheno_<trait>_<method>.pt     step 4b
+    ├── phenotypes/<trait>_train.tsv, _test.tsv, _answer.json   step 4b --simulate
+    └── validation_<model name>/                 step 6: report.md, summary.json, split.csv, one CSV per task,
+                                                 nemotron_summary.md, inputs/ (downloads)
 ```
 
-Graph folder names: `genome` (all 22 chromosomes) or e.g. `chr21_chr22` (a selection), plus `_train_<split name>` (`half_A` for BH_26, e.g. `random50_seed0` for a random split, or the stem of a `--train-individuals` file). Step 4b writes its model next to its input TSV.
+Graph folder names: `genome` (all 22 chromosomes) or e.g. `chr21_chr22` (a selection), plus `_train_<split name>` (`half_A` for BH_26, e.g. `random50_seed0` for a random split, or the stem of a `--train-individuals` file).
 
 ## 4. Script reference
 
-Only the main options are listed; `--help` shows all of them, and each script's header documents its output formats (input formats are in this section). Every script has **`--test`**, which runs it on a small synthetic haplograph (2 chromosomes, 60 individuals) on the CPU in seconds; the test outputs go to `<system temp>/haplograph_selftest/`. Steps 3–4 accept `--train-individuals` (a file or URL, one sample ID per line) and `--sample-map` (CSV: graph name, sample ID; only needed if the graph's individual names differ from the sample IDs); the training set defaults to the graph's `train_individuals.txt`.
+Only the main options are listed; `--help` shows all of them, and each script's header documents its output formats. Every script has **`--test`**, which runs it on a small synthetic haplograph (2 chromosomes, 60 individuals, drawn from a known block-HMM) on the CPU in seconds; the test outputs go to `<system temp>/haplograph_selftest/`. Steps 3, 4a and 4b take the training set from the graph's `train_individuals.txt` and stop on any other.
 
 ### Step 1: `1_download_haplograph.py`
 
-Downloads `nodes.csv.gz` and the edge file of each chromosome from `https://data.haploblocks.org/haplograph/1000G/<chrom>/`, checks them against `checksums.md5`, and writes the train/test split restricted to the individuals of the haplograph.
-
-- **Out:** `raw/<chrom>/…`, `splits/train_individuals.txt`, `splits/test_individuals.txt`, `splits/split.json`.
+Downloads `nodes.csv.gz` and the edge file of each chromosome from `https://data.haploblocks.org/haplograph/1000G/<chrom>/` and checks them against `checksums.md5`. With `--haplotypes`, it downloads `<chrom>_individual_hashes_<haploblock>.tsv` from `haploblock_hashes/1000G/<chrom>/` for every haploblock (the last 20 bits of each haplotype's hash are its cluster index), checks that every haplotype of every individual has exactly one cluster that exists in the haplograph, and writes `raw/<chrom>/haplotypes.csv.gz`. It writes the train/test split restricted to the haplograph's individuals, each individual's population (`phenotypes_real.csv`; used only to stratify step 6, never as a model input) and the parent-child and sibling pairs of the 1000 Genomes pedigree (BH_26 on the 2,548 haplograph individuals: none).
 
 | Option | Default | Meaning |
 |---|---|---|
 | `--chroms` | all (chr1–chr22) | e.g. `chr21,chr22` or `21,22` |
-| `--edges` | `all` | `lift5` = small pre-filtered file (lift ≥ 5); `both` |
-| `--split` | `bh26` | BH_26 halves (`half_A` train, `half_B` test); `random` = new split |
+| `--haplotypes` | off | download each haplotype's cluster per haploblock (needed by steps 2–6 with haplotype units) |
+| `--sequences` | off | download each cluster's representative sequence, `rep_seq.tar.gz` (step 3 `evo2_seq`; 3.1 GB for chr21) |
+| `--edges` | `all` | `lift5` = small pre-filtered file (lift ≥ 5); `both` (only used by `--lift individual`) |
+| `--split` | `bh26` | BH_26 halves (`half_A` train, `half_B` test); `random` = new split, related individuals on one side |
 | `--test-fraction`, `--seed` | `0.5`, `0` | random split; stratified by 1000G population unless `--no-stratify` |
 | `--workdir` | `haplograph` | output root |
+| `--jobs` | `8` | parallel downloads of the per-haploblock files |
 | `--no-verify` | off | skip the MD5 check |
 
 Usage (more in [section 11](#11-running-the-pipeline)):
 
 ```bash
-python 1_download_haplograph.py --test                # test: synthetic haplograph + split
-python 1_download_haplograph.py --chroms chr21        # test: one chromosome
-python 1_download_haplograph.py                       # full run: whole genome, BH_26 split
+python 1_download_haplograph.py --test                        # test: synthetic haplograph + split
+python 1_download_haplograph.py --chroms chr21 --haplotypes   # test: one chromosome
+python 1_download_haplograph.py --haplotypes                  # full run: whole genome, BH_26 split
 ```
 
 ### Step 2: `2_build_graph.py`
 
-Merges the chromosomes into one graph. Edge weights, support and lift come from the training individuals only (the split of step 1, or `--train-individuals`); `--no-split` uses all individuals. When `--train-individuals` is the split's own `train_individuals.txt`, the split's test file is used too; for any other training file pass `--test-individuals`, or step 6 will ask for it.
+Merges the chromosomes into one graph. Everything learned from data comes from the training individuals only (the split of step 1, or `--train-individuals`; `--no-split` uses all individuals). With `--lift haplotype` (the default when every chromosome has `haplotypes.csv.gz`) the candidate pairs and their counts come from the training haplotypes; with `--lift individual` they come from the dataset's edge file and are re-weighted on the training individuals.
 
-If the graph folder already exists, step 2 compares the requested settings (chromosomes, `--edges`, `--min-lift`, training and test sets) with its `graph_info.json`: identical settings reuse the graph, different ones stop with the differences listed. `--force` rebuilds in place (steps 3 and 4 then notice the new build and recompute / refuse stale outputs), `--out` writes a new folder.
+With haplotype data, step 2 also writes `haplotypes.npz` (int32 [2 × individuals, haploblocks]: row 2i / 2i+1 = haplotype 0 / 1 of individual i, value = node index; all individuals, because step 6 needs the test rows) and `junctions.npz` (`block`, `a`, `b`, `count`: training haplotypes with node a in haploblock column `block` and node b in the next one). The build stops unless every individual's two haplotypes reproduce its carriers in `nodes.csv.gz` exactly.
 
-- **In:** step 1's `raw/` and `splits/`:
-  - `nodes.csv.gz` has columns `id`, `high_dim_edge` (the haploblock), then one 0/1 column per individual;
-  - `edges.csv.gz` has columns `source`, `target`, `weight`.
-- **Out** (in the graph folder):
-  - `nodes.csv.gz`: columns `node`, `id`, `chrom`, `region`, `start`, `end`, `support`, and `support_train`;
-  - `individuals.txt`: one individual per line;
-  - `train_individuals.txt`, `test_individuals.txt`: the training and test individuals found in the graph;
-  - `carriers.npz`: sparse [nodes × individuals], all individuals;
-  - `graph.npz`: sparse [nodes × nodes], `log(1 + lift)`;
-  - `graph_info.json`: settings, counts and the training / test sets.
+If the graph folder already exists, step 2 compares the requested settings with its `graph_info.json`: identical settings reuse the graph, different ones stop with the differences listed. `--force` rebuilds in place (steps 3 and 4 then notice the new build), `--out` writes a new folder.
+
+- **Out** (in the graph folder): `nodes.csv.gz` (`node`, `id`, `chrom`, `region`, `start`, `end`, `support`, `support_train`), `individuals.txt`, `train_individuals.txt`, `test_individuals.txt`, `populations.tsv`, `related_pairs.tsv`, `carriers.npz` (sparse [nodes × individuals]), `graph.npz` (sparse [nodes × nodes], `log(1 + lift)`), `haplotypes.npz`, `junctions.npz`, `graph_info.json` (settings, counts, `pair_source`, training / test sets).
 
 | Option | Default | Meaning |
 |---|---|---|
 | `--chroms` | every downloaded chromosome | e.g. `chr21,chr22` |
+| `--lift` | `haplotype` with haplotype data, else `individual` | same-haplotype or same-individual co-occurrence |
+| `--max-span` | `500000` | `--lift haplotype`: max bp between linked haploblocks (start to start) |
+| `--min-pair-count` | `3` | `--lift haplotype`: min training haplotypes carrying both clusters |
+| `--min-lift` | `2.0` | drop weaker edges |
 | `--train-individuals` | the split of step 1 | training set file or URL |
 | `--no-split` | off | build from all individuals |
-| `--min-lift` | `2.0` | drop weaker edges |
-| `--edges` | `all` | `lift5` = small pre-filtered file (not train-only) |
 | `--workdir`, `--raw-dir`, `--out` | `haplograph`, `<workdir>/raw`, automatic | locations |
-| `--cudf` | off | read and match nodes/edges on the GPU with RAPIDS cuDF |
-| `--chunksize` | `2000000` | edge rows read at a time; `0` = whole file (with `--cudf`, needed for GPU parsing) |
+| `--cudf`, `--chunksize` | off, `2000000` | `--lift individual`: read the edge files on the GPU with RAPIDS cuDF; rows per chunk (`0` = whole file) |
 
 Usage (more in [section 11](#11-running-the-pipeline)):
 
@@ -156,112 +151,108 @@ Usage (more in [section 11](#11-running-the-pipeline)):
 python 2_build_graph.py --test                      # test: synthetic data
 python 2_build_graph.py --chroms chr21              # test: -> haplograph/chr21_train_half_A
 python 2_build_graph.py                             # full run: whole genome -> haplograph/genome_train_half_A
-python 2_build_graph.py --cudf --chunksize 0        # or with RAPIDS cuDF on the GPU
 ```
 
 ### Step 3: `3_node_embeddings.py`
 
-Learns one vector per node, by default with all three methods (`--method all`, or e.g. `--method gnn,xgboost`). No labels are used.
+Learns one vector per node, by default with carrier_svd, node2vec and the GNN (`--method all`, or e.g. `--method gnn,xgboost`). No phenotype or population labels are used.
 
 | Method | Uses | How |
 |---|---|---|
+| `carrier_svd` | carriers | the SVD-compressed profile of which training individuals carry the node: the GNN's (and XGBoost's) input, kept as the reference graph methods must beat in step 6 |
 | `node2vec` | graph | random walks along edges, then skip-gram (nodes close on walks get similar vectors) |
-| `gnn` | graph + carrier features | 2-layer graph convolutional network trained to predict which nodes are connected |
-| `xgboost` | graph + carrier features | trees predict each node's **haploblock region** (regions in genomic order grouped into `--xgb-region-bins` bins of about equal node count); the leaves a node falls into become its vector |
+| `gnn` | graph + carrier_svd | 2-layer graph convolutional network trained to predict which nodes are connected |
+| `xgboost` | graph + carrier_svd | trees predict each node's **cis partner** in the next haploblock (the frequency rank, within that haploblock, of the cluster that most often follows it on a training haplotype; `--xgb-classes` classes); the leaves a node falls into become its vector. Not in `--method all` (see section 8) |
+| `evo2_seq` | sequences (GPU) | Evo 2 at `--layer`, mean-pooled over each cluster's representative haplotype sequence (`--seq-windows` windows of `--seq-window` bp), centred within its haploblock (clusters of one haploblock differ by a few variants) and reduced to `--dim` by PCA. Defined for every cluster, including those never seen in training; cached per haploblock so a run can resume. Needs step 1 `--sequences`; costs one Evo 2 pass per cluster (chr21: 167k) |
 
-- **In:** `graph.npz`, plus `carriers.npz` (gnn, xgboost) and `nodes.csv.gz` (xgboost).
-- **Out:**
-  - `node_emb_<method>.npy`: float32 [nodes × dim], row *i* = node *i*;
-  - `node_emb_<method>.json`: settings, a training summary (e.g. XGBoost accuracy vs the majority-class baseline), the training set and the graph build (`graph_id`, a hash of `graph_info.json`);
-  - `node_emb_<method>.csv.gz` with `--csv`.
+- **Out:** `node_emb_<method>.npy` (float32 [nodes × dim], row *i* = node *i*), `node_emb_<method>.json` (settings, a training summary, the training set and the graph build), `node_emb_<method>.csv.gz` with `--csv`.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--method` | `all` | `node2vec`, `gnn`, `xgboost`, a comma-separated list, or `all` |
+| `--method` | `all` | a method, a comma-separated list, or `all` (carrier_svd, node2vec, gnn) |
 | `--dim` | `64` | embedding size |
 | `--p`, `--q` | `1.0`, `1.0` | node2vec: low `p` keeps walks local, low `q` makes them explore |
 | `--walks-per-node`, `--walk-length` | `10`, `40` | node2vec walk budget (CPU-bound) |
 | `--gnn-epochs` | `300` | GNN training length |
-| `--xgb-trees`, `--xgb-depth` | `50`, `6` | boosting rounds and tree depth; the model has `--xgb-trees` × bins trees |
-| `--xgb-region-bins` | `16` | number of genomic bins = XGBoost classes |
-| `--device` | cuda if available | `cpu` / `cuda` for torch and XGBoost |
+| `--xgb-trees`, `--xgb-depth`, `--xgb-classes` | `50`, `6`, `8` | XGBoost; the model has `--xgb-trees` × classes trees |
+| `--seq-window`, `--seq-windows`, `--raw-dir` | `8192`, `1`, `<graph-dir>/../raw` | evo2_seq; backbone options as in step 4a |
+| `--device` | cuda if available | `cpu` / `cuda` |
 | `--rapids` | off | carrier and leaf SVDs on the GPU with RAPIDS cuML + CuPy (see section 6) |
-
-If XGBoost runs out of memory, lower `--chunk-nodes`, `--xgb-svd-nodes`, `--xgb-train-nodes`, `--xgb-max-bin`, `--xgb-region-bins`, `--xgb-trees` or `--xgb-depth`. Step 3 moves the booster to the CPU before computing leaves, which avoids XGBoost's slow GPU/CPU device-mismatch path.
 
 Usage (more in [section 11](#11-running-the-pipeline)):
 
 ```bash
-python 3_node_embeddings.py --test                  # test: synthetic data
-python 3_node_embeddings.py --graph-dir haplograph/chr21_train_half_A --device cpu --walks-per-node 2 --gnn-epochs 50 --xgb-trees 20   # test: chr21, CPU
-python 3_node_embeddings.py --graph-dir haplograph/genome_train_half_A --device cuda --rapids                                  # full run: GPU
+python 3_node_embeddings.py --test                  # test: synthetic data (every method, small backbone for evo2_seq)
+python 3_node_embeddings.py --graph-dir haplograph/chr21_train_half_A --device cpu --walks-per-node 2 --gnn-epochs 50   # test: chr21, CPU
+python 3_node_embeddings.py --graph-dir haplograph/genome_train_half_A --device cuda --rapids                           # full run: GPU
 ```
 
 ### Step 4a: `4a_finetune_evo2_embeddings.py`
 
-Fine-tunes Evo 2 7B on node embeddings, with no DNA involved. One example is one individual on one chromosome: their clusters in genomic order, each replaced by its embedding.
-- The embeddings are projected into Evo 2 in place of its DNA-letter embeddings, plus a learned per-chromosome vector. Each embedding first gets a **genomic-position encoding** appended (sin / cos of the cluster's start at `--pos-freqs` wavelengths from 10 kb to the graph's largest start coordinate, standardized like the embedding; unknown starts get 0), used both as input and in the candidate keys the head is scored against. Node embeddings describe carrier and linkage structure, not location, so without it the model cannot tell which region comes next. Positive control (`tests/test_iteration3.py`: synthetic data, mock backbone, 60 epochs, 317 predictions on step 4's validation individuals): top-1 0.48 with the encoding vs 0.11 without, against a bigram of 0.53; on the graph's test half, never used for the graph or embeddings: 0.51 vs 0.13, bigram 0.52 (641 predictions).
-- Evo 2 runs up to its read-out layer. Its last `--train-blocks` blocks before it are fully fine-tuned; the rest stay frozen. Evo 2 is kept in bf16, so the optimizer steps on fp32 master copies of the unfrozen weights and writes them back after every step (updating bf16 weights in place at `--lr 1e-5` would round every update away).
-- Step 4 refuses embeddings made from an earlier build of the graph (different `graph_id`) or another training set.
-- Rare clusters: most clusters are carried by one person, and 38.6% of chr21 clusters never occur in the training half, so predicting their identity is impossible. `--min-support` merges rare clusters into one "rare cluster of this region" token, counting carriers among step 4's own training individuals (not its validation individuals). The default `2` also merges clusters with one training carrier, so the token occurs in training and can be learned (at `1` it never would: on chr21 0 of 559 merged tokens are learnable, at `2` 550 of 567). A region whose rare clusters were all unseen in training still has an unlearnable token. `test_set_performance` reports the share of test targets that are merged tokens.
-- Objective: predict the next token along the chromosome (cosine similarity to every token of that chromosome, i.e. its clusters after `--min-support` merging, softmax with `--temperature`).
-- Only training individuals are used, split again into train and validation (`--val-frac`).
+Fine-tunes Evo 2 7B on node embeddings, with no DNA involved.
+
+- **Units.** With `--units haplotype` (default) one example is one training haplotype on one chromosome, exactly one token per haploblock, so token offset = haploblock offset for every example. `--units individual` uses every cluster an individual carries (1 or 2 per haploblock, in file order) and needs `--softmax all`.
+- **Tokens.** Each token is the node's embedding with the haploblock's log length and a **genomic-position encoding** appended (sin / cos of the cluster's start at `--pos-freqs` wavelengths from 10 kb to the graph's largest start, standardized like the embedding), projected into Evo 2 in place of its DNA-letter embeddings, plus a learned per-chromosome vector. Clusters carried by fewer than `--min-support` training haplotypes share one "rare cluster of this haploblock" token (embedding = mean of its members), counted on step 4a's own training individuals.
+- **Objective.** `--objective next` predicts each haploblock's cluster from the ones before it (causal, like Evo 2's pretraining). `--objective masked` replaces spans of 1..`--mask-max` haploblocks (`--mask-frac` of the tokens) by a learned mask vector plus the haploblock's position and length, runs Evo 2 on the haplotype and on its reverse, and predicts each masked cluster from the two states concatenated (left and right context).
+- **Head and softmax.** `--softmax block` (default with haplotype units) scores only the clusters of the target's haploblock, which is exact for haplotype units and leaves "which cluster" without "where". `--head scaled-cosine` (default) = cosine similarity to each candidate's embedding times a learned logit scale (log scale initialised at log 10, clamped to [0, log 100]); `--head table` = a learned output vector and bias per token, initialised from the embeddings; `--head cosine` = a fixed `--temperature`. Step 6's `head_ceiling` reports the floor each head leaves.
+- **Backbone and controls.** Evo 2 runs up to its read-out layer; its last `--train-blocks` blocks (default 4) are fine-tuned, the rest stay frozen. Evo 2 is kept in bf16, so the optimizer steps on fp32 master copies of the trainable weights. `--init random` replaces Evo 2's pretrained weights with a seeded random init (same architecture and trainable budget); `--backbone small` is a causal transformer with sinusoidal token positions trained from scratch (`--small-hidden` 512, `--small-layers` 6, every block trained at `--head-lr`). Each checkpoint records its trainable parameter count.
+- **Training.** AdamW (`--lr` for Evo 2's blocks, `--head-lr` for the new layers), `--batch` sequences per step, `--epochs` (default 3), evaluation every `--eval-every` steps and after every epoch; the parameters of the lowest validation loss are kept. The training state is saved to `<out>.resume` after every evaluation; `--resume` continues from it. Only training individuals are used, split again into train and validation (`--val-frac`).
+- **`--smoke`** loads the backbone, runs one forward / backward on 16 tokens, checks that gradients reach the input projection and the trainable blocks, reports the peak memory and the seconds per step at `--max-len`, and exits.
 
 | Backbone | Flag | Notes |
 |---|---|---|
-| Evo 2 via the `evo2` package | (default) | one CUDA GPU (80 GB recommended); `--evo2-model`, `--layer` |
-| Evo 2 via NVIDIA BioNeMo | `--bionemo` | **experimental, not yet run on a GPU**; inside the BioNeMo container, NeMo2 checkpoint in `--ckpt-dir`, `--model-size` (default `7b`), `--layer-index` (default `28`); code that may need adjusting for your BioNeMo version is marked `VERSION-SENSITIVE` in `evo2_model.py` |
-| small stand-in model | `--mock-evo2` | a random causal transformer (`--mock-hidden`, `--mock-layers`), runs on CPU; **not Evo 2**, only for checking the pipeline |
+| Evo 2 via the `evo2` package | `--backbone evo2` (default) | one CUDA GPU (80 GB recommended); `--evo2-model`, `--layer` |
+| Evo 2 via NVIDIA BioNeMo | `--bionemo` / `--backbone bionemo` | **experimental, not yet run on a GPU**; inside the BioNeMo container, NeMo2 checkpoint in `--ckpt-dir`, `--model-size` (default `7b`), `--layer-index` (default `28`); code that may need adjusting for your BioNeMo version is marked `VERSION-SENSITIVE` in `evo2_model.py` |
+| small transformer | `--backbone small` | trained from scratch; the baseline for "pretraining helps", and the CPU model of every `--test` |
 
-- **In:** `nodes.csv.gz`, `individuals.txt`, `carriers.npz`, `node_emb_<method>.npy` + `.json`.
-- **Out:** `evo2[_bionemo|_mock]_next_<method>.pt`, a torch dict (CPU tensors) containing:
-  - `trained_blocks`: the fine-tuned backbone weights (the whole stand-in model for `--mock-evo2`);
-  - `proj_in`, `chrom_emb`, `head`: the new layers;
-  - `backend`, `graph_method`, `chroms`, `embeddings_sha1` and the backbone settings;
-  - `train_individuals`, `val_individuals`, `train_set_id`;
-  - `metrics` (validation before / after training) and `config`.
+- **In:** `nodes.csv.gz`, `individuals.txt`, `haplotypes.npz` (or `carriers.npz` with individual units), `node_emb_<method>.npy` + `.json`.
+- **Out:** `<backbone>[-random]_<objective>_<method>[_individual].pt`, a torch dict (CPU tensors): `trained_blocks` (the trained backbone parameters; the whole small backbone), `proj_in`, `chrom_emb`, `head_layers`, `extra` (mask vector, logit scale or output table); `backend`, `init`, `units`, `objective`, `head`, `softmax`, `graph_method`, `chroms`, `graph_id`, `embeddings_sha1`; `train_individuals`, `val_individuals`, `train_set_id`; `trainable_params`; `metrics` (`before`, `best`, `last`, `best_step`, `history`) and `config`.
 
 | Option | Default | Meaning |
 |---|---|---|
 | `--method` | required | which embeddings |
-| `--train-blocks` | `4` | backbone blocks to fine-tune; `0` = frozen baseline (only the new layers train) |
-| `--lr`, `--head-lr` | `1e-5`, `1e-3` | learning rates of the backbone blocks and the new layers |
-| `--batch` | `8` | sequences per optimizer step (gradient accumulation, one sequence per forward pass) |
-| `--max-len` | `1024` | max clusters per sequence (memory grows with it × the clusters on the chromosome) |
-| `--epochs` | `1` | passes over the training sequences |
-| `--chroms` | all of the graph | train on some chromosomes only |
-| `--pos-freqs` | `16` | genomic-position encoding (sin/cos at this many wavelengths); `0` = embeddings only |
-| `--min-support` | `2` | clusters carried by fewer of step 4's training individuals share one token per haploblock region (embedding = mean of its members); `0` = no merging. On chr21 (1,127 training individuals): 166,754 tokens without merging, 95,874 at `1`, 29,034 at `2`, 10,965 at `5` |
+| `--units` | `haplotype` | `individual`: the carriers view (for comparison) |
+| `--objective` | `next` | `masked`: masked-haploblock prediction from both sides |
+| `--head`, `--softmax` | `scaled-cosine`, `block` | see above |
+| `--backbone`, `--init` | `evo2`, `pretrained` | `small`, `bionemo`; `random` |
+| `--train-blocks` | `4` (all for small) | backbone blocks to train; `0` = frozen backbone (only the new layers train) |
+| `--lr`, `--head-lr` | `1e-5`, `1e-3` | learning rates of Evo 2's blocks and of the new layers (and the small backbone) |
+| `--batch`, `--epochs` | `8`, `3` | sequences per optimizer step; passes over the training sequences |
+| `--max-len` | `1024` | max tokens per sequence |
+| `--pos-freqs` | `16` | genomic-position encoding (`0` = none) |
+| `--min-support` | `2` | merge clusters carried by fewer training haplotypes (`0` = no merging) |
+| `--mask-frac`, `--mask-max` | `0.15`, `3` | masked objective |
+| `--eval-every`, `--resume`, `--smoke` | `200`, off, off | see above |
 
 Usage (more in [section 11](#11-running-the-pipeline)):
 
 ```bash
-python 4a_finetune_evo2_embeddings.py --test        # test: synthetic data, stand-in model
-python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir haplograph/chr21_train_half_A --mock-evo2 --device cpu --max-len 128   # test: chr21, CPU
-python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir haplograph/genome_train_half_A                                       # full run: Evo 2, GPU
+python 4a_finetune_evo2_embeddings.py --test        # test: synthetic data, small backbone
+python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir haplograph/chr21_train_half_A --backbone small --device cpu   # test: chr21, CPU
+python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir haplograph/genome_train_half_A                               # full run: Evo 2, GPU
 ```
 
-### Step 4b: `4b_finetune_evo2_hash.py` (optional)
+### Step 4b: `4b_finetune_evo2_phenotype.py`
 
-Fine-tunes Evo 2 to predict a phenotype from a genomic hash. Each bit of the hash is one Evo 2 token.
-- Numeric phenotypes are treated as regression (reports RMSE, Pearson r and R²).
-- Text labels are treated as classification (reports accuracy).
+Fine-tunes Evo 2 to predict a phenotype from an individual's genome. With `--input tokens` (default) both haplotypes of every chromosome are step-4a tokens, each run through the backbone; their states are attention-pooled per chromosome, the chromosome vectors attention-pooled into one genome vector, and a head predicts the phenotype (regression for numbers, classification for labels). `--init-from` starts from a step-4a checkpoint (its backbone blocks and input projection). `--input hash` is the "unlinked hash" baseline: a 0/1 genomic hash per row (`--hash-pheno`), cut into tokens of `--hash-bits` bits (one haploblock hash each), so the model sees cluster identities without the haplograph's linkage.
 
-- **In:** a TSV with two columns, the hash (0/1 string) and the phenotype, with an optional header row. Build it from training individuals only.
-- **Out:** `evo2_hash_<phenotype>.pt` next to the TSV.
+1000 Genomes has no measured traits beyond ancestry and sex, so `--simulate` draws one on the graph's real haplotypes:
 
-| Option | Default | Meaning |
-|---|---|---|
-| `--hash-pheno` | required | input TSV |
-| `--task` | `auto` | `regression` or `classification` |
-| `--hash-window` | `4096` | bits per Evo 2 pass; longer hashes are split |
-| `--mock-evo2` | off | CPU stand-in model instead of Evo 2 |
+| Trait | Genetic value |
+|---|---|
+| `additive` | `--causal-blocks` haploblocks, one causal cluster each (training frequency 5–50%), effect N(0, 1) per copy |
+| `cis` | `--causal-blocks` pairs of neighbouring haploblocks with a cluster pair (a, b) found together on 5–50% of training haplotypes; the effect counts the haplotypes that carry a AND b, so a and b on different haplotypes of one individual do nothing (an additive model of cluster dosages cannot represent it exactly) |
+| `null` | none |
+
+The phenotype is the genetic value scaled to heritability `--h2` plus Gaussian noise, written to `phenotypes/<trait>_train.tsv` (training individuals only, the file 4b trains on), `_test.tsv` (for step 6) and `_answer.json` (causal haploblocks, clusters, effects). `--phenotype FILE` takes real values of training individuals instead; a file with test individuals is refused.
+
+- **Out:** `<backbone>[-random]_pheno_<trait>_<method>.pt` (hash input: next to the TSV): `mode` "phenotype", `input`, `task`, `trait`, `target_mean` / `target_std`, the trained parameters, `train_individuals`, `val_individuals`, `metrics`, `config`.
 
 Usage (more in [section 11](#11-running-the-pipeline)):
 
 ```bash
-python 4b_finetune_evo2_hash.py --test                         # test: synthetic TSV, stand-in model
-python 4b_finetune_evo2_hash.py --hash-pheno hash_height.tsv   # full run: Evo 2, GPU
+python 4b_finetune_evo2_phenotype.py --test                                       # test: simulated cis trait, small backbone
+python 4b_finetune_evo2_phenotype.py --graph-dir $G --method gnn --simulate cis   # full run: Evo 2, GPU
 ```
 
 ### Step 5: `5_download_gwas.py`
@@ -273,11 +264,10 @@ Downloads the [NHGRI-EBI GWAS Catalog](https://www.ebi.ac.uk/gwas/docs/file-down
 | Option | Default | Meaning |
 |---|---|---|
 | `--trait` | none | regular expression on `MAPPED_TRAIT` / `DISEASE/TRAIT`, case-insensitive (e.g. `"^body height$"`) |
-| `--trait-id` | none | comma-separated ontology IDs, the last part of `MAPPED_TRAIT_URI` (e.g. `OBA_VT0001253`; `OBA:VT0001253` also works); also matches associations mapped to several traits (body height: 29,502 variants instead of 29,486) |
+| `--trait-id` | none | comma-separated ontology IDs, the last part of `MAPPED_TRAIT_URI` (e.g. `OBA_VT0001253`; `OBA:VT0001253` also works); also matches associations mapped to several traits |
 | `--label` | from the filter | output file name (letters, digits, `.`, `_`, `-`) |
 | `--catalog` | latest release URL | catalog zip, https URL or local file |
-| `--workdir` | `haplograph` | output root |
-| `--force` | off | download the catalog again |
+| `--workdir`, `--force` | `haplograph`, off | output root; download the catalog again |
 
 Usage (more in [section 11](#11-running-the-pipeline)):
 
@@ -288,33 +278,41 @@ python 5_download_gwas.py --trait "^body height$" --label height    # full run: 
 
 ### Step 6: `6_validate_evo2.py`
 
-Validates one fine-tuned model on the test set. By default it uses the graph folder's `train_individuals.txt` / `test_individuals.txt` (from steps 1–2; a graph with a training set but no test file is refused rather than paired with another split, and only a `--no-split` graph falls back to BH_26); `--splits DIR_OR_URL` reads `half_A.txt` / `half_B.txt` from elsewhere (e.g. the [BH_26 folder](https://data.haploblocks.org/BH_26/splits/)), and `--splits none` uses the model's own validation individuals. It warns if any test individual was used to build the graph or to train or validate the model (when the checkpoint records its individuals, as every current step-4 checkpoint does). With `--splits none` the train side is the model's own training individuals. The checks to run are listed in a tasks file, one per line ([`validation_tasks.txt`](part1_haplograph/validation_tasks.txt)):
+Validates fine-tuned models on the test set. By default it uses the graph folder's `train_individuals.txt` / `test_individuals.txt`; `--splits DIR_OR_URL` reads `half_A.txt` / `half_B.txt` from elsewhere, and `--splits none` uses the model's own validation individuals. It warns if any test individual was used to build the graph or to train or validate a model. `--model` can be repeated: `model_comparison` uses every model, the other tasks the first (or the one in their `model=` parameter). The checks to run are listed in a tasks file, one per line ([`validation_tasks.txt`](part1_haplograph/validation_tasks.txt)):
 
 ```
 model_info
 test_set_performance max_examples=500 train_examples=200
+head_ceiling
 embedding_cooccurrence min_lift=2 min_support=5 min_expected=5 pairs=50000
 cluster_consistency min_carriers=1 permutations=200
 gwas_enrichment gwas=haplograph/gwas/height.tsv pvalue=5e-8 clump=auto label=height
+model_gwas gwas=haplograph/gwas/height.tsv pvalue=5e-8
+junction_strength
 ```
 
 | Task | Checks |
 |---|---|
-| `model_info` | model type and backbone, stored metrics, train/test leakage |
-| `test_set_performance` | **queries the fine-tuned model** on the test individuals: next-cluster cross-entropy, perplexity, top-1 / top-5 accuracy per chromosome, top-1 within the target's own region; 95% CIs from a paired bootstrap over test individuals (model, bigram, model − bigram); the bigram conditional entropy of the training sequences as a reference cross-entropy (not a floor: a model with more context can go below it); the same on a sample of training individuals (generalization gap); a bigram baseline (most frequent next cluster after the current one, counted on the training individuals) that the model should beat; the stored validation metrics. Needs the backbone used in step 4 (a GPU for Evo 2 / BioNeMo) |
-| `embedding_cooccurrence` | **held-out test of the step-3 embeddings, no GPU**: for distinct cluster pairs in different regions (≤ `max_distance` bp apart, ≥ `min_support` test carriers each, ≥ `min_expected` co-carriers expected among the test individuals, so that one chance co-carrier of two rare clusters can't make a pair "linked"), ROC AUC of embedding cosine similarity for pairs that co-occur among the TEST individuals (lift ≥ `min_lift`) vs pairs that don't (lift ≤ 1); overall, within distance bins and within frequency bins, with a 95% CI that resamples haploblock regions; references: genomic proximity, cluster frequency, and the lift counted on the training individuals. Warns when the graph was built with test individuals |
-| `cluster_consistency` | per haploblock: do train and test individuals carry the same clusters, at the same frequencies, compared with random splits of the same size? |
-| `gwas_enrichment` | GWAS hits (p < `pvalue`) are clumped into independent loci (lowest p first; each hit joins the first lead within `clump` bp; `clump=auto`: 25 kb for hit lists, 250 kb for summary statistics, where LD reaches further). **Per haploblock:** more loci than expected, for a hit list (step 5) from the haploblock's length (Poisson), for full summary statistics from the SNPs tested in it (hypergeometric); `mode=auto` picks summary statistics when most rows have p > 1e-5; Benjamini-Hochberg q, the top haploblock and its q. **Two nulls**, `permutations` draws each (`0` = none; their fields are then empty); hits move along the haploblock span for a hit list, and over the SNP order for summary statistics (hit labels land on other tested SNPs, so every haploblock keeps its SNP count): (1) every locus, with its hits, moved to a random place on its chromosome: haploblocks with q < 0.05 by chance and `empirical_fdr`; (2) all hits rotated along the chromosome with their spacing kept: calls that the clustering of hits alone produces and `empirical_fdr_rotation` (a warning when it exceeds twice null 1: the calls are dense clusters of hits, independent only if LD does not reach beyond `clump`), the number of hit pairs sharing a haploblock (more than under rotation = the haploblock boundaries keep GWAS loci together), and hits inside haploblocks (informative only where haploblocks leave gaps; coverage counts the union of the haploblocks). A note says when `clump` is so large that no haploblock can reach p < 0.05/haploblocks. A SNP on the boundary shared by two haploblocks belongs to the second; `window` bp widen every haploblock (a SNP within reach of two counts for both, and so do its pairs). Positions must use the haplograph's build (GRCh38): a file whose `5_download_gwas.py` sidecar `.json` names another build is refused, a file with no SNP inside a haploblock fails, and more than 5% of SNPs outside the haploblock span gives a warning |
+| `model_info` | model type, backbone, init, units, objective, head, trainable parameters, stored metrics and best step, train/test leakage |
+| `test_set_performance` | **queries the fine-tuned model** (next-token objective) on test haplotypes: cross-entropy, perplexity, top-1 / top-5, against **baselines counted on the training haplotypes**: frequency (also the identity-free baseline for haplotype units), add-k smoothed bigram, trigram with backoff and a Li-Stephens HMM (copying the training haplotypes, switch and error rates fitted on held-out training haplotypes); with individual units, identity-free (the current token's haploblock and slot, not its identity) and bigram. 95% CIs of the model and of model − each baseline from a paired bootstrap over test individuals (`beats_baselines`); the same on a sample of training individuals (generalization gap); the bigram reference entropy and the head's floor. `test_set_performance_strata.csv`: every metric by target training frequency (< 1%, 1–5%, 5–20%, > 20%), superpopulation, haploblock-length tertile, merged-rare target and (individual units) same- vs next-haploblock target, with CIs. Needs the backbone used in step 4a (a GPU for Evo 2 / BioNeMo) |
+| `head_ceiling` | the cross-entropy of an oracle that points the head exactly at each target's key, at the current and at the largest logit scale, and how collinear the keys are (cosine to the nearest other key); a learned table has no floor |
+| `masked_imputation` | masked-objective model: `spans` of 1, 2, 5 haploblocks masked on both haplotypes of test individuals; concordance and r² of the cluster dosage (pooled per training-frequency bin) for the model, the HMM (forward-backward), a flank lookup (training haplotypes matching both flanking clusters) and the frequency, with paired CIs of model − each |
+| `model_comparison` | every `--model` scored on the same test examples (top-1, cross-entropy), with paired CIs between every pair; pairs with a different readout, units, merging or chromosomes are marked not comparable |
+| `embedding_cooccurrence` | **held-out test of the step-3 embeddings, no GPU**: for distinct cluster pairs in different haploblocks (≤ `max_distance` bp apart, ≥ `min_support` test occurrences each, ≥ `min_expected` co-occurrences expected), ROC AUC of embedding cosine similarity for pairs that co-occur on the same TEST haplotype (`labels=haplotype`, default with haplotype data; lift ≥ `min_lift`) vs pairs that don't (lift ≤ 1); overall, within distance and frequency bins, on pairs without graph edges, and minus carrier_svd's AUC with a paired CI; references: genomic proximity, cluster frequency, the training haplotypes' lift; the 95% CIs resample haploblocks |
+| `cluster_consistency` | per haploblock: do train and test individuals carry the same clusters at the same frequencies (permutation null); related pairs across the split |
+| `gwas_enrichment` | GWAS hits (p < `pvalue`) clumped into independent loci (`clump=auto`: 25 kb for hit lists, 250 kb for summary statistics). **Per haploblock:** more loci than expected, for a hit list from the haploblock's length (Poisson), for full summary statistics from the SNPs tested in it (hypergeometric); Benjamini-Hochberg q. **Two nulls**, `permutations` draws each: loci moved to random places (empirical FDR), and all hits rotated along the chromosome with their spacing kept (calls that clusters of correlated hits alone produce; a warning when it exceeds twice the first). **Same haploblock:** hit pairs that share a haploblock vs the rotations. Positions must be GRCh38: a file whose `.json` names another build is refused, and more than 5% of SNPs outside the haploblock span gives a warning |
+| `model_gwas` | a 4a model's per-haploblock scores (mean surprisal and entropy of its predictions on test haplotypes, dispersion of the haploblock's cluster embeddings) at GWAS-hit haploblocks vs `matched` background haploblocks each (same chromosome, nearest in length, number of clusters and cluster entropy), with a CI over hit haploblocks and p-values under the two nulls of `gwas_enrichment` |
+| `phenotype_prediction` | a 4b model (token input): test R² against ridge regression on cluster dosages (λ by generalized cross-validation), with paired CIs; with an answer key, recall of the causal haploblocks among those each method ranks first (ridge: sum of its weights; model: mean attention) |
+| `junction_strength` | Spearman correlation between the recombination rate between neighbouring haploblocks (GRCh38 genetic map, default Beagle's) and the next haploblock's unpredictability: the training haplotypes' conditional entropy, and the model's mean prediction entropy; CI resampling chunks of neighbouring boundaries |
 
-- **In:** the model `.pt`, the graph folder, the split files.
-- **Out:** in `validation_<model name>/`: `report.md`, `summary.json`, `split.csv`, one CSV per task, and `nemotron_summary.md` with `--nemotron-summary`.
+- **Out:** in `validation_<model name>/`: `report.md`, `summary.json`, `split.csv`, one CSV per task, and `nemotron_summary.md` with `--nemotron-summary`. A failed task makes step 6 exit with code 1.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--model` | required | fine-tuned model |
-| `--tasks` / `--task` | `model_info` + `test_set_performance` + `embedding_cooccurrence` + `cluster_consistency` | tasks file / one task line |
-| `--splits` | `graph` | `graph`, a folder or URL with `half_A.txt` / `half_B.txt`, or `none` |
+| `--model` | required | fine-tuned model; repeat for `model_comparison` |
+| `--tasks` / `--task` | model_info + test_set_performance (or masked_imputation) + head_ceiling + embedding_cooccurrence + cluster_consistency (+ model_comparison with several models) | tasks file / one task line |
 | `--gwas` | none | adds a `gwas_enrichment` line for this file to the tasks |
+| `--splits` | `graph` | `graph`, a folder or URL with `half_A.txt` / `half_B.txt`, or `none` |
 | `--plugins` | none | Python file(s) with extra tasks |
 | `--cudf` | off | read its tables on the GPU with RAPIDS cuDF |
 | `--nemotron-summary` | off | plain-language summary by an NVIDIA Nemotron model (section 6) |
@@ -324,7 +322,7 @@ gwas_enrichment gwas=haplograph/gwas/height.tsv pvalue=5e-8 clump=auto label=hei
 Usage (more in [section 11](#11-running-the-pipeline)):
 
 ```bash
-python 6_validate_evo2.py --test      # test: steps 1-3, 4a, 5 and 6 on synthetic data (checks the planted GWAS loci are found)
+python 6_validate_evo2.py --test      # test: steps 1-6 on synthetic data, every task
 G=haplograph/genome_train_half_A
 python 6_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt   # full run: Evo 2, GPU
 ```
@@ -335,28 +333,28 @@ The pipeline is designed so the test individuals never influence anything that i
 
 | Step | What comes from the training individuals only | What still contains everyone, and why |
 |---|---|---|
-| 1 | (writes the split) | |
-| 2 | edge weights, support, lift, `--min-lift` filtering | `carriers.npz` (step 6 needs test carriers); the list of candidate edge pairs comes from the dataset's edge file |
-| 3 | carrier features (gnn, xgboost); the graph (all methods) | none |
-| 4 | the individuals trained and validated on | none |
+| 1 | (writes the split; related individuals stay on one side of a random split) | |
+| 2 | same-haplotype counts, lift, candidate pairs, `--min-lift` filtering, junction counts | `carriers.npz`, `haplotypes.npz` (step 6 needs the test rows) |
+| 3 | carrier features, graph, cis-partner targets (all methods); evo2_seq uses sequences only | none |
+| 4a / 4b | the individuals trained and validated on; rare-cluster merging; simulated phenotypes of the training file | the simulated test phenotypes (written for step 6 only) |
 | 5 | (GWAS hits: no individuals) | |
-| 6 | (checks this, then evaluates on the test individuals) | |
+| 6 | baselines (counted on the training haplotypes); checks the rest, then evaluates on the test individuals | |
 
-Each step stores the training set's id and the graph build's id and the next step checks them: steps 3 and 4 refuse any training set other than the graph's own; step 4 stops if the embeddings came from another training set or graph build; step 3 recomputes automatically if the graph, training set or its settings changed; step 6 fails `test_set_performance` for a model trained on another graph build or other embeddings, and `embedding_cooccurrence` marks embeddings made from another training set as not held-out. Step 6 only loads checkpoints with `torch.load(weights_only=True)`, so a model file can't run code. To use a different split, rerun step 1 with other `--split` settings (or give step 2 another `--train-individuals` file); step 2 then creates a new graph folder.
+Each step stores the training set's id and the graph build's id and the next step checks them: steps 3, 4a and 4b refuse any training set other than the graph's own; step 4a stops if the embeddings came from another training set or graph build; step 4b refuses a phenotype file with test individuals; step 3 recomputes automatically if the graph, training set or its settings changed; step 6 refuses a model trained on another graph build or other embeddings, and `embedding_cooccurrence` marks embeddings made from another training set as not held-out. Step 6 only loads checkpoints with `torch.load(weights_only=True)`, so a model file can't run code. With `--lift individual`, the *list* of candidate pairs comes from the dataset's edge file, which was made from all individuals (weights and filtering are train-only); `--lift haplotype` avoids that.
 
 ## 6. GPU acceleration: RAPIDS, CuPy, BioNeMo, Nemotron
 
-The pipeline detects the GPU itself (torch and XGBoost use CUDA when available; `--device cpu` forces the CPU). The NVIDIA tools are optional extras:
+The pipeline detects the GPU itself (torch and XGBoost use CUDA when available; `--device cpu` forces the CPU for the small backbone and step 3). The NVIDIA tools are optional extras:
 
 | Tool | Where | What it does |
 |---|---|---|
-| RAPIDS cuDF | steps 2 and 6, `--cudf` | runs their pandas code on the GPU (cuDF's pandas accelerator), falling back to the CPU for anything cuDF doesn't support. In step 2 add `--chunksize 0` so the edge files are parsed on the GPU |
+| RAPIDS cuDF | steps 2 and 6, `--cudf` | runs their pandas code on the GPU (cuDF's pandas accelerator), falling back to the CPU for anything cuDF doesn't support. In step 2 (`--lift individual`) add `--chunksize 0` so the edge files are parsed on the GPU |
 | RAPIDS cuML + CuPy | step 3, `--rapids` | carrier-matrix SVD and XGBoost leaf-basis SVD on the GPU |
 | XGBoost (CUDA) | step 3 | tree training on the GPU (`--device cuda`, automatic when available) |
-| NVIDIA BioNeMo | step 4, `--bionemo` | loads and runs Evo 2 through NeMo 2 / Megatron Core |
+| NVIDIA BioNeMo | steps 3 (evo2_seq), 4a, 4b, `--bionemo` | loads and runs Evo 2 through NeMo 2 / Megatron Core |
 | NVIDIA Nemotron (NIM) | step 6, `--nemotron-summary` | plain-language interpretation of the validation report |
 
-**RAPIDS in step 3, honestly.** Step 3 is CPU/RAM-bound, not GPU-bound, so `--rapids` is not a large speedup: the dominant cost is the CPU-side chunked embedding of all ~11M genome-wide nodes, which `--rapids` does not change. It only accelerates the two SVDs; tree fitting uses XGBoost's own GPU path, the rest is numpy. The carrier SVD is fitted on a `--rapids-fit-rows` sample (default 150k) and applied in `--rapids-chunk` dense chunks (default 200k). The sampling is an approximation: on the genome run (with the former ancestry target) it gave val-accuracy 0.986 vs 0.992/0.993 for the exact CPU SVD. Raise `--rapids-fit-rows` (e.g. 300000) to close that gap; the carrier matrix has only ~1,250 training columns, so a larger sample is cheap. The cached features are stored separately for `--rapids` (`features_svd*_rapids.npy`), so the CPU and GPU SVDs never mix.
+**RAPIDS in step 3.** Step 3 is CPU/RAM-bound, not GPU-bound, so `--rapids` is not a large speedup: it accelerates the two SVDs only. The carrier SVD is fitted on a `--rapids-fit-rows` sample (default 150k) and applied in `--rapids-chunk` dense chunks (default 200k); the sampling is an approximation, so raise `--rapids-fit-rows` (e.g. 300000) to get closer to the exact CPU SVD (the carrier matrix has only ~1,250 training columns, so a larger sample is cheap). The cached features are stored separately for `--rapids` (`features_svd*_rapids.npy`), so the CPU and GPU SVDs never mix.
 
 **Nemotron.** `--nemotron-summary` sends the task summaries of the report to an NVIDIA Nemotron model on an OpenAI-compatible NIM endpoint and writes the answer to `nemotron_summary.md`. Only aggregate numbers are sent: sample IDs (`HG…`/`NA…` and the graph's own individual names) and the directories of file paths are removed, and file names are dropped. The key is only sent over https (or to localhost), and redirects are not followed. Defaults: `--nemotron-url https://integrate.api.nvidia.com/v1` (build.nvidia.com; or a self-hosted NIM) and `--nemotron-model nvidia/llama-3.3-nemotron-super-49b-v1` (change it if the catalogue has moved on). The API key is read from `$NVIDIA_API_KEY`. Without a key, or if the request fails, step 6 prints a warning and still writes its report.
 
@@ -372,76 +370,80 @@ The pipeline detects the GPU itself (torch and XGBoost use CUDA when available; 
       return {"summary": {"mean": float(n.mean())}}
   ```
 
-  A task receives `ctx` plus its parameters (typed by their annotations) and returns a `summary` dict, plus optional `notes` and `files`. Useful parts of `ctx`:
-  - `ctx.graph.nodes`, `ctx.graph.carriers`, `ctx.graph.regions`;
-  - `ctx.train_idx`, `ctx.test_idx`;
-  - `ctx.model.meta`: the checkpoint dict;
-  - `ctx.out(name)`: a path for an output file.
-- **A check that queries the fine-tuned model:** `model, data = evo2_model.load_finetuned(ctx.model.meta, ctx.graph.dir)` rebuilds it; `model.logits(chrom, individual_index)` gives next-cluster logits and targets (see `test_set_performance`).
-- **A new backbone** (another DNA foundation model): write a runner class in `evo2_model.py` with `net`, `dev`, `hidden_in`, `hidden_out`, `trainable` and `run_soft()` (see `MockEvo2Runner` for the smallest example), and select it in `make_runner()` and `load_finetuned()`.
+  A task receives `ctx` plus its parameters (typed by their annotations) and returns a `summary` dict, plus optional `notes` and `files`. Useful parts of `ctx`: `ctx.graph.nodes`, `ctx.graph.carriers`, `ctx.graph.regions`; `ctx.train_idx`, `ctx.test_idx`; `ctx.model.meta` (the first checkpoint) and `ctx.models`; `ctx.out(name)` (a path for an output file).
+- **A check that queries the fine-tuned model:** `model, data, meta = query_model(ctx)` rebuilds it (cached across tasks); `model.score(chrom, example)` returns per-prediction target, log-probability, top-1 / top-5 and entropy (`example` = haplotype row, `2 * individual + h`), `model.score(chrom, example, mask=positions, probs=True)` the distributions at masked positions. `haplo_baselines.BlockBaselines` gives the count-based predictions on the same tokens.
+- **A new backbone** (another DNA foundation model): write a runner class in `evo2_model.py` with `net`, `dev`, `hidden_in`, `hidden_out`, `trainable`, `run_soft()` and `run_ids()` (see `SmallRunner` for the smallest example), and select it in `make_runner()`.
 - **A new model type in step 6:** add a rule to `model_kind()`.
-- **A new embedding method:** write `embed_<name>(args, A)` in step 3 that returns a [nodes × dim] array and a summary dict, add it to `METHODS` and the dispatch dict in `run_method()`, and to the `--method` choices of step 4.
-- **Another dataset:** change `BASE_URL` and `ALL_CHROMS` in `haplo_common.py` (same file layout), or put the files in `<workdir>/raw/<chrom>/` yourself together with `splits/split.json`, `train_individuals.txt` and `test_individuals.txt`.
+- **A new embedding method:** write `embed_<name>(args, A)` in step 3 that returns a [nodes × dim] array and a summary dict, add it to `METHODS` in `haplo_common.py` and to the dispatch dict in `run_method()`.
+- **Another dataset:** change `BASE_URL`, `HASHES_URL` and `ALL_CHROMS` in `haplo_common.py` (same file layout), or put the files in `<workdir>/raw/<chrom>/` yourself together with `splits/split.json`, `train_individuals.txt` and `test_individuals.txt`.
 
-## 8. Limitations and known issues
+## 8. Results and limitations
 
 ### What has and has not been run
 
-On a CPU-only machine (Apple M5, 16 GB RAM, Python 3.9, torch 2.8, xgboost 2.1), the whole pipeline ran on the real chr21 data with the BH_26 split (1,252 train / 1,251 test individuals):
+On a CPU-only machine (Apple M5, 16 GB RAM, Python 3.9, torch 2.8, xgboost 2.1), the pipeline ran on the real chr21 data with the BH_26 split (1,252 train / 1,251 test individuals):
 
 | Step | Result | Time |
 |---|---|---|
-| 1 | chr21 downloaded (~85 MB), MD5 verified, split written (45 haplograph individuals in neither half) | 22 s |
-| 2 | 166,754 nodes, 1,520,370 edges, 161,937 isolated nodes at `--min-lift 2` | 14 s |
-| 3 | node2vec, GNN and XGBoost embeddings, CPU, reduced settings (`--walks-per-node 2 --walk-length 20 --window 3 --gnn-epochs 50 --xgb-trees 20 --xgb-depth 4`); XGBoost region accuracy 0.070 vs 0.066 majority | 60 s |
-| 4a | `--mock-evo2 --max-len 128`, 1 epoch: validation loss 10.8 → 8.2 | 13 s |
-| 5 | GWAS Catalog downloaded (~73 MB), body height: 45,250 associations from 68 studies → 29,486 variants | 48 s |
-| 6 | split consistent (3.4% of regions outside the 95% interval), no leakage; `test_set_performance` on 500 test sequences (bigram baseline top-1 0.437); embedding AUC GNN 0.978, XGBoost 0.968, node2vec 0.881; GWAS: 216 hits → 128 loci, 0 haploblocks enriched | 8 s |
+| 1 | chr21 downloaded (~85 MB), MD5 verified; `--haplotypes`: 5,096 haplotypes × 597 haploblocks, every haplotype one cluster that exists in the haplograph; split written (45 haplograph individuals in neither half; 0 related pairs) | ~2 min |
+| 2 | 166,754 nodes; the two haplotypes of every individual reproduce its carriers exactly; `--lift haplotype`: 89,147 edges from 2.5 M same-haplotype pairs, 148,857 isolated nodes (`--lift individual`: 1,520,370 edges, 161,937 isolated) | ~15 s |
+| 3 | carrier_svd, node2vec, GNN (CPU, reduced settings `--walks-per-node 2 --walk-length 20 --window 3 --gnn-epochs 50`) | ~20 s |
+| 4a | `--backbone small --small-hidden 256 --small-layers 4`, haplotype units, next-haploblock, scaled-cosine head, 3 epochs (3.2 M trainable parameters): validation loss 3.54 → 1.66, top-1 0.11 → 0.56 | 4 min |
+| 5 | GWAS Catalog downloaded (~73 MB), body height: 45,250 associations from 68 studies → 29,486 variants | ~50 s |
+| 6 | see below | ~1 min |
 
-Every script's `--test` also passes, and step 6 rebuilds a step-4 model exactly (the same validation accuracy as stored in the checkpoint, when step 4 evaluated all its validation sequences, i.e. at most `--val-examples` of them; otherwise step 4 evaluated a random subset). **Not run, because no GPU was available:** Evo 2 itself (the `evo2` package), the BioNeMo backbone (written against the BioNeMo API, never executed), RAPIDS `--cudf` / `--rapids`, XGBoost on CUDA, `setup.py --evo2` beyond a dry run, and the Nemotron request against the real NVIDIA endpoint (tested against a local fake endpoint). Expect to fix small API or version issues on first real runs, especially in the parts marked `VERSION-SENSITIVE`.
+**Step 6 on chr21** (1,000 test haplotype sequences of 800 test individuals, 596,000 predictions; 95% CIs from a paired bootstrap over test individuals):
 
-Earlier versions of this document described LoRA adapters, `--micro-batch` and activation checkpointing for step 4. They were never implemented: step 4 fine-tunes whole blocks, one sequence per forward pass.
+| | top-1 | cross-entropy | model − baseline, top-1 |
+|---|---|---|---|
+| small backbone | 0.562 (0.559–0.565) | 1.670 | |
+| frequency (= identity-free) | 0.492 | 1.652 | +0.070 (0.068–0.071) |
+| bigram | 0.555 | 1.528 | +0.007 (0.006–0.008) |
+| trigram | 0.573 | 1.491 | −0.011 (−0.012 to −0.010) |
+| Li-Stephens HMM | 0.592 | 1.354 | −0.031 (−0.033 to −0.029) |
+
+The small backbone learns more than frequency and position (it beats the identity-free baseline, so the learning setup works on real haplotypes), and slightly more than the bigram, but not the trigram or the HMM, and its cross-entropy is worse than every baseline's (its probabilities are not calibrated after 3 CPU epochs; the head's floor at its learned logit scale is 0.21, at the largest scale 0.005). Generalization gap: 0.012 (top-1 on training haplotypes 0.573). With individual units (the carriers view), the baselines are identity-free 0.393 and bigram 0.436 on 500 sampled sequences. Evo 2 has to beat the HMM and the trigram, and this small backbone, to support the hypothesis.
+
+**Embeddings on held-out haplotypes** (`embedding_cooccurrence`, haplotype labels, 2,478 pairs, 126 positive, ≥ 5 expected test co-occurrences): GNN 0.941 (0.911–0.964), XGBoost 0.832, node2vec 0.812, carrier_svd 0.810, against 0.982 for the lift counted on the training haplotypes, 0.627 for genomic proximity and 0.365 for cluster frequency. Only the GNN beats its own input features (AUC − carrier_svd +0.130, 0.093–0.186; XGBoost +0.022 and node2vec +0.002, CIs including 0). On the individual-lift graph the GNN reaches 0.875 (+0.065), so `--lift haplotype` is the default.
+
+**Recombination and GWAS on chr21.** `junction_strength` (Beagle's GRCh38 map, 596 boundaries): the next haploblock is harder to predict where recombination between the two is more frequent, both in the training haplotypes' transitions (Spearman ρ 0.129, 0.050–0.208) and in the small backbone's predictions (ρ 0.132, 0.052–0.198). `model_gwas` (body height, 131 loci in 105 haploblocks): the small backbone's surprisal, prediction entropy and the embeddings' dispersion at hit haploblocks do not differ from matched background (differences 0.006, 0.016, 0.005, CIs including 0). `masked_imputation`, `phenotype_prediction` and `model_comparison` were run on synthetic data only (tests and `--test`), not on chr21.
+
+Every script's `--test` passes, and the positive controls on the synthetic block-HMM pass (`tests/test_controls.py`): the small backbone's next-haploblock cross-entropy on test haplotypes is within 10% of the true generating model's, and a masked-objective small backbone imputes single haploblocks with 0.95× the concordance of the Li-Stephens HMM. **Not run, because no GPU was available:** Evo 2 itself (the `evo2` package; so `--init random` on Evo 2, `--smoke` on a GPU and `evo2_seq` with Evo 2), the BioNeMo backbone (written against the BioNeMo API, never executed), RAPIDS `--cudf` / `--rapids`, XGBoost on CUDA, `setup.py --evo2` beyond a dry run, and the Nemotron request against the real NVIDIA endpoint (tested against a local fake endpoint). Expect to fix small API or version issues on first real runs, especially in the parts marked `VERSION-SENSITIVE`.
 
 ### Modelling assumptions
 
-- **Evo 2 was trained on DNA, never on these inputs.**
-  - Step 4 replaces its nucleotide inputs with projected graph embeddings, and 4b feeds 0/1 characters. Neither is something Evo 2 has seen.
-  - What is tested is whether its architecture and weights are a useful starting point. Its DNA knowledge doesn't transfer directly.
-  - Always compare with a `--train-blocks 0` baseline and with the bigram baseline of `test_set_performance`. On chr21 the bigram baseline already reaches 41% top-1 accuracy (44% with the default `--min-support 2`).
-  - The learning setup passes a positive control on synthetic data (the mock backbone reaches 0.9 × the bigram's top-1, see step 4). On chr21, 3 CPU epochs of the small mock reached test top-1 0.041 with the position encoding vs 0.010 without, still far below the bigram's 0.44: whether Evo 2 gets there needs a GPU run with a real training budget.
-- **Edges exist only within chromosomes.** The genome-wide graph is 22 disconnected pieces.
-  - node2vec vectors can't be compared across chromosomes; step 4 adds a per-chromosome vector to compensate.
-  - Training sequences are per chromosome; there's no genome-wide sequence per person.
-- **Most nodes are rare and isolated.** On chr21, 97% of the nodes have no edge at `--min-lift 2` (the dataset lists edges only for clusters with support ≥ 25), so node2vec and the GNN learn little for them beyond their carrier features.
-- **XGBoost predicts the haploblock region.** On chr21 it reached only 0.070 accuracy on 16 region bins against a 0.066 majority baseline: the carrier profile of a rare cluster says little about where it is. The XGBoost embeddings may therefore carry little signal; compare them with node2vec and GNN in step 6.
-- **Embeddings on held-out individuals (chr21).** `embedding_cooccurrence` (pairs with ≥ 5 expected test co-carriers) gave AUC 0.978 for GNN, 0.968 for XGBoost and 0.881 for node2vec (reduced CPU settings), against 0.991 for the lift counted on the training individuals, 0.618 for genomic proximity and 0.354 for cluster frequency: for common clusters, all three embeddings carry linkage that replicates in unseen individuals. Rare clusters (most nodes) cannot be tested this way.
-- **Clusters only seen in the test set** have embeddings, but the model never trained on them; step 6 counts them (61,892 on chr21).
+- **Evo 2 was trained on DNA, never on these inputs.** Steps 4a and 4b replace its nucleotide inputs with projected graph embeddings. What is tested is whether its architecture and weights are a useful starting point; whether its DNA knowledge transfers is what `evo2_seq` (embeddings from the clusters' own sequences) addresses. The controls `--init random` and `--backbone small` separate the two.
+- **Between-haploblock linkage is weak by construction**: haploblocks are cut where recombination occurs, so the next haploblock is only partly predictable from the previous ones; the n-gram and HMM baselines show how much is.
+- **Edges exist only within chromosomes.** The genome-wide graph is 22 disconnected pieces; node2vec vectors can't be compared across chromosomes (step 4a adds a per-chromosome vector), and training sequences are per chromosome.
+- **Most nodes are rare.** On chr21 the median cluster is carried by one individual; at the default `--min-support 2`, clusters seen on fewer than 2 training haplotypes share one token per haploblock. Clusters only seen in the test set have embeddings but the model never trained on them; only `evo2_seq` gives them an embedding from data the model has not seen labelled.
+- **XGBoost is not in `--method all`.** Its cis-partner target is close to its majority-class baseline on chr21 (accuracy 0.474 vs 0.469), and its embeddings do not beat carrier_svd in `embedding_cooccurrence` (AUC difference +0.02, CI including 0).
+- **Phenotypes are simulated.** 1000 Genomes has no measured traits beyond ancestry and sex; the phenotype claim is tested on traits simulated on the real haplotypes (step 4b), where the answer is known.
 
 ### Data and leakage
 
-- **Genome build.** The haplograph README doesn't state the build of its coordinates, but its regions are identical to the hg38 HaploHash blocks of `part2_proteomics/data/` (e.g. `chr21_14215892-14284114` holds RBM11 at its hg38 position), and on chr21 only 1.3% of GWAS Catalog (GRCh38) height hits fall outside the haploblock span. Summary statistics in hg19 (e.g. GIANT 2022) must be lifted over first. Because the haploblocks tile the chromosomes, hg19 positions still land inside haploblocks and give plausible but wrong results; step 6 warns when more than 5% of the SNPs fall outside the haploblock span (GRCh38 height hits: 1.3%; the same hits shifted like hg19: ~10%).
-- **Candidate edge pairs.** The *list* of candidate pairs comes from the dataset's edge file, which was made from all individuals. Weights and filtering are train-only, but a pair only present because of test individuals may still be in the list (with a train weight of zero it is dropped).
-- **`--edges lift5`** was pre-filtered on all individuals, so its pair selection saw the test set. Use `--edges all` in train-only mode.
-- **`split.tsv`** in the BH_26 folder isn't used; only `half_A.txt` / `half_B.txt` are.
+- **Genome build.** The haplograph README doesn't state the build of its coordinates, but its regions are identical to the hg38 HaploHash blocks of `part2_proteomics/data/` (e.g. `chr21_14215892-14284114` holds RBM11 at its hg38 position), and on chr21 only 1.3% of GWAS Catalog (GRCh38) height hits fall outside the haploblock span. Summary statistics in hg19 (e.g. GIANT 2022) must be lifted over first. Because the haploblocks tile the chromosomes, hg19 positions still land inside haploblocks and give plausible but wrong results; step 6 warns when more than 5% of the SNPs fall outside the haploblock span.
+- **Related individuals.** The 1000 Genomes pedigree lists no parent-child or sibling pairs among the 2,548 haplograph individuals (individuals sharing a family ID there are unrelated co-founders), so BH_26 has no related pairs across the split; a relatedness task has no ground truth in these data. Cryptic relatedness not in the pedigree is not checked.
+- **`--edges lift5`** was pre-filtered on all individuals; with `--lift individual` use `--edges all`.
 - **2,548 vs 2,503 individuals.** 45 graph individuals are in neither BH_26 half and are left out of training and validation.
-- **Step 4b's hash file** must be built from training individuals by the user; the pipeline can't check it.
+- **Step 4b's `--phenotype` file** must contain training individuals only; step 4b refuses test individuals.
 
 ### Statistical caveats in step 6
 
-- **Chi-square assumption.** The chi-square test treats carrier counts as independent, but one person can carry two clusters of the same haploblock. The permutation-based columns don't rely on that and are the ones to trust.
+- **Baselines are counted on the training individuals**, the model on its own training individuals (a subset: the rest is its validation set), so the baselines see slightly more data than the model.
+- **Chi-square assumption.** `cluster_consistency`'s chi-square test treats carrier counts as independent, but one person can carry two clusters of the same haploblock. The permutation-based columns don't rely on that and are the ones to trust.
 - **Correlated GWAS hits.** Hits in linkage disequilibrium (one locus reported by several studies, or several SNPs of one signal) are not independent. Counted one by one (`clump=0`), body height on chr21 gives 8 haploblocks with q < 0.05; moving loci at random gives 0.01 by chance (empirical FDR 0%), but rotating all hits with their spacing kept gives 7.9 (FDR 99%, and step 6 warns): the apparent enrichment is the clustering of hits, not the haploblocks. With the default 25 kb (216 hits → 128 loci) no haploblock is enriched (rotation: 0.0; at 10 kb, 155 loci, ~0.15-0.17). Distance clumping is a proxy for LD: in simulations with LD-like clusters it gave no false calls at ≥ 25 kb for hit lists, some at 10 kb, and for summary statistics some at 25 kb and none at 100 kb or 250 kb, hence the 250 kb default there. The rotation null also moves real clusters of independent loci together, so a high rotation count says "dense cluster", not "false".
 - **Power.** After clumping, a haploblock can hold at most about its length / `clump` + 1 loci: at 25 kb only ~7% of chr21 haploblocks can reach a Bonferroni-level p (67% at 10 kb), so the per-haploblock test detects only strong multi-locus enrichment (in simulations, 10 planted loci in a 341 kb haploblock: 19/20 detected at 25 kb, 6 loci: 1/20). For summary statistics at the default 250 kb no chr21 haploblock (longest 341 kb, median 41 kb) can reach it at all; step 6 says so, and the same-haploblock test is then the informative one.
-- **Genome-wide test.** The haploblocks tile whole chromosomes, so "are hits inside haploblocks" can't be tested (step 6 notes this when they cover > 95% of the span). The same-haploblock test replaces it: on chr21, 361 hit pairs share a haploblock vs ~295-296 under rotation (p ≈ 0.07-0.09). It is calibrated (~4-5% at p < 0.05 with shuffled haploblock boundaries) but has modest power on one chromosome; whole-genome runs give more. It counts unclumped hit pairs, so large clusters weigh most.
-- **`test_set_performance`** evaluates the central `--max-len` window of each sequence (the same windows as step 4's validation) on a sample of `max_examples` sequences; raise it for tighter estimates.
+- **Genome-wide GWAS test.** The haploblocks tile whole chromosomes, so "are hits inside haploblocks" can't be tested (step 6 notes this when they cover > 95% of the span). The same-haploblock test replaces it: on chr21, 361 hit pairs share a haploblock vs ~295-296 under rotation (p ≈ 0.07-0.09). It is calibrated (~4-5% at p < 0.05 with shuffled haploblock boundaries) but has modest power on one chromosome; whole-genome runs give more. It counts unclumped hit pairs, so large clusters weigh most.
+- **`test_set_performance`** evaluates the central `--max-len` window of each sequence (the same windows as step 4a's validation) on a sample of `max_examples` sequences; raise it for tighter estimates.
 
 ### Scale and performance
 
-- **Data size.** The full edge files are up to about 1 GB per chromosome; genome-wide graphs need lots of memory and disk. Use `--min-lift` to shrink the graph, and `--chunksize` if memory runs out while reading edges.
-- **Host RAM, not the GPU, is the bottleneck of steps 2–3** at genome scale (11M nodes). XGBoost's leaf stage is the peak; see step 3 in the README.
+- **Data size.** The edge files (only for `--lift individual`) are up to about 1 GB per chromosome, the haplotype tables a few MB per chromosome (about 0.5 MB downloaded per haploblock), the representative sequences several GB per chromosome.
+- **Host RAM, not the GPU, is the bottleneck of steps 2–3** at genome scale (11M nodes). With `--method xgboost`, its leaf stage is the peak; lower `--xgb-trees`, `--xgb-classes` or `--xgb-depth` if step 3 is killed.
 - **GNN memory.** The GNN runs on the whole graph at once on one device; very large graphs may not fit.
 - **node2vec speed.** Its walks run on CPU (numpy), which can be slow for genome-wide graphs; lower `--walks-per-node` or `--walk-length`.
-- **Step 4.** It uses one GPU and can't resume an interrupted run. Each position is scored against all tokens of its chromosome, so memory grows with `--max-len` × the chromosome's tokens (chr21: 166,754 clusters, 29,034 tokens at the default `--min-support 2`); lower `--max-len` for large chromosomes.
-- **Permutation cost.** Step 6's permutations multiply runtime; lower `permutations` for quick runs.
+- **Step 4a.** It uses one GPU (or the CPU for the small backbone). With `--softmax block` memory grows with `--max-len` × the largest haploblock's tokens, not with the chromosome's; `--objective masked` runs the backbone twice per example. `--resume` continues an interrupted run from its last evaluation.
+- **Permutation cost.** Step 6's permutations and the HMM baseline (one pass per training haplotype and haploblock) multiply runtime; lower `permutations` or `max_examples` for quick runs.
 
 ## 9. Part 2: proteomics
 
@@ -459,7 +461,7 @@ The fusion with the genome model (early vs late fusion with the Evo 2 of part 1)
 
 ## 10. Installation
 
-Part 1 has a CPU core (all steps, with `--mock-evo2` in step 4) and GPU extras (Evo 2, BioNeMo, RAPIDS). Run everything from `part1_haplograph/`.
+Part 1 has a CPU core (all steps, with `--backbone small` in steps 3, 4a and 4b) and GPU extras (Evo 2, BioNeMo, RAPIDS). Run everything from `part1_haplograph/`.
 
 ### 10.1 CPU only (any OS; checks the whole pipeline, no Evo 2)
 
@@ -566,66 +568,80 @@ All commands from `part1_haplograph/`.
 ### 11.1 Self-tests (CPU, seconds)
 
 ```bash
-python 1_download_haplograph.py --test        # synthetic haplograph + split
+python 1_download_haplograph.py --test        # synthetic haplograph (known block-HMM) + split
 python 2_build_graph.py --test
-python 3_node_embeddings.py --test
-python 4a_finetune_evo2_embeddings.py --test   # --mock-evo2
-python 4b_finetune_evo2_hash.py --test
+python 3_node_embeddings.py --test            # every method (small backbone for evo2_seq)
+python 4a_finetune_evo2_embeddings.py --test   # small backbone
+python 4b_finetune_evo2_phenotype.py --test   # simulated cis trait
 python 5_download_gwas.py --test              # synthetic GWAS Catalog
-python 6_validate_evo2.py --test            # runs steps 1-3, 4a and 5 itself (not 4b), then every validation task
+python 6_validate_evo2.py --test              # runs steps 1-5 itself (next, masked, frozen and phenotype models), then every task
 ```
 
-Regression tests (synthetic data, CPU, about 5 s): `pip install pytest`, then from the repository root `python -m pytest part1_haplograph/tests -q`.
+Tests (synthetic data, CPU, about a minute; they include the positive controls): `pip install pytest`, then from the repository root `python -m pytest part1_haplograph/tests -q`.
 
-### 11.2 Real data on a CPU (chr21, stand-in model, about 5 minutes)
+### 11.2 Real data on a CPU (chr21, small backbone)
 
 ```bash
-python 1_download_haplograph.py --chroms chr21
+python 1_download_haplograph.py --chroms chr21 --haplotypes
 python 2_build_graph.py
 G=haplograph/chr21_train_half_A
-python 3_node_embeddings.py --graph-dir $G --device cpu \
-    --walks-per-node 2 --walk-length 20 --window 3 --gnn-epochs 50 --xgb-trees 20 --xgb-depth 4
-python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir $G --mock-evo2 --device cpu --max-len 128
+python 3_node_embeddings.py --graph-dir $G --device cpu --walks-per-node 2 --walk-length 20 --window 3 --gnn-epochs 50
+python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir $G --backbone small --small-hidden 256 --small-layers 4 --device cpu
 python 5_download_gwas.py --trait "^body height$" --label height   # GWAS hits for validation_tasks.txt
-python 6_validate_evo2.py --model $G/evo2_mock_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt
+python 6_validate_evo2.py --model $G/small_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt
 ```
 
-The numbers of the stand-in model mean nothing; this only shows that the data flows through every step.
+This trains the small backbone from scratch: it is the baseline Evo 2 must beat, and shows that the data flows through every step (section 8 has its chr21 results).
 
 ### 11.3 Real data on a GPU (Evo 2)
 
+Start with `--chroms chr21,chr22` in steps 1–2 (`G=haplograph/chr21_chr22_train_half_A`) before the whole genome.
+
 ```bash
 source ~/evo2-env/bin/activate
-python 1_download_haplograph.py                              # whole genome, BH_26 split (~15 GB)
-python 2_build_graph.py                                    # -> haplograph/genome_train_half_A
+python 4a_finetune_evo2_embeddings.py --smoke                     # check the GPU setup first (minutes)
+python 1_download_haplograph.py --haplotypes                      # whole genome, BH_26 split
+python 2_build_graph.py                                           # -> haplograph/genome_train_half_A
 G=haplograph/genome_train_half_A
-python 3_node_embeddings.py --graph-dir $G                 # node2vec + gnn + xgboost (torch/XGBoost on CUDA)
-for m in node2vec gnn xgboost; do
-    python 4a_finetune_evo2_embeddings.py --method $m --graph-dir $G
-    python 4a_finetune_evo2_embeddings.py --method $m --graph-dir $G --train-blocks 0 --out $G/evo2_frozen_next_$m.pt
-done
-python 5_download_gwas.py --trait "^body height$" --label height   # GWAS hits for validation_tasks.txt
-for m in node2vec gnn xgboost; do
-    python 6_validate_evo2.py --model $G/evo2_next_$m.pt --graph-dir $G --tasks validation_tasks.txt
-done
+python 3_node_embeddings.py --graph-dir $G                        # carrier_svd + node2vec + gnn
+python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir $G                    # evo2_next_gnn.pt
+python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir $G --init random      # evo2-random_next_gnn.pt
+python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir $G --backbone small   # small_next_gnn.pt
+python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir $G --objective masked # evo2_masked_gnn.pt
+python 5_download_gwas.py --trait "^body height$" --label height
+python 6_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt
+python 6_validate_evo2.py --model $G/evo2_next_gnn.pt --model $G/evo2-random_next_gnn.pt --model $G/small_next_gnn.pt \
+    --graph-dir $G --task model_comparison                                            # does pretraining help?
+python 6_validate_evo2.py --model $G/evo2_masked_gnn.pt --graph-dir $G --task masked_imputation
 ```
 
-Start with `--chroms chr21,chr22` in steps 1–2 (`G=haplograph/chr21_chr22_train_half_A`) before the whole genome. Compare each model with its frozen (`--train-blocks 0`) run and with the bigram baseline in `report.md`.
+Then read the result as in README step 6 ("Reading the result"): the hypothesis needs fine-tuned Evo 2 to beat the HMM and the n-grams (CI excluding 0, at least for common clusters), and both `--init random` and `--backbone small`, with a head whose floor is not the limit.
+
+Phenotypes (simulated on the real haplotypes) and DNA-grounded embeddings:
+
+```bash
+for t in additive cis null; do
+    python 4b_finetune_evo2_phenotype.py --graph-dir $G --method gnn --simulate $t --init-from $G/evo2_next_gnn.pt
+    python 6_validate_evo2.py --model $G/evo2_pheno_${t}_gnn.pt --graph-dir $G --task phenotype_prediction
+done
+python 1_download_haplograph.py --chroms chr21 --sequences       # representative sequences (3.1 GB for chr21)
+python 3_node_embeddings.py --graph-dir haplograph/chr21_train_half_A --method evo2_seq
+```
 
 With RAPIDS (in the RAPIDS venv) for steps 2, 3 and 6:
 
 ```bash
 source ~/rapids-env/bin/activate
-python 2_build_graph.py --cudf --chunksize 0                       # add --force if the graph already exists
+python 2_build_graph.py --lift individual --cudf --chunksize 0    # add --force if the graph already exists
 python 3_node_embeddings.py --graph-dir $G --device cuda --rapids --rapids-fit-rows 300000 --force
-deactivate && source ~/evo2-env/bin/activate      # step 4 in the Evo 2 environment
+deactivate && source ~/evo2-env/bin/activate      # step 4a in the Evo 2 environment
 ```
 
 With BioNeMo (inside the container, see 10.4):
 
 ```bash
 python 4a_finetune_evo2_embeddings.py --method gnn --graph-dir $G --bionemo --ckpt-dir nemo2_evo2_7b_8k
-python 6_validate_evo2.py --model $G/evo2_bionemo_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt
+python 6_validate_evo2.py --model $G/bionemo_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt
 ```
 
 With a Nemotron summary of the validation:
@@ -635,4 +651,4 @@ export NVIDIA_API_KEY=nvapi-...
 python 6_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt --nemotron-summary
 ```
 
-At genome scale, host RAM is the limit in steps 2–3 (see section 8 and step 3 in the README); lower `--xgb-trees`, `--xgb-depth` or `--xgb-region-bins` if step 3 is killed.
+At genome scale, host RAM is the limit in steps 2–3 (see section 8).

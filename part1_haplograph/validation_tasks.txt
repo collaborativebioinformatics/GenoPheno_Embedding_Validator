@@ -1,24 +1,33 @@
 # Tasks for 6_validate_evo2.py - one task per line: <task name> [key=value ...]
 # '#' starts a comment; quote values that contain spaces.
 # List all tasks and their parameters with:  python 6_validate_evo2.py --list-tasks
+# This file is for a next-token model of step 4a (--objective next, the default). For a masked
+# model, replace test_set_performance by masked_imputation; to compare models, pass --model several
+# times and add model_comparison.
 
 # what the model is, its stored metrics, and whether test individuals were seen in training
 model_info
 
-# 1. the fine-tuned model itself on the test individuals: next-cluster loss, perplexity, top-1/top-5
-#    accuracy vs the training individuals and a bigram baseline (needs the step-4 backbone: GPU for Evo 2)
+# 1. the fine-tuned model on the test haplotypes: next-haploblock loss and top-1 against frequency,
+#    bigram, trigram and Li-Stephens HMM baselines, with paired CIs, by stratum (needs the step-4a
+#    backbone: a GPU for Evo 2)
 test_set_performance max_examples=500 train_examples=200
 
-# 2. the step-3 embeddings alone (no GPU): do they predict cluster co-occurrence in the test individuals?
+# 2. the lowest cross-entropy the model's output head can reach
+head_ceiling
+
+# 3. the step-3 embeddings alone (no GPU): do they predict which clusters share a test haplotype?
 embedding_cooccurrence min_lift=2 min_support=5 min_expected=5 pairs=50000
 
-# 3. train vs test consistency of the haploblock clusters (data-level)
+# 4. train vs test consistency of the haploblock clusters, related pairs across the split (data-level)
 cluster_consistency min_carriers=1 permutations=200
 
-# 4. GWAS enrichment of haploblocks (data-level): which haploblocks hold more independent GWAS loci than expected?
-#    Hit file from:  python 5_download_gwas.py --trait "^body height$" --label height   (GWAS Catalog,
-#    GRCh38 like the haplograph). Full summary statistics also work (same genome build, mode=summary).
-#    Add one line per trait or threshold.
-#    Hits are clumped into independent loci (clump=auto: 25 kb for hit lists, 250 kb for summary
-#    statistics); chance levels from random loci and from rotations. See --list-tasks for all parameters.
+# 5. GWAS (hit file from: python 5_download_gwas.py --trait "^body height$" --label height; GRCh38 like
+#    the haplograph). gwas_enrichment is data-level: which haploblocks hold more independent GWAS loci
+#    than expected (clump=auto: 25 kb for hit lists, 250 kb for summary statistics). model_gwas: the
+#    model's per-haploblock scores at the hit haploblocks vs matched background.
 gwas_enrichment gwas=haplograph/gwas/height.tsv pvalue=5e-8 clump=auto label=height
+model_gwas gwas=haplograph/gwas/height.tsv pvalue=5e-8
+
+# 6. is the next haploblock less predictable where recombination is frequent? (GRCh38 genetic map)
+junction_strength

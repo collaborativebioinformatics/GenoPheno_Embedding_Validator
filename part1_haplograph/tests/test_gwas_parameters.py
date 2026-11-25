@@ -1,6 +1,5 @@
 """
-Spec-test regressions (round 2) for gwas_enrichment in step 6: calibration and edge cases.
-Each test guards a confirmed issue and passes once it is fixed. Synthetic regions, no network.
+gwas_enrichment in step 6: parameters, haploblock boundaries and empty inputs.
 Run:  python -m pytest part1_haplograph/tests -q
 """
 import json

@@ -1,6 +1,5 @@
 """
-Spec-test regressions for the GWAS step (5_download_gwas.py and gwas_enrichment in step 6).
-Each test guards a confirmed issue; tests for unfixed issues fail until the fix lands.
+5_download_gwas.py and gwas_enrichment in step 6: inputs, labels and paths.
 Run:  python -m pytest part1_haplograph/tests -q
 """
 import zipfile

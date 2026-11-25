@@ -1,43 +1,60 @@
 """
-Step 6 - validate a fine-tuned Evo 2 model (step 4) on the held-out TEST individuals.
+Step 6 - validate fine-tuned models (steps 4a / 4b) on the held-out TEST individuals.
 
 A small task runner: the checks to run are listed one per line in a tasks file (validation_tasks.txt;
 `--list-tasks` shows every task and its parameters); new checks go in a --plugins file using the
-`task` decorator (example and `ctx` fields: DOCUMENTATION.md section 7).
-  model_info              model type, stored metrics, train/test leakage
-  test_set_performance    queries the model on the test individuals: next-cluster loss, top-1/top-k,
-                          region-conditioned top-1, vs training individuals and a bigram baseline,
-                          with paired bootstrap CIs over test individuals (needs step 4's backbone)
-  embedding_cooccurrence  do the step-3 embeddings predict cluster co-occurrence in the test individuals?
-  cluster_consistency     do train and test carry the same clusters per haploblock? (permutation null)
+`task` decorator (example and `ctx` fields: DOCUMENTATION.md section 7). --model can be repeated:
+model_comparison uses every model, the other tasks the first (or their model= parameter).
+  model_info              model type and settings, stored metrics, train/test leakage
+  test_set_performance    a next-token 4a model on test haplotypes: loss, top-1/top-5 against frequency,
+                          bigram, trigram and Li-Stephens HMM baselines (identity-free and bigram for
+                          individual units), paired bootstrap CIs over test individuals, by stratum
+  head_ceiling            the lowest cross-entropy the model's output head can reach
+  masked_imputation       a masked 4a model imputing masked haploblocks of test individuals, against the
+                          HMM, a flank lookup and the frequency (concordance, dosage r^2 by frequency)
+  model_comparison        every --model on the same test examples, paired CIs between every pair
+  embedding_cooccurrence  do the step-3 embeddings predict which clusters share a test haplotype? (vs
+                          carrier_svd, references, pairs without graph edges)
+  cluster_consistency     do train and test carry the same clusters per haploblock? (permutation null);
+                          related pairs across the split
   gwas_enrichment         haploblocks with more independent GWAS loci than expected (hits clumped by
                           distance), chance levels from randomly placed loci (empirical FDR) and from
-                          rotations that keep the hits' spacing, and whether nearby hits share a haploblock (same genome build needed; columns
-                          auto-detected, see GWAS_COLS; hit files from 5_download_gwas.py)
+                          rotations that keep the hits' spacing, and whether nearby hits share a
+                          haploblock (GRCh38; columns auto-detected, see GWAS_COLS; 5_download_gwas.py)
+  model_gwas              a 4a model's per-haploblock scores at GWAS-hit haploblocks vs matched background
+  phenotype_prediction    a 4b model's test R^2 vs ridge on cluster dosages; causal-haploblock recovery
+  junction_strength       next-haploblock unpredictability (data, model) vs recombination rate
 
 Split: by default the graph's train_individuals.txt / test_individuals.txt (steps 1-2); --splits
 DIR_OR_URL (half_A.txt / half_B.txt), --train/--test-individuals, or --splits none (the model's own
 held-out individuals). Split files: one sample ID per line, or a CSV with an "individual" column.
 
-OUTPUT (--out-dir, default <graph-dir>/validation_<model name>/)
+OUTPUT (--out-dir, default <graph-dir>/validation_<first model name>/)
   report.md, summary.json, split.csv (individual, set)
-  test_set_performance_chroms.csv     chrom, test_sequences, test_predictions, test_loss, test_top1,
-                                      test_top<k>, test_region_top1, bigram_top1
-  embedding_cooccurrence.csv          name, kind, auc, auc_distance_matched, auc_frequency_matched, auc_95ci
+  test_set_performance_strata.csv     stratum, value, predictions, model_top1, model_top1_95ci,
+                                      <baseline>_top1, model_loss
+  masked_imputation.csv               span, <method>_concordance, model_minus_<method>_95ci, <method>_r2_<bin>
+  model_comparison.csv / _pairs.csv   per model: top1, loss; per pair: differences with 95% CIs
+  embedding_cooccurrence.csv          name, kind, auc, auc_distance_matched, auc_frequency_matched,
+                                      auc_no_graph_edges, auc_95ci, auc_minus_carrier_svd(_95ci)
   cluster_consistency_regions.csv.gz  region, chrom, start, end, n_clusters_total/_train/_test,
                                       test_expected, test_ci_low/high, outside_ci, n_test_only,
                                       test_only_carriers, tvd, tvd_null_mean, tvd_p, chi2, chi2_df, chi2_p, chi2_q
   gwas_enrichment_<label>_regions.csv.gz   region, chrom, start, end, n_snps, n_hits, n_loci,
                                       expected_loci, fold, p, q, lead_snp, lead_p
+  model_gwas.csv                      score, hit_mean, matched_mean, difference(_95ci), p_random_loci, p_rotation
   nemotron_summary.md                 --nemotron-summary: an NVIDIA Nemotron reading of the aggregate
                                       numbers ($NVIDIA_API_KEY; IDs and paths removed, https only)
   (a task listed twice writes its files with a _2, _3 ... suffix)
+A failed task makes the script exit with code 1 after the report is written.
 
 USAGE
   python 6_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt
   python 6_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --gwas haplograph/gwas/height.tsv
   python 6_validate_evo2.py --model $G/evo2_next_gnn.pt --model $G/evo2-random_next_gnn.pt \
       --model $G/small_next_gnn.pt --task model_comparison     # does pretraining help?
+  python 6_validate_evo2.py --model $G/evo2_masked_gnn.pt --graph-dir $G --task masked_imputation
+  python 6_validate_evo2.py --model $G/evo2_pheno_cis_gnn.pt --graph-dir $G --task phenotype_prediction
   python 6_validate_evo2.py --test                       # synthetic data, small backbone, CPU
 """
 import argparse
@@ -2096,7 +2113,7 @@ def main(argv=None):
     for f in args.model:
         if not os.path.exists(f):
             raise SystemExit(f"error: model file {f} not found - run 4a_finetune_evo2_embeddings.py "
-                             "(or 4b_finetune_evo2_hash.py) first")
+                             "(or 4b_finetune_evo2_phenotype.py) first")
 
     model = Model(args.model[0])                  # loaded once, on first use, shared with the tasks
     try:

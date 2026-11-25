@@ -1,7 +1,6 @@
 """
-Spec-test regressions (round 3) for gwas_enrichment in step 6: null calibration and edge cases.
-Each test guards a confirmed issue.
-Synthetic regions, no network.  Run:  python -m pytest part1_haplograph/tests -q
+gwas_enrichment in step 6: calibration of the nulls and edge cases.
+Run:  python -m pytest part1_haplograph/tests -q
 """
 import re
 import types
