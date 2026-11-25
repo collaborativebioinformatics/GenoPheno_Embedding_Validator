@@ -32,7 +32,8 @@ held-out individuals). Split files: one sample ID per line, or a CSV with an "in
 OUTPUT (--out-dir, default <graph-dir>/validation_<first model name>/)
   report.md, summary.json, split.csv (individual, set)
   test_set_performance_strata.csv     stratum, value, predictions, model_top1, model_top1_95ci,
-                                      <baseline>_top1, model_loss
+                                      <baseline>_top1, model_minus_<baseline>_top1_95ci,
+                                      model_minus_<baseline>_loss_95ci (haplotype units), model_loss
   masked_imputation.csv               span, <method>_concordance, model_minus_<method>_95ci, <method>_r2_<bin>
   model_comparison.csv / _pairs.csv   per model: top1, loss; per pair: differences with 95% CIs
   embedding_cooccurrence.csv          name, kind, auc, auc_distance_matched, auc_frequency_matched,
@@ -1122,8 +1123,13 @@ def test_set_performance(ctx, max_examples: int = 500, train_examples: int = 200
                    "model_top1": round(float(g["model_top1"].mean()), 4),
                    "model_top1_95ci": ratio_ci(np.bincount(gi, weights=g["model_top1"].astype(float),
                                                            minlength=len(uniq)), cnt, idx) if idx is not None else None}
+            per_g = lambda col: np.bincount(gi, weights=g[col].astype(float), minlength=len(uniq))
             for n in names:
                 row[f"{n}_top1"] = round(float(g[f"{n}_top1"].mean()), 4)
+                if idx is not None:
+                    row[f"model_minus_{n}_top1_95ci"] = ratio_ci(per_g("model_top1") - per_g(f"{n}_top1"), cnt, idx)
+                if with_ce and idx is not None:
+                    row[f"model_minus_{n}_loss_95ci"] = ratio_ci(per_g(f"{n}_logp") - per_g("model_logp"), cnt, idx)
             if with_ce:
                 row["model_loss"] = round(float(-g["model_logp"].mean()), 4)
             strata.append(row)
