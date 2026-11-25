@@ -174,10 +174,13 @@ def test_baselines_learn_a_markov_chain():
     Y, K = markov_haplotypes(600)
     bl = BlockBaselines(Y[:400], K)
     ll = {}
+    for b in (1, 5):
+        for n in ("frequency", "bigram", "trigram"):
+            assert np.allclose(bl.next_dist(Y[400:], b, n).sum(1), 1)
     for n in ("frequency", "bigram", "trigram", "hmm"):
-        P = bl.predict_next(Y[400:], n)
-        assert all(np.allclose(p.sum(1), 1) for p in P)
-        ll[n] = np.mean([np.log(P[b - 1][np.arange(200), Y[400:, b]]).mean() for b in range(1, Y.shape[1])])
+        top, pt = bl.predict_next(Y[400:], n)
+        assert top.shape == pt.shape == (200, Y.shape[1] - 1) and (pt > 0).all() and (pt <= 1).all()
+        ll[n] = np.log(pt).mean()
     assert min(ll["bigram"], ll["trigram"], ll["hmm"]) > ll["frequency"] + 0.1, ll
 
 
@@ -188,6 +191,9 @@ def test_hmm_imputation_uses_both_flanks():
     mask[:, 6] = True
     post = bl.hmm(Y[400:], causal=False, mask=mask)[6]
     assert np.allclose(post.sum(1), 1)
+    one = mask.copy()                                  # rows masked elsewhere do not change a row's posterior
+    one[1:, 6], one[1:, 3] = False, True
+    assert np.allclose(bl.hmm(Y[400:], causal=False, mask=one)[6][0], post[0], atol=1e-5)
     assert (post.argmax(1) == Y[400:, 6]).mean() > (bl.freq[6].argmax() == Y[400:, 6]).mean()
 
 

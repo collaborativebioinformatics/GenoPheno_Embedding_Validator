@@ -1023,9 +1023,9 @@ def score_next(model, data, examples, train_inds):
                 y = Y[j, pos]
                 d["freq"] = np.array([freq[p][t] for p, t in zip(pos, y)])
                 for n in NEXT_BASELINES:
-                    P = [base[n][p - 1][j] for p in pos]
-                    d[f"{n}_top1"] = np.array([p.argmax() == t for p, t in zip(P, y)])
-                    d[f"{n}_logp"] = np.log(np.array([p[t] for p, t in zip(P, y)]))
+                    top, pt = base[n]
+                    d[f"{n}_top1"] = top[j, pos - 1] == y
+                    d[f"{n}_logp"] = np.log(pt[j, pos - 1])
             else:
                 t = data.tokens(chrom, ex)
                 pr = predict(t)
