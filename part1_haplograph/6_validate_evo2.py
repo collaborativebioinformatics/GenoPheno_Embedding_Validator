@@ -1787,7 +1787,8 @@ def model_gwas(ctx, gwas: str, pvalue: float = 5e-8, clump: str = "auto", matche
     for _ in range(permutations):
         nulls["random_loci"].append(blocks_at(lo + (rng.random(len(lc)) * L).astype(np.int64)))
         nulls["rotation"].append(blocks_at(lo + (lp - lo + (rng.random(len(chroms[1]))[chroms[0]] * L).astype(np.int64)) % L))
-    s, rows = {"hit_haploblocks": int(len(hits)), "loci": int(len(lc)), "backbone": meta["backend"]}, []
+    s, rows = {"hit_haploblocks": int(len(hits)), "loci": int(len(lc)), "backbone": meta["backend"],
+               f"hits_with_fewer_than_{matched}_matched": int(sum(len(v) < matched for v in match.values()))}, []
     for name, v in scores.items():
         ok = [b for b in hits if np.isfinite(v[b]) and np.isfinite(v[match[b]]).any()]
         if not ok:
@@ -1797,8 +1798,12 @@ def model_gwas(ctx, gwas: str, pvalue: float = 5e-8, clump: str = "auto", matche
         row = {"score": name, "hit_mean": round(obs, 4),
                "matched_mean": round(float(np.nanmean([np.nanmean(v[match[b]]) for b in ok])), 4),
                "difference": round(float(diff.mean()), 4)}
-        if bootstrap:
-            bt = [diff[rng.integers(0, len(diff), len(diff))].mean() for _ in range(bootstrap)]
+        if bootstrap:                          # resample hits and, within each, its matched background set
+            hv, mv = np.array([v[b] for b in ok]), [v[match[b]][np.isfinite(v[match[b]])] for b in ok]
+            bt = []
+            for _ in range(bootstrap):
+                pick = rng.integers(0, len(ok), len(ok))
+                bt.append(np.mean([hv[i] - mv[i][rng.integers(0, len(mv[i]), len(mv[i]))].mean() for i in pick]))
             row["difference_95ci"] = tuple(round(float(x), 4) for x in np.percentile(bt, [2.5, 97.5]))
         for kind, draws in nulls.items():
             null = np.array([np.nanmean(v[d]) for d in draws if np.isfinite(v[d]).any()])
