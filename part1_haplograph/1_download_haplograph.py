@@ -4,8 +4,8 @@ Step 1 - download the 1000 Genomes haplograph and write the train / test split o
 Downloads nodes.csv.gz and the edge file of every chromosome (chr1-chr22, or --chroms) from
 https://data.haploblocks.org/haplograph/1000G/ and checks them against checksums.md5. With
 --haplotypes (needed by the haplotype-level steps 2-6) it also downloads, for every haploblock, the
-cluster of each of the 2 x 2,548 phased haplotypes (haploblock_hashes/1000G/<chrom>/), decodes them
-and writes one table per chromosome. It writes the TRAINING set (steps 2-4 learn from it) and the
+cluster of each of the 2 x 2,548 phased haplotypes (haploblock_hashes/1000G/<chrom>/, checked against
+all_chr_tsv_webserver.md5), decodes them and writes one table per chromosome. It writes the TRAINING set (steps 2-4 learn from it) and the
 TEST set (step 6 validates on it): the BH_26 halves (--split bh26, default) or a new
 population-stratified random split that keeps related individuals together (--split random), plus
 the population of every individual (used only to stratify step 6's metrics, never as model input)
@@ -103,12 +103,13 @@ def haplograph_individuals(nodes_path):
     return header[2:]
 
 
-def fetch_haplotypes(workdir, chrom, url=HASHES_URL, jobs=8):
+def fetch_haplotypes(workdir, chrom, url=HASHES_URL, jobs=8, verify=True):
     """--haplotypes: per haploblock of nodes.csv.gz, download <chrom>_individual_hashes_<region>.tsv
     (one row per haplotype, <sample>_<chrom>_region_<region>_hap<0/1>; the last 20 bits of HASH are
     the cluster index, node <region>_cluster<index + 1>), check that every haplotype of every
     individual has exactly one cluster that exists in the haplograph, and write
-    raw/<chrom>/haplotypes.csv.gz. The per-block files are removed once the table is written."""
+    raw/<chrom>/haplotypes.csv.gz. Files downloaded here are checked against <url>/all_chr_tsv_webserver.md5
+    (unless verify=False). The per-block files are removed once the table is written."""
     raw = Path(workdir) / "raw" / chrom
     out = raw / "haplotypes.csv.gz"
     if out.exists():
@@ -122,11 +123,19 @@ def fetch_haplotypes(workdir, chrom, url=HASHES_URL, jobs=8):
     parts = raw / "haplotype_hashes"
     log(f"  {chrom}: haplotype clusters of {len(regions):,} haploblocks")
 
-    def get(region):
-        name = f"{chrom}_individual_hashes_{region.split('_', 1)[1]}.tsv"
-        return download(f"{url}/{chrom}/{name}", parts / name, quiet=True)
+    names = [f"{chrom}_individual_hashes_{r.split('_', 1)[1]}.tsv" for r in regions]
+    new = [n for n in names if not (parts / n).exists()]
     with ThreadPoolExecutor(jobs) as ex:
-        files = list(ex.map(get, regions))
+        files = list(ex.map(lambda n: download(f"{url}/{chrom}/{n}", parts / n, quiet=True), names))
+    if verify and new:
+        sums_file = download(f"{url}/all_chr_tsv_webserver.md5", Path(workdir) / "raw" / "haplotype_hashes.md5", quiet=True)
+        sums = {p.split("/")[-1]: h for h, p in (line.split() for line in open(sums_file) if line.strip())}
+        for n in new:
+            got = md5(parts / n)
+            if sums.get(n, got) != got:
+                (parts / n).unlink()
+                die(f"checksum mismatch for {parts / n} (got {got}, expected {sums[n]}); the file was deleted, "
+                    "run again to re-download it")
     rows = [f"{x}_hap{h}" for x in individuals for h in (0, 1)]
     cols = {}
     for region, path in zip(regions, files):
@@ -137,6 +146,8 @@ def fetch_haplotypes(workdir, chrom, url=HASHES_URL, jobs=8):
         key = parsed["sample"] + "_hap" + parsed["hap"]
         if key.duplicated().any():
             die(f"{path}: a haplotype is listed twice (e.g. {key[key.duplicated()].iloc[0]})")
+        if not df["HASH"].str.fullmatch(r"[01]{20,}", na=False).all():
+            die(f"{path}: HASH must be a 0/1 string of at least 20 bits")
         col = pd.Series(df["HASH"].str[-20:].map(lambda b: int(b, 2) + 1).to_numpy(), index=key).reindex(rows)
         if col.isna().any():
             die(f"{path}: {int(col.isna().sum())} haplotypes of haplograph individuals are missing "
@@ -269,7 +280,7 @@ def main(argv=None):
     ap.add_argument("--test-fraction", type=float, default=0.5, help="random split: share of individuals in test")
     ap.add_argument("--seed", type=int, default=0, help="random split seed")
     ap.add_argument("--no-stratify", action="store_true", help="random split: do not stratify by population")
-    ap.add_argument("--no-verify", action="store_true", help="skip the MD5 check against checksums.md5")
+    ap.add_argument("--no-verify", action="store_true", help="skip the MD5 checks of downloaded files")
     ap.add_argument("--haplotypes", action="store_true",
                     help="also download each haplotype's cluster per haploblock (phased data for steps 2-6)")
     ap.add_argument("--hashes-url", default=HASHES_URL, help="folder with <chrom>/<chrom>_individual_hashes_*.tsv")
@@ -282,6 +293,8 @@ def main(argv=None):
                     help="self-test: write a small synthetic haplograph (no network) and split it")
     args = ap.parse_args(argv)
 
+    if args.jobs < 1:
+        die("--jobs must be >= 1")
     chroms = parse_chroms(args.chroms) or ALL_CHROMS
     if args.test:
         args.workdir = str(test_workdir("download"))
@@ -305,7 +318,7 @@ def main(argv=None):
         elif set(inds) != set(individuals):
             die(f"{chrom}: individual columns differ from {chroms[0]}")
         if args.haplotypes:
-            fetch_haplotypes(args.workdir, chrom, args.hashes_url, args.jobs)
+            fetch_haplotypes(args.workdir, chrom, args.hashes_url, args.jobs, not args.no_verify)
         if args.sequences:
             for ext in ("md5", "tar.gz"):              # members are checked against the .md5 in step 3
                 download(f"{args.sequences_url}/{chrom}_rep_seq.{ext}", Path(args.workdir) / "raw" / chrom / f"rep_seq.{ext}")
