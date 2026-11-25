@@ -1,18 +1,35 @@
 """
 Step 2 - build the haplograph co-occurrence graph, genome-wide or for --chroms, from step 1's
-downloads. Edge weight, support and lift are counted on the TRAINING individuals only (step 1's
-split, or --train-individuals; --no-split = all individuals), so the test set never shapes the
-graph: weight = training individuals carrying both clusters of a pair listed in the edge file,
-lift = weight / (support_A * support_B / n_train), edges with lift < --min-lift are dropped.
-Use --edges all for a train-only graph (the lift5 file was filtered on all individuals).
+downloads. Everything learned from data is counted on the TRAINING individuals only (step 1's split,
+or --train-individuals; --no-split = all individuals), so the test set never shapes the graph.
+Two kinds of edge (--lift):
+  haplotype   (default when step 1 ran with --haplotypes) two clusters are linked when they sit on
+              the same training haplotype, within --max-span bp of each other:
+              lift = n_AB * H / (n_A * n_B) over the H training haplotypes; candidate pairs come from
+              the training haplotypes themselves, pairs seen on fewer than --min-pair-count are dropped
+  individual  two clusters are linked when the same training individuals carry them (either
+              haplotype), for the pairs listed in the dataset's edge file:
+              lift = n_AB / (support_A * support_B / n_train)
+Edges with lift < --min-lift are dropped; the edge value is log(1 + lift).
+
+With step 1's --haplotypes data, the graph folder also gets each haplotype's cluster per haploblock
+(checked: each individual's two haplotypes must reproduce its carriers exactly, or the build stops)
+and the training haplotypes' transitions between adjacent haploblocks.
 
 OUTPUT (in --out; default <workdir>/genome or <workdir>/<chrA>_<chrB>, + _train_<split name>)
   nodes.csv.gz      row i = node i: node, id, chrom, region, start, end, support, support_train
   individuals.txt   one individual per line = the columns of carriers.npz
   train_individuals.txt / test_individuals.txt   the split, restricted to the graph's individuals
+  populations.tsv, related_pairs.tsv             copied from step 1's splits/ (step 6 stratifies by
+                                                 population and reports related pairs across the split)
   carriers.npz      scipy.sparse CSR uint8 [nodes, individuals], ALL individuals (step 6 needs the test ones)
   graph.npz         scipy.sparse CSR float32 [nodes, nodes], symmetric, value log(1 + lift);
                     within-chromosome edges only
+  haplotypes.npz    node: int32 [2 x individuals, haploblocks], row 2i / 2i+1 = haplotype 0 / 1 of
+                    individual i of individuals.txt, value = node index; blocks: haploblock regions
+                    (columns, genomic order per chromosome); block_chrom; ALL individuals
+  junctions.npz     block, a, b, count: count = training haplotypes with node a in haploblock column
+                    `block` and node b in the next haploblock of the same chromosome
   graph_info.json   settings, counts, training/test set ids (rerunning with other settings stops
                     unless --force)
 Parsed chromosomes are cached in <workdir>/parts/<chrom>/, keyed by the raw files.
@@ -20,6 +37,7 @@ Parsed chromosomes are cached in <workdir>/parts/<chrom>/, keyed by the raw file
 USAGE
   python 2_build_graph.py                       # all downloaded chromosomes -> haplograph/genome_train_half_A
   python 2_build_graph.py --chroms chr21,chr22  # -> haplograph/chr21_chr22_train_half_A
+  python 2_build_graph.py --lift individual     # co-carriage lift from the dataset's edge file
   python 2_build_graph.py --cudf --chunksize 0  # pandas parts on the GPU (RAPIDS cuDF)
   python 2_build_graph.py --test                # synthetic data, CPU, seconds
 """
@@ -51,6 +69,7 @@ from haplo_common import (ALL_CHROMS, EDGE_FILE, REGION_RE, chrom_key, die, load
                           test_workdir)
 
 OUTPUTS = ("nodes.csv.gz", "individuals.txt", "carriers.npz", "graph.npz", "graph_info.json")
+HAP_OUTPUTS = ("haplotypes.npz", "junctions.npz")
 
 
 def file_stamp(path):
@@ -158,16 +177,68 @@ def read_edges(edges_path, ids, support, n_ind, min_lift, chunksize, packed=None
     return cat(S, np.int64), cat(T, np.int64), cat(L, np.float32), n_read, n_unknown
 
 
+def read_haplotypes(path, ids, regions, carriers, inds):
+    """raw/<chrom>/haplotypes.csv.gz -> (int32 [2 x individuals, haploblocks] node index within the
+    chromosome, haploblock regions in column order). Stops unless every individual's two haplotypes
+    reproduce its carriers exactly."""
+    tab = pd.read_csv(path, index_col=0)
+    rows = [f"{x}_hap{h}" for x in inds for h in (0, 1)]
+    missing = sorted(set(rows) - set(tab.index))
+    if missing:
+        die(f"{path}: {len(missing)} haplotypes of nodes.csv.gz individuals are missing (e.g. {missing[:2]})")
+    tab = tab.loc[rows]
+    index = pd.Index(ids)
+    H = np.empty(tab.shape, np.int32)
+    for j, region in enumerate(tab.columns):
+        H[:, j] = index.get_indexer(region + "_cluster" + tab[region].astype(str))
+    if (H < 0).any():
+        die(f"{path}: {int((H < 0).sum())} haplotype clusters are not nodes of nodes.csv.gz; re-run step 1")
+    ind = np.repeat(np.arange(len(inds)), 2)
+    U = sp.csr_matrix((np.ones(H.size, np.uint8), (H.ravel(), np.repeat(ind, H.shape[1]))),
+                      shape=carriers.shape)
+    U.data[:] = 1                                             # homozygous: both haplotypes, one carrier bit
+    diff = (U != carriers.astype(bool)).tocoo()
+    if diff.nnz:
+        bad = sorted(set(regions[diff.row]))
+        die(f"{path}: the haplotypes do not reproduce the carriers of nodes.csv.gz in {len(bad)} haploblock(s) "
+            f"(e.g. {bad[:3]}); the two downloads disagree - delete raw/<chrom>/haplotypes.csv.gz and re-run step 1")
+    return H, list(tab.columns)
+
+
+def haplotype_edges(H, starts, hap_rows, n_nodes, args):
+    """Same-haplotype co-occurrence over the training haplotypes `hap_rows` of H, for cluster pairs in
+    different haploblocks at most --max-span bp apart (start to start). Returns s, t, lift, n_pairs."""
+    Ht = H[hap_rows]
+    n_A = np.bincount(Ht.ravel(), minlength=n_nodes).astype(np.float64)
+    counts = sp.csr_matrix((n_nodes, n_nodes), dtype=np.float64)
+    for d in range(1, H.shape[1]):
+        k = np.where(starts[d:] - starts[:-d] <= args.max_span)[0]
+        if not len(k):
+            break
+        a, b = Ht[:, k].ravel(), Ht[:, k + d].ravel()
+        counts = counts + sp.csr_matrix((np.ones(len(a)), (a, b)), shape=(n_nodes, n_nodes))
+    c = counts.tocoo()
+    lift = c.data * len(hap_rows) / (n_A[c.row] * n_A[c.col])
+    keep = (c.data >= args.min_pair_count) & (lift >= args.min_lift)
+    return c.row[keep].astype(np.int64), c.col[keep].astype(np.int64), lift[keep].astype(np.float32), c.nnz
+
+
 def chrom_part(args, chrom, train_names=None, train_tag=""):
     """Parse one chromosome; cached in <workdir>/parts/<chrom>/.
-    Returns ids, regions, carriers (all individuals), individual names, edges, lift, train support, status."""
+    Returns ids, regions, carriers (all individuals), individual names, edges, lift, train support,
+    haplotypes (node index within the chromosome, or None), haploblock regions of its columns, status."""
     d = os.path.join(args.workdir, "parts", chrom)
     os.makedirs(d, exist_ok=True)
-    edges_name = EDGE_FILE[args.edges]
-    nodes_raw, edges_raw = raw_file(args, chrom, "nodes.csv.gz"), raw_file(args, chrom, edges_name)
+    nodes_raw = raw_file(args, chrom, "nodes.csv.gz")
+    hap_raw = Path(args.raw_dir) / chrom / "haplotypes.csv.gz"
+    if args.lift == "haplotype":
+        hap_raw = Path(raw_file(args, chrom, "haplotypes.csv.gz"))
+        edges_raw, kind = str(hap_raw), f"hap_span{args.max_span}_min{args.min_pair_count}"
+    else:
+        edges_raw, kind = raw_file(args, chrom, EDGE_FILE[args.edges]), f"ind_{args.edges}"
     f_meta, f_car = os.path.join(d, "nodes.npz"), os.path.join(d, "carriers.npz")
     tag = f"_train-{train_tag}" if train_tag else ""
-    f_edges = os.path.join(d, f"edges_{args.edges}_minlift{args.min_lift:g}{tag}_{file_stamp(edges_raw)}.npz")
+    f_edges = os.path.join(d, f"edges_{kind}_minlift{args.min_lift:g}{tag}_{file_stamp(edges_raw)}.npz")
 
     meta = np.load(f_meta) if os.path.exists(f_meta) and os.path.exists(f_car) else None
     if not args.force and meta is not None and str(meta.get("source", "")) == file_stamp(nodes_raw):
@@ -179,6 +250,7 @@ def chrom_part(args, chrom, train_names=None, train_tag=""):
         np.savez(f_meta, ids=ids.astype(str), regions=regions.astype(str),
                  individuals=np.array(inds, dtype=str), source=np.array(file_stamp(nodes_raw)))
 
+    cols = list(range(len(inds)))
     if train_names is not None:
         cols = [j for j, c in enumerate(inds) if c in train_names]
         if not cols:
@@ -189,18 +261,26 @@ def chrom_part(args, chrom, train_names=None, train_tag=""):
         C_train = carriers
     support = np.asarray(C_train.sum(axis=1)).ravel()
     n_used = C_train.shape[1]
+    H, blocks = read_haplotypes(hap_raw, ids, regions, carriers, inds) if hap_raw.exists() else (None, [])
+    hap_rows = np.sort(np.concatenate([2 * np.asarray(cols), 2 * np.asarray(cols) + 1])) \
+        if train_names is not None else np.arange(2 * len(inds))
 
     if not args.force and os.path.exists(f_edges):
         e = np.load(f_edges)
         s, t, lift = e["s"], e["t"], e["lift"]
         status = "cached"
+    elif args.lift == "haplotype":
+        starts = pd.Series(blocks).str.extract(REGION_RE)["start"].astype(np.int64).to_numpy()
+        s, t, lift, n_pairs = haplotype_edges(H, starts, hap_rows, len(ids), args)
+        np.savez(f_edges, s=s, t=t, lift=lift)
+        status = f"{len(s):,}/{n_pairs:,} same-haplotype cluster pairs kept"
     else:
         packed = pack_rows(C_train) if train_names is not None else None
         s, t, lift, n_read, n_unk = read_edges(edges_raw, ids, support,
                                               n_used, args.min_lift, args.chunksize, packed)
         np.savez(f_edges, s=s, t=t, lift=lift)
         status = f"{len(s):,}/{n_read:,} edge rows kept" + (f", {n_unk:,} with unknown ids" if n_unk else "")
-    return ids, regions, carriers, inds, s, t, lift, support, status
+    return ids, regions, carriers, inds, s, t, lift, support, H, blocks, hap_rows, status
 
 
 # ---------------------------------------------------------------------------
@@ -223,10 +303,12 @@ def build(args):
             overlap = train_names & test_names
             if overlap:
                 die(f"{len(overlap):,} individuals are in both the train and the test set (e.g. {sorted(overlap)[:3]})")
-        if args.edges == "lift5":
-            log("  warning: the lift5 edge file was pre-filtered on ALL individuals (incl. the test set); "
-                "use --edges all for a strictly train-only graph")
-    requested = {"chromosomes": chroms, "edges_file": args.edges, "min_lift": args.min_lift,
+        if args.lift == "individual":
+            log(f"  note: --lift individual takes its candidate pairs from the dataset's {EDGE_FILE[args.edges]}, "
+                "which was made from ALL individuals (weights are train-only); --lift haplotype avoids that")
+    requested = {"chromosomes": chroms, "lift": args.lift, "min_lift": args.min_lift,
+                 **({"edges_file": args.edges} if args.lift == "individual" else
+                    {"max_span": args.max_span, "min_pair_count": args.min_pair_count}),
                  "train_file_set_id": train_tag or "all",
                  "test_file_set_id": set_id(test_names) if test_names is not None else None}
     if not args.force and all(os.path.exists(os.path.join(out, f)) for f in OUTPUTS):
@@ -244,10 +326,12 @@ def build(args):
 
     ref_inds = None
     ids_all, regions_all, chrom_all, carrier_blocks, sup_train, S, T, W = [], [], [], [], [], [], [], []
+    haps, blocks_all, block_chrom, junc = [], [], [], []
     offset = 0
     for chrom in chroms:
         t0 = time.time()
-        ids, regions, carriers, inds, s, t, lift, support, status = chrom_part(args, chrom, train_names, train_tag)
+        ids, regions, carriers, inds, s, t, lift, support, H, blocks, hap_rows, status = \
+            chrom_part(args, chrom, train_names, train_tag)
         if ref_inds is None:
             ref_inds = inds
         elif inds != ref_inds:
@@ -255,11 +339,25 @@ def build(args):
                 die(f"{chrom}: individual columns differ from {chroms[0]}")
             pos = {c: j for j, c in enumerate(inds)}
             carriers = carriers[:, [pos[c] for c in ref_inds]].tocsr()
+            if H is not None:
+                order = np.ravel([[2 * pos[c], 2 * pos[c] + 1] for c in ref_inds])
+                hap_rows = np.where(np.isin(order, hap_rows))[0]
+                H = H[order]
         ids_all.append(ids); regions_all.append(regions); chrom_all.append(np.full(len(ids), chrom))
         carrier_blocks.append(carriers); sup_train.append(support)
         S.append(s + offset); T.append(t + offset); W.append(np.log1p(lift))
+        if H is not None:
+            col0 = len(blocks_all)
+            for k in range(H.shape[1] - 1):           # training haplotypes' transitions between neighbours
+                pair, cnt = np.unique(H[hap_rows, k].astype(np.int64) * len(ids) + H[hap_rows, k + 1],
+                                      return_counts=True)
+                junc.append((np.full(len(pair), col0 + k), pair // len(ids) + offset,
+                             pair % len(ids) + offset, cnt))
+            haps.append(H + offset); blocks_all += blocks; block_chrom += [chrom] * len(blocks)
         offset += len(ids)
-        log(f"  {chrom}: {len(ids):,} nodes, {status}  ({time.time() - t0:.0f}s)")
+        log(f"  {chrom}: {len(ids):,} nodes, {status}"
+            + (f", {H.shape[0]:,} haplotypes x {H.shape[1]:,} haploblocks" if H is not None else "")
+            + f"  ({time.time() - t0:.0f}s)")
 
     n = offset
     A = sp.coo_matrix((np.concatenate(W).astype(np.float32),
@@ -296,12 +394,26 @@ def build(args):
                 f.write("\n".join(members) + "\n")
         elif os.path.exists(path):
             os.remove(path)                 # a rebuild without a split must not leave a stale one
+    for name in ("populations.tsv", "related_pairs.tsv"):
+        src = os.path.join(args.workdir, "splits", name)
+        if os.path.exists(src):
+            shutil.copyfile(src, os.path.join(out, name))
     sp.save_npz(os.path.join(out, "carriers.npz"), carriers)
     sp.save_npz(os.path.join(out, "graph.npz"), A)
+    with_haps = len(haps) == len(chroms)
+    if with_haps:
+        np.savez_compressed(os.path.join(out, "haplotypes.npz"), node=np.hstack(haps),
+                            blocks=np.array(blocks_all), block_chrom=np.array(block_chrom))
+        j = [np.concatenate(x) for x in zip(*junc)] if junc else [np.empty(0, np.int64)] * 4
+        np.savez_compressed(os.path.join(out, "junctions.npz"), block=j[0], a=j[1], b=j[2], count=j[3])
+    for f in HAP_OUTPUTS if not with_haps else ():
+        if os.path.exists(os.path.join(out, f)):
+            os.remove(os.path.join(out, f))             # a rebuild without haplotypes must not leave stale ones
     deg = np.diff(A.indptr)
-    info = {"chromosomes": chroms, "edges_file": args.edges, "min_lift": args.min_lift,
-            "edge_value": "log1p(lift)", "n_nodes": int(n), "n_edges": int(A.nnz // 2),
+    info = {"edge_value": "log1p(lift)", "n_nodes": int(n), "n_edges": int(A.nnz // 2),
             "n_individuals": len(ref_inds), "isolated_nodes": int((deg == 0).sum()),
+            "pair_source": "train_haplotypes" if args.lift == "haplotype" else f"dataset {EDGE_FILE[args.edges]}",
+            "haplotypes": with_haps, "n_haploblocks": len(blocks_all) if with_haps else None,
             "train_only": train_names is not None, **requested}
     if train_names is not None:
         info.update({"train_individuals_source": args.train_individuals,
@@ -377,8 +489,14 @@ def main(argv=None):
                          "(default: <workdir>/splits/test_individuals.txt)")
     ap.add_argument("--no-split", action="store_true", help="build the graph from ALL individuals (no train/test split)")
     ap.add_argument("--sample-map", help="CSV: graph individual name, sample ID (if they differ)")
+    ap.add_argument("--lift", choices=["haplotype", "individual"],
+                    help="edges from same-haplotype co-occurrence (default when step 1 downloaded --haplotypes) or "
+                         "from individual co-carriage in the dataset's edge file")
+    ap.add_argument("--max-span", type=int, default=500_000, help="--lift haplotype: max bp between linked haploblocks")
+    ap.add_argument("--min-pair-count", type=int, default=3,
+                    help="--lift haplotype: min training haplotypes carrying both clusters")
     ap.add_argument("--edges", choices=["all", "lift5"], default="all",
-                    help="all = edges.csv.gz (~1 GB per chromosome); lift5 = pre-filtered lift>=5 file")
+                    help="--lift individual: all = edges.csv.gz (~1 GB per chromosome); lift5 = pre-filtered lift>=5 file")
     ap.add_argument("--min-lift", type=float, default=2.0, help="keep edges with lift >= this")
     ap.add_argument("--chunksize", type=int, default=2_000_000,
                     help="edge rows read at a time; 0 = whole file at once (with --cudf, chunked reading "
@@ -401,6 +519,11 @@ def main(argv=None):
     args.chroms = parse_chroms(args.chroms) or [c for c in ALL_CHROMS if c in downloaded] or downloaded
     if not args.chroms:
         die(f"no <chrom>/nodes.csv.gz in {args.raw_dir} - run 1_download_haplograph.py first")
+    if args.lift is None:
+        has_haps = all((Path(args.raw_dir) / c / "haplotypes.csv.gz").exists() for c in args.chroms)
+        args.lift = "haplotype" if has_haps else "individual"
+    if args.max_span < 1 or args.min_pair_count < 1:
+        die("--max-span and --min-pair-count must be >= 1")
     genome_wide = set(args.chroms) == set(ALL_CHROMS)
     name = "genome" if genome_wide else "_".join(args.chroms)
     if args.split_name:

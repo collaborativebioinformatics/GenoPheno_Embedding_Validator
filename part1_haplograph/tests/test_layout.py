@@ -7,7 +7,7 @@ import re
 from conftest import PART1
 
 STEPS = ["1_download_haplograph", "2_build_graph", "3_node_embeddings", "4a_finetune_evo2_embeddings",
-         "4b_finetune_evo2_hash", "5_download_gwas", "6_validate_evo2"]
+         "4b_finetune_evo2_phenotype", "5_download_gwas", "6_validate_evo2"]
 
 
 def test_step_scripts_are_numbered():

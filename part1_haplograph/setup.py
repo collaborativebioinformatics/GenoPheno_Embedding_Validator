@@ -3,7 +3,7 @@ Install the dependencies of the part 1 pipeline (haplograph -> embeddings -> Evo
 
 Two modes:
   CPU core (any OS): numpy, pandas, scipy, torch, xgboost from requirements.txt, into the current
-      Python or a new venv. Enough for every step with --mock-evo2 and for every --test.
+      Python or a new venv. Enough for every step with --backbone small and for every --test.
   Evo 2 on a GPU (--evo2; Linux, NVIDIA GPU with compute capability >= 8.0, driver for CUDA 12.8):
       CUDA 12.8 toolkit (Ubuntu, apt + sudo), CUDA_HOME in ~/.bashrc, a venv with torch 2.7.1 (cu128),
       flash-attn 2.8.0.post2 (compiled from source on Blackwell), the evo2 package (light install,
@@ -140,7 +140,7 @@ def gpu_arch(args):
     """Checks for the Evo 2 install; returns the compute capability to build for, e.g. '12.0'."""
     if platform.system() != "Linux":
         raise SetupError("Evo 2 needs Linux with an NVIDIA GPU.\n  hint: on this system use `python setup.py` "
-                         "(CPU core) and run step 4a with --mock-evo2")
+                         "(CPU core) and run step 4a with --backbone small")
     if not shutil.which("nvidia-smi"):
         raise SetupError("nvidia-smi not found\n  hint: install the NVIDIA driver first (CUDA 12.8 capable, >= 570)")
     if not shutil.which(args.python):

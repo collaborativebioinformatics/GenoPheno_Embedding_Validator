@@ -36,7 +36,9 @@ OUTPUT (--out-dir, default <graph-dir>/validation_<model name>/)
 USAGE
   python 6_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --tasks validation_tasks.txt
   python 6_validate_evo2.py --model $G/evo2_next_gnn.pt --graph-dir $G --gwas haplograph/gwas/height.tsv
-  python 6_validate_evo2.py --test                       # synthetic data, mock backbone, CPU
+  python 6_validate_evo2.py --model $G/evo2_next_gnn.pt --model $G/evo2-random_next_gnn.pt \
+      --model $G/small_next_gnn.pt --task model_comparison     # does pretraining help?
+  python 6_validate_evo2.py --test                       # synthetic data, small backbone, CPU
 """
 import argparse
 import glob
@@ -66,8 +68,8 @@ import pandas as pd
 import scipy.sparse as sp
 from scipy import stats
 
-from haplo_common import (BH26_SPLITS, die, is_url, load_sample_map, log, read_graph_individuals,
-                          read_individual_list, selftest_graph_dir, test_workdir)
+from haplo_common import (BH26_SPLITS, die, download, is_url, load_sample_map, log, read_graph_individuals,
+                          read_individual_list, selftest_graph_dir, test_workdir, url_cache_path)
 
 
 GRAPH_SPLIT = "graph"
@@ -212,11 +214,12 @@ def model_kind(meta):
     """Recognise which step-4 script produced a checkpoint. Add a rule here for a new model type."""
     if not isinstance(meta, dict):
         return "unknown"
-    if meta.get("mode") == "hash":
-        return "4b hash-phenotype"
+    if meta.get("mode") == "phenotype":
+        return f"4b phenotype ({meta.get('input')} input)"
     if meta.get("mode") == "embeddings" or "proj_in" in meta:
         backend = meta.get("backend", "evo2")
-        return "4a embeddings" + {"bionemo": " (BioNeMo)", "mock": " (MOCK backbone, not Evo 2)"}.get(backend, "")
+        return "4a embeddings" + {"bionemo": " (BioNeMo)", "small": " (small backbone trained from scratch, not Evo 2)"
+                                  }.get(backend, "") + (" (random init)" if meta.get("init") == "random" else "")
     return "unknown"
 
 
@@ -270,6 +273,8 @@ class Context:
         self.train_idx = self.test_idx = None
         self.test_source = None
         self.split_info = {}
+        self.cache = {}                                  # loaded models, shared by the tasks
+        self.models = [self.model] + [Model(f) for f in args.model[1:]]
 
     def out(self, name):
         """Path for an output file; repeated names get _2, _3 ... before the extension."""
@@ -431,21 +436,27 @@ def model_info(ctx):
     s = {"model_file": ctx.model.path, "kind": kind}
     notes = []
     if isinstance(meta, dict):
-        for k in ("objective", "task", "phenotype", "graph_method", "evo2_model", "model_size",
-                  "layer", "layer_index", "backend"):
+        for k in ("backend", "init", "units", "objective", "head", "softmax", "graph_method", "input", "task", "trait",
+                  "trainable_params", "model_size", "layer_index"):
             if meta.get(k) is not None:
                 s[k] = meta[k]
+        for k in ("evo2_model", "layer", "train_blocks"):
+            if (meta.get("config") or {}).get(k) is not None and meta.get("backend") != "small":
+                s[k] = meta["config"][k]
         if meta.get("chroms"):
             s["trained_chromosomes"] = ",".join(meta["chroms"])
             missing = set(meta["chroms"]) - set(ctx.graph.nodes["chrom"].unique())
             if missing:
                 notes.append(f"WARNING: model was trained on chromosomes not in this graph: {sorted(missing)}")
         tb = meta.get("trained_blocks") or {}
-        s["fine_tuned_evo2_params"] = int(sum(getattr(t, "numel", lambda: 0)() for t in tb.values()))
-        for phase in ("before", "after"):
-            for k, v in ((meta.get("metrics") or {}).get(phase) or {}).items():
+        s["stored_backbone_params"] = int(sum(getattr(t, "numel", lambda: 0)() for t in tb.values()))
+        metrics = meta.get("metrics") or {}
+        for phase in ("before", "best"):
+            for k, v in (metrics.get(phase) or {}).items():
                 if isinstance(v, (int, float)):
                     s[f"stored_val_{k}_{phase}"] = round(float(v), 4)
+        if "best_step" in metrics:
+            s["best_step"] = metrics["best_step"]
         held, trained = ctx.model.held_out_individuals(), ctx.model.trained_individuals()
         test_names = [ctx.graph.individuals[i] for i in ctx.test_idx] if ctx.test_idx is not None else []
         if trained is not None and test_names:
@@ -458,11 +469,9 @@ def model_info(ctx):
             notes.append(f"WARNING: {len(leaked):,} of {len(test_names):,} test individuals are in the model's "
                          f"training or validation set (e.g. {leaked[:3]})" if leaked else
                          "no leakage: no test individual is in the model's training or validation set")
-        elif kind.startswith("4a"):
-            notes.append("the checkpoint does not record its training individuals: leakage not checked")
-        elif kind.startswith("4b"):
-            notes.append("4b models are trained on hash-phenotype rows, not individuals; their held-out rows "
-                         "are stored as val_rows (indices into the training TSV)")
+        elif meta.get("input") == "hash":
+            notes.append("hash-input 4b models are trained on hash-phenotype rows, not individuals; their held-out "
+                         "rows are stored as val_rows (indices into the training TSV)")
     else:
         notes.append("the model file is not a dict; only its type is reported")
     return {"summary": s, "notes": notes}
@@ -559,10 +568,20 @@ def cluster_consistency(ctx, min_carriers: int = 1, permutations: int = 200, alp
         "regions_with_test_only_clusters": int((regions["n_test_only"] > 0).sum()),
         "verdict": "consistent" if consistent else "inconsistent - see per-region file",
     }
+    rel = os.path.join(ctx.graph.dir, "related_pairs.tsv")
+    if os.path.exists(rel):
+        pairs = pd.read_csv(rel, sep="\t", dtype=str)
+        tr_n, te_n = ({ctx.graph.individuals[i] for i in x} for x in (tr, te))
+        across = sum(1 for a, b in zip(pairs["individual_a"], pairs["individual_b"])
+                     if (a in tr_n and b in te_n) or (a in te_n and b in tr_n))
+        s["related_pairs"], s["related_pairs_across_split"] = len(pairs), across
     per_chrom = regions.groupby("chrom", sort=False)["outside_ci"].mean()
     worst = per_chrom.sort_values(ascending=False).head(3)
     notes = ["chromosomes with most regions outside the interval: "
              + ", ".join(f"{c} {v:.1%}" for c, v in worst.items())]
+    if s.get("related_pairs_across_split"):
+        notes.append(f"WARNING: {s['related_pairs_across_split']} related pairs (1000 Genomes pedigree) straddle the "
+                     "split: relatives share long haplotypes, so the test set is not fully independent")
     if test_only.sum():
         notes.append(f"{int(test_only.sum()):,} clusters are carried in test but not in train: the model never saw "
                      "them, so predictions involving them are extrapolation")
@@ -868,179 +887,493 @@ def gwas_enrichment(ctx, gwas: str, pvalue: float = 5e-8, clump: str = "auto", w
 
 # ---- querying the fine-tuned model ----------------------------------------
 
-def bigram_table(data, chrom, individuals):
-    """Most frequent next cluster after each cluster (local indices), counted on `individuals`;
-    clusters never seen as 'current' fall back to the most frequent next cluster overall.
-    Returns (best next [n], sum over transitions of -log p(next | current), number of transitions):
-    the plug-in conditional entropy H(next | current) of the training sequences."""
-    n = len(data.candidates(chrom))
-    keys = []
-    for i in individuals:
-        _, local = data.tokens(chrom, i)
-        if len(local) >= 2:
-            keys.append(local[:-1].astype(np.int64) * n + local[1:])
-    best = np.full(n, -1, np.int64)
-    if not keys:
-        return best, 0.0, 0
-    keys, counts = np.unique(np.concatenate(keys), return_counts=True)
-    cur, nxt = keys // n, keys % n
-    order = np.lexsort((-counts, cur))                      # per current cluster: highest count first
-    first = np.unique(cur[order], return_index=True)[1]
-    best[cur[order][first]] = nxt[order][first]
-    fallback = np.bincount(nxt, weights=counts, minlength=n).argmax()
-    best[best < 0] = fallback
-    per_cur = np.bincount(cur, weights=counts, minlength=n)
-    nll = float(-(counts * np.log(counts / per_cur[cur])).sum())
-    return best, nll, int(counts.sum())
+def ratio_ci(num, den, idx):
+    """95% interval of sum(num) / sum(den) over bootstrap resamples idx [n_boot, n] of individuals."""
+    v = num[idx].sum(1) / np.maximum(den[idx].sum(1), 1e-12)
+    lo, hi = np.percentile(v, [2.5, 97.5])
+    return (round(float(lo), 4), round(float(hi), 4))
 
 
-def paired_bootstrap(per_ind, n_boot, rng, alpha=0.05):
-    """per_ind: [individuals, 3] sums of (model correct, bigram correct, predictions). Resamples
-    INDIVIDUALS (their predictions are correlated). Returns CIs of model, bigram and model - bigram."""
-    m, b, n = per_ind[:, 0], per_ind[:, 1], per_ind[:, 2]
-    idx = rng.integers(0, len(per_ind), (n_boot, len(per_ind)))
-    tot = n[idx].sum(1)
-    tot = np.where(tot > 0, tot, 1)
-    stats_ = np.stack([m[idx].sum(1) / tot, b[idx].sum(1) / tot, (m[idx].sum(1) - b[idx].sum(1)) / tot])
-    lo, hi = np.percentile(stats_, [100 * alpha / 2, 100 * (1 - alpha / 2)], axis=1)
-    return [(round(float(a), 4), round(float(c), 4)) for a, c in zip(lo, hi)]
+def verdict(ci):
+    return "yes" if ci and ci[0] > 0 else "no" if ci and ci[1] < 0 else "not significant"
 
 
-@task("test_set_performance", "Query the fine-tuned model on the test individuals (next-cluster prediction)")
-def test_set_performance(ctx, max_examples: int = 500, train_examples: int = 200, top_k: int = 5,
-                         baseline_individuals: int = 0, bootstrap: int = 1000, device: str = "",
-                         ckpt_dir: str = ""):
-    """max_examples / train_examples = (individual, chromosome) sequences evaluated from the test set /
-    from the model's training individuals (0 = all); baseline_individuals = training individuals used
-    to count the bigram baseline (0 = all); bootstrap = resamples of test individuals for the 95% CIs
-    (0 = none); device = cpu/cuda for the mock backbone; ckpt_dir overrides the NeMo2 checkpoint
-    folder stored in a --bionemo model."""
-    import torch
+def query_model(ctx, model_file=None, device="", ckpt_dir=""):
+    """(HaploModel, GenomeData, meta) of a 4a checkpoint, cached on ctx."""
     from evo2_model import load_finetuned
-    meta = ctx.model.meta
-    if not model_kind(meta).startswith("4a"):
-        raise ValueError(f"test_set_performance needs a 4a model; this is {model_kind(meta)}")
-    model, data = load_finetuned(meta, ctx.graph.dir, device or None, ckpt_dir or None)
+    m = ctx.model if model_file is None else Model(model_file)
+    key = (m.path, device, ckpt_dir)
+    if key not in ctx.cache:
+        if not model_kind(m.meta).startswith("4a"):
+            raise ValueError(f"{m.path} is {model_kind(m.meta)}; this task needs a 4a model")
+        model, data = load_finetuned(m.meta, ctx.graph.dir, device or None, ckpt_dir or None)
+        ctx.cache[key] = (model, data, m.meta)
+    return ctx.cache[key]
+
+
+def sample_examples(data, individuals, k, rng):
+    ex = data.examples(individuals)
+    return ex if not k or len(ex) <= k else [ex[j] for j in np.sort(rng.choice(len(ex), k, replace=False))]
+
+
+def block_tokens(data, chrom, rows):
+    """Block-local tokens [len(rows), haploblocks of chrom] (haplotype units) and tokens per block."""
+    cols = data.block_cols[chrom]
+    tok = data.canon[data.H[np.asarray(rows)][:, cols]]
+    reg = data.region_code[data.canon[data.H[0, cols]]]
+    return data.block_pos[tok], data.block_len[reg]
+
+
+def hap_rows(individuals):
+    return np.ravel([[2 * i, 2 * i + 1] for i in individuals]).astype(np.int64)
+
+
+def individual_baselines(data, chrom, train_inds):
+    """Individual units: next-token predictors counted on the training individuals' sequences:
+    identity_free = the most frequent next token given the current token's haploblock and slot (1st /
+    2nd cluster of the individual in that haploblock), bigram = given the current token."""
+    nxt = {"identity_free": {}, "bigram": {}}
+    for i in train_inds:
+        t = data.tokens(chrom, i)
+        reg = data.region_code[t]
+        slot = np.r_[0, (reg[1:] == reg[:-1]).astype(int)]
+        for key, name in (((reg[:-1] * 2 + slot[:-1]), "identity_free"), (t[:-1], "bigram")):
+            for a, b in zip(key, t[1:]):
+                d = nxt[name].setdefault(int(a), {})
+                d[int(b)] = d.get(int(b), 0) + 1
+    best = {n: {a: max(d, key=d.get) for a, d in v.items()} for n, v in nxt.items()}
+
+    def predict(t):
+        reg = data.region_code[t]
+        slot = np.r_[0, (reg[1:] == reg[:-1]).astype(int)]
+        return {"identity_free": np.array([best["identity_free"].get(int(k), -1) for k in reg[:-1] * 2 + slot[:-1]]),
+                "bigram": np.array([best["bigram"].get(int(k), -1) for k in t[:-1]])}
+    return predict
+
+
+def bigram_entropy(data, chrom, train_inds):
+    """Plug-in H(next | current) of the training sequences: (sum of -log p, number of transitions)."""
+    keys = []
+    for ex in data.examples(train_inds):
+        if ex[0] == chrom:
+            t = data.local[data.tokens(*ex)].astype(np.int64)
+            keys.append(t[:-1] * data.n_nodes + t[1:])
+    if not keys:
+        return 0.0, 0
+    keys, counts = np.unique(np.concatenate(keys), return_counts=True)
+    cur = keys // data.n_nodes
+    per_cur = pd.Series(counts).groupby(cur).transform("sum").to_numpy()
+    return float(-(counts * np.log(counts / per_cur)).sum()), int(counts.sum())
+
+
+def freq_bin(f):
+    return np.select([f < 0.01, f < 0.05, f < 0.2], ["<1%", "1-5%", "5-20%"], ">20%")
+
+
+def populations(ctx):
+    f = os.path.join(ctx.graph.dir, "populations.tsv")
+    if not os.path.exists(f):
+        return None
+    pop = pd.read_csv(f, sep="\t", dtype=str).set_index("individual")["superpopulation"]
+    return np.array([pop.get(x, "unknown") for x in ctx.graph.individuals])
+
+
+def score_next(model, data, examples, train_inds):
+    """Model and baselines on every next-token prediction of `examples`. Returns a DataFrame with one
+    row per prediction: individual, chrom, block, target, rare, freq, length, model_top1/_top5/_logp
+    and <baseline>_top1 (and _logp for haplotype units)."""
+    from haplo_baselines import NEXT_BASELINES, BlockBaselines
+    rows, by_chrom = [], {}
+    for c, ex in examples:
+        by_chrom.setdefault(c, []).append(ex)
+    for chrom, exs in by_chrom.items():
+        if data.units == "haplotype":
+            tr = hap_rows(train_inds)
+            R, K = block_tokens(data, chrom, tr)
+            bl = BlockBaselines(R, K)
+            Y, _ = block_tokens(data, chrom, exs)
+            base = {n: bl.predict_next(Y, n) for n in NEXT_BASELINES}
+            freq = [f / f.sum() for f in bl.freq]
+        else:
+            predict = individual_baselines(data, chrom, train_inds)
+        for j, ex in enumerate(exs):
+            s = model.score(chrom, ex)
+            d = {"individual": ex // 2 if data.units == "haplotype" else ex, "chrom": chrom,
+                 "target": s["target"], "block": data.region_code[s["target"]], "rare": data.rare[s["target"]],
+                 "model_top1": s["top1"], "model_top5": s["top5"], "model_logp": s["logp"]}
+            if data.units == "haplotype":
+                pos = s["pos"]
+                y = Y[j, pos]
+                d["freq"] = np.array([freq[p][t] for p, t in zip(pos, y)])
+                for n in NEXT_BASELINES:
+                    P = [base[n][p - 1][j] for p in pos]
+                    d[f"{n}_top1"] = np.array([p.argmax() == t for p, t in zip(P, y)])
+                    d[f"{n}_logp"] = np.log(np.array([p[t] for p, t in zip(P, y)]))
+            else:
+                t = data.tokens(chrom, ex)
+                pr = predict(t)
+                d["freq"] = data.support[s["target"]] / max(len(train_inds), 1)
+                d["same_block"] = data.region_code[t[s["pos"] - 1]] == d["block"]
+                for n, p in pr.items():
+                    d[f"{n}_top1"] = p[s["pos"] - 1] == t[s["pos"]]
+            rows.append(pd.DataFrame(d))
+    return pd.concat(rows, ignore_index=True)
+
+
+@task("test_set_performance", "Query the fine-tuned model on the test haplotypes / individuals: next-token "
+                              "prediction against frequency, n-gram and HMM baselines, by stratum")
+def test_set_performance(ctx, max_examples: int = 500, train_examples: int = 200, bootstrap: int = 1000,
+                         model: str = "", device: str = "", ckpt_dir: str = ""):
+    """max_examples / train_examples = (haplotype or individual, chromosome) sequences evaluated from the
+    test set / from the model's training individuals (0 = all); bootstrap = resamples of test
+    individuals for the 95% CIs (paired: the same resamples for the model and every baseline); device =
+    cpu/cuda for a small backbone; ckpt_dir overrides the NeMo2 checkpoint folder of a bionemo model;
+    model = another --model file (default: the first). Baselines are counted on the graph's training
+    individuals."""
+    model, data, meta = query_model(ctx, model or None, device, ckpt_dir)
+    if meta["objective"] != "next":
+        raise ValueError("test_set_performance scores next-token models; use masked_imputation for a masked model")
     rng = ctx.rng
-
-    def sample(examples, k):
-        if k and len(examples) > k:
-            return [examples[j] for j in np.sort(rng.choice(len(examples), k, replace=False))]
-        return examples
-
-    test_ex = sample(data.examples(ctx.test_idx), max_examples)
-    trained = set(meta.get("train_individuals") or [])
-    pos = {x: i for i, x in enumerate(ctx.graph.individuals)}
-    tr_pool = np.array(sorted(pos[x] for x in trained if x in pos), dtype=np.int64) if trained else ctx.train_idx
-    train_ex = sample(data.examples(tr_pool), train_examples)
+    test_ex = sample_examples(data, ctx.test_idx, max_examples, rng)
     if not test_ex:
-        raise ValueError("no test sequences with at least 2 clusters on the model's chromosomes")
+        raise ValueError("no test sequences with at least 2 tokens on the model's chromosomes")
+    pos = {x: i for i, x in enumerate(ctx.graph.individuals)}
+    tr_pool = np.array(sorted(pos[x] for x in meta["train_individuals"] if x in pos), dtype=np.int64)
+    df = score_next(model, data, test_ex, ctx.train_idx)
+    tr = score_next(model, data, sample_examples(data, tr_pool, train_examples, rng), ctx.train_idx) \
+        if train_examples and len(tr_pool) else None
+    names = [c[:-5] for c in df.columns if c.endswith("_top1") and c != "model_top1"]
+    with_ce = data.units == "haplotype" and meta["softmax"] == "block"
 
-    base_pool = ctx.train_idx
-    if baseline_individuals and len(base_pool) > baseline_individuals:
-        base_pool = np.sort(rng.choice(base_pool, baseline_individuals, replace=False))
-    chroms = sorted({c for c, _ in test_ex})
-    bigram, h_nll, h_n = {}, 0.0, 0
-    for c in chroms:
-        bigram[c], nll_c, n_c = bigram_table(data, c, base_pool)
-        h_nll += nll_c; h_n += n_c
-    # region of every local cluster index (clusters of one region are contiguous in genomic order)
-    region_local = {c: torch.from_numpy(pd.factorize(ctx.graph.region_codes[data.candidates(c)])[0]).to(model.rnr.dev)
-                    for c in chroms}
+    inds = df["individual"].to_numpy()
+    uniq, ind_code = np.unique(inds, return_inverse=True)
+    per = lambda col: np.bincount(ind_code, weights=df[col].astype(float), minlength=len(uniq))
+    count = np.bincount(ind_code, minlength=len(uniq)).astype(float)
+    idx = rng.integers(0, len(uniq), (bootstrap, len(uniq))) if bootstrap and len(uniq) > 1 else None
+    ci = lambda num: ratio_ci(num, count, idx) if idx is not None else None
+    top1 = float(df["model_top1"].mean())
+    loss = float(-df["model_logp"].mean())
+    s = {"backend": meta["backend"], "init": meta["init"], "units": data.units, "head": meta["head"],
+         "softmax": meta["softmax"], "embeddings": meta["graph_method"],
+         "test_individuals": len(uniq), "test_sequences": len(test_ex), "test_predictions": len(df),
+         "test_loss": round(loss, 4), "test_perplexity": round(float(np.exp(min(loss, 50))), 2),
+         "test_top1_accuracy": round(top1, 4), "test_top1_95ci": ci(per("model_top1")),
+         "test_top5_accuracy": round(float(df["model_top5"].mean()), 4),
+         "test_targets_merged_rare_share": round(float(df["rare"].mean()), 4)}
+    beats = []
+    for n in names:
+        s[f"{n}_top1_accuracy"] = round(float(df[f"{n}_top1"].mean()), 4)
+        d_ci = ci(per("model_top1") - per(f"{n}_top1"))
+        s[f"model_minus_{n}_top1"] = round(top1 - s[f"{n}_top1_accuracy"], 4)
+        s[f"model_minus_{n}_top1_95ci"] = d_ci
+        if with_ce:
+            s[f"{n}_loss"] = round(float(-df[f"{n}_logp"].mean()), 4)
+            s[f"model_minus_{n}_loss_95ci"] = ci(per(f"{n}_logp") - per("model_logp"))
+        if verdict(d_ci) == "yes":
+            beats.append(n)
+    s["beats_baselines"] = ",".join(beats) or "none"
+    s["beats_every_baseline"] = "yes" if len(beats) == len(names) else "no"
+    if tr is not None:
+        s["train_sample_top1_accuracy"] = round(float(tr["model_top1"].mean()), 4)
+        s["generalization_gap_top1"] = round(s["train_sample_top1_accuracy"] - top1, 4)
+    h_nll, h_n = map(sum, zip(*(bigram_entropy(data, c, ctx.train_idx) for c in sorted(set(df["chrom"])))))
+    s["bigram_reference_entropy"] = round(h_nll / h_n, 4) if h_n else None
+    floor = head_floor(model, data, df["target"].to_numpy()[:2000])
+    s["head_ce_floor"] = round(floor, 4) if floor is not None else None
+    s["stored_best_val_top1"] = round(float(meta["metrics"]["best"]["accuracy"]), 4)
 
-    def run(examples, with_baseline):
-        rows, per_ind = {}, {}
-        with torch.no_grad():
-            for chrom, i in examples:
-                logits, target = model.logits(chrom, i)
-                k = min(top_k, logits.shape[1])
-                nll = torch.nn.functional.cross_entropy(logits, target, reduction="sum").item()
-                top = logits.topk(k, dim=-1).indices
-                r = rows.setdefault(chrom, {"seq": 0, "n": 0, "nll": 0.0, "top1": 0, "topk": 0, "bigram": 0,
-                                            "region_top1": 0, "rare": 0})
-                r["rare"] += int(data.rare[data.candidates(chrom)[target.cpu().numpy()]].sum())
-                r["seq"] += 1; r["n"] += len(target); r["nll"] += nll
-                hit = int((top[:, 0] == target).sum())
-                r["top1"] += hit; r["topk"] += int((top == target[:, None]).any(1).sum())
-                big_hit = 0
-                if with_baseline:
-                    # region-conditioned: is the target the best-scored cluster of its own region?
-                    reg = region_local[chrom]
-                    n_reg = int(reg.max()) + 1
-                    others = logits.scatter(1, target[:, None], float("-inf"))      # all but the target
-                    rmax = torch.full((logits.shape[0], n_reg), float("-inf"), device=logits.device)
-                    rmax = rmax.scatter_reduce(1, reg.expand_as(others), others, reduce="amax")
-                    t_logit = logits.gather(1, target[:, None])[:, 0]
-                    # strictly above every other cluster of its region (a tie is a miss)
-                    r["region_top1"] += int((t_logit > rmax.gather(1, reg[target][:, None])[:, 0]).sum())
-                    _, local = data.tokens(chrom, i)
-                    s, e = model.window(len(local))
-                    big_hit = int((bigram[chrom][local[s:e - 1]] == local[s + 1:e]).sum())
-                    r["bigram"] += big_hit
-                acc = per_ind.setdefault(i, [0, 0, 0])
-                acc[0] += hit; acc[1] += big_hit; acc[2] += len(target)
-        return rows, np.array(list(per_ind.values()), dtype=np.float64).reshape(-1, 3)
+    # strata
+    pops = populations(ctx)
+    df["superpopulation"] = pops[df["individual"]] if pops is not None else "unknown"
+    starts = ctx.graph.regions.set_index("region")
+    length = (starts["end"] - starts["start"]).reindex(data.regions).to_numpy()[df["block"]]
+    df["block_length"] = pd.qcut(length, 3, labels=["short", "medium", "long"], duplicates="drop").astype(str) \
+        if len(np.unique(length)) >= 3 else "all"
+    df["target_frequency"] = freq_bin(df["freq"].to_numpy())
+    df["merged_rare_target"] = np.where(df["rare"], "yes", "no")
+    kinds = ["target_frequency", "superpopulation", "block_length", "merged_rare_target"]
+    if "same_block" in df:
+        df["target_block"] = np.where(df["same_block"], "same haploblock", "next haploblock")
+        kinds.append("target_block")
+    strata = []
+    for kind in kinds:
+        for value, g in df.groupby(kind):
+            gi = np.searchsorted(uniq, g["individual"].to_numpy())
+            cnt = np.bincount(gi, minlength=len(uniq)).astype(float)
+            row = {"stratum": kind, "value": value, "predictions": len(g),
+                   "model_top1": round(float(g["model_top1"].mean()), 4),
+                   "model_top1_95ci": ratio_ci(np.bincount(gi, weights=g["model_top1"].astype(float),
+                                                           minlength=len(uniq)), cnt, idx) if idx is not None else None}
+            for n in names:
+                row[f"{n}_top1"] = round(float(g[f"{n}_top1"].mean()), 4)
+            if with_ce:
+                row["model_loss"] = round(float(-g["model_logp"].mean()), 4)
+            strata.append(row)
+    path = ctx.out("test_set_performance_strata.csv")
+    pd.DataFrame(strata).to_csv(path, index=False)
 
-    (t_rows, t_ind), (tr_rows, _) = run(test_ex, True), run(train_ex, False)
-    tot = lambda rows, key: sum(r[key] for r in rows.values())
-    n_test, n_train = tot(t_rows, "n"), max(tot(tr_rows, "n"), 1)
-    loss = tot(t_rows, "nll") / n_test
-    top1, topk = tot(t_rows, "top1") / n_test, tot(t_rows, "topk") / n_test
-    tr_top1 = tot(tr_rows, "top1") / n_train
-    big = tot(t_rows, "bigram") / n_test
-    region_top1 = tot(t_rows, "region_top1") / n_test
-    floor = h_nll / h_n if h_n else float("nan")          # bigram reference cross-entropy
-    cis = paired_bootstrap(t_ind, bootstrap, rng) if bootstrap > 0 and len(t_ind) > 1 else None
-
-    path = ctx.out("test_set_performance_chroms.csv")
-    pd.DataFrame([{"chrom": c, "test_sequences": r["seq"], "test_predictions": r["n"],
-                   "test_loss": r["nll"] / r["n"], "test_top1": r["top1"] / r["n"],
-                   f"test_top{top_k}": r["topk"] / r["n"], "test_region_top1": r["region_top1"] / r["n"],
-                   "bigram_top1": r["bigram"] / r["n"]}
-                  for c, r in t_rows.items()]).to_csv(path, index=False, float_format="%.6g")
-    stored = (meta.get("metrics") or {})
-    s = {
-        "backend": meta.get("backend", "evo2"), "embeddings": meta.get("graph_method"),
-        "test_individuals": len({i for _, i in test_ex}), "test_sequences": len(test_ex),
-        "test_predictions": n_test,
-        "test_loss": round(loss, 4), "test_perplexity": round(float(np.exp(min(loss, 50))), 2),
-        "test_top1_accuracy": round(top1, 4),
-        "test_top1_95ci": cis[0] if cis else None,
-        f"test_top{top_k}_accuracy": round(topk, 4),
-        "test_region_conditioned_top1": round(region_top1, 4),
-        "test_targets_merged_rare_share": round(tot(t_rows, "rare") / n_test, 4),
-        "train_sample_top1_accuracy": round(tr_top1, 4) if tr_rows else None,
-        "generalization_gap_top1": round(tr_top1 - top1, 4) if tr_rows else None,
-        "bigram_baseline_top1_accuracy": round(big, 4),
-        "bigram_baseline_top1_95ci": cis[1] if cis else None,
-        "model_minus_bigram_top1": round(top1 - big, 4),
-        "model_minus_bigram_95ci": cis[2] if cis else None,
-        "beats_bigram_baseline": ("yes" if cis[2][0] > 0 else "no" if cis[2][1] < 0 else "not significant")
-                                 if cis else ("yes" if top1 > big else "no"),
-        "bigram_reference_entropy": round(floor, 4),
-        "test_loss_minus_bigram_reference": round(loss - floor, 4),
-        "stored_val_top1_before_training": round(float((stored.get("before") or {}).get("accuracy", np.nan)), 4),
-        "stored_val_top1_after_training": round(float((stored.get("after") or {}).get("accuracy", np.nan)), 4),
-    }
     notes = []
-    if meta.get("backend") == "mock":
-        notes.append("MOCK backbone: this model is a small stand-in, not Evo 2; the numbers only show that "
-                     "the pipeline runs")
-    leaked = {x for x in (ctx.graph.individuals[i] for _, i in test_ex) if x in trained}
+    if meta["backend"] == "small":
+        notes.append("small backbone: a transformer trained from scratch, not Evo 2")
+    leaked = set(meta["train_individuals"]) & {ctx.graph.individuals[i] for i in uniq}
     if leaked:
         notes.append(f"WARNING: {len(leaked)} evaluated test individuals were in the model's training set")
-    if s["beats_bigram_baseline"] != "yes":
-        notes.append("the model does not beat the bigram baseline on the test set (paired bootstrap over test "
-                     "individuals): it has not shown more than which cluster usually follows the current one")
-    notes.append("bigram_reference_entropy is the plug-in H(next | current) of the training sequences (nats), "
-                 "measured on the data it is counted from: a reference, not a floor. A model that uses more "
-                 "context than the current cluster can go below it (negative test_loss_minus_bigram_reference "
-                 "is good); far above it, the model does not even capture the bigram's predictability")
-    notes.append("region-conditioned top-1 asks whether the target is the model's best cluster within the "
-                 "target's own haploblock region: it separates 'which haplotype' from 'where on the chromosome'")
-    if tr_rows and tr_top1 - top1 > 0.1:
+    if s["beats_every_baseline"] != "yes":
+        notes.append("the model does not beat every baseline on the test set (paired bootstrap over test individuals): "
+                     f"not beaten: {', '.join(n for n in names if n not in beats)}")
+    if floor is not None and s["bigram_reference_entropy"] is not None and floor > s["bigram_reference_entropy"]:
+        notes.append(f"the head's cross-entropy floor ({floor:.3f}) is above the bigram reference entropy: comparing the "
+                     "test loss with that reference is not meaningful for this head (see head_ceiling)")
+    notes.append("baselines are counted on the training individuals: frequency (= identity-free for haplotype units), "
+                 "add-k bigram, trigram with backoff, and a Li-Stephens HMM copying the training haplotypes"
+                 if data.units == "haplotype" else
+                 "baselines: identity_free (the current token's haploblock and slot, not its identity) and bigram")
+    if tr is not None and s["generalization_gap_top1"] > 0.1:
         notes.append("training accuracy is much higher than test accuracy: likely overfitting")
     return {"summary": s, "notes": notes, "files": [path]}
+
+
+def head_floor(model, data, targets):
+    """Mean cross-entropy an oracle reaches with the model's head when it points exactly at the target's
+    key (cosine heads; at the head's current logit scale). None for a learned output table."""
+    import torch
+    if model.head_kind == "table":
+        return None
+    targets = np.asarray(targets)
+    with torch.no_grad():
+        q = model.keys[torch.from_numpy(targets).to(model.rnr.dev)]      # the best direction: the target's own key
+        total = 0.0
+        for chrom in np.unique(data.chrom_of[targets]):
+            sel = torch.from_numpy(np.where(data.chrom_of[targets] == chrom)[0]).to(model.rnr.dev)
+            lg, t, _ = model.logits(q[sel], targets[sel.cpu().numpy()], chrom)
+            total += torch.nn.functional.cross_entropy(lg, t, reduction="sum").item()
+    return total / max(len(targets), 1)
+
+
+@task("head_ceiling", "The best cross-entropy and top-1 the model's output head can reach on the test targets")
+def head_ceiling(ctx, max_targets: int = 5000, model: str = "", device: str = "", ckpt_dir: str = ""):
+    """An oracle that points the head exactly at each target's key: with a cosine head the softmax
+    over near-collinear keys cannot be sharp, so even a perfect model has a cross-entropy floor; with
+    a learned table there is none. Reported for the model's current scale and the largest allowed one."""
+    import torch
+    model, data, meta = query_model(ctx, model or None, device, ckpt_dir)
+    ex = sample_examples(data, ctx.test_idx, 0, ctx.rng)
+    targets = np.concatenate([data.tokens(c, e)[1:] for c, e in ex])
+    if len(targets) > max_targets:
+        targets = ctx.rng.choice(targets, max_targets, replace=False)
+    s = {"head": meta["head"], "softmax": meta["softmax"], "targets": int(len(targets))}
+    if meta["head"] == "table":
+        s["ce_floor"] = 0.0
+        notes = ["learned output table: every token has its own output vector, so the head has no fixed floor"]
+    else:
+        s["ce_floor_current_scale"] = round(head_floor(model, data, targets), 4)
+        s["logit_scale"] = round(float(model.scale().detach() if hasattr(model.scale(), "detach") else model.scale()), 3)
+        if meta["head"] == "scaled-cosine":
+            with torch.no_grad():
+                keep = model.extra["log_scale"].clone()
+                model.extra["log_scale"].fill_(float(np.log(100.0)))
+                s["ce_floor_max_scale"] = round(head_floor(model, data, targets), 4)
+                model.extra["log_scale"].copy_(keep)
+        with torch.no_grad():
+            K = model.keys[torch.from_numpy(targets).to(model.rnr.dev)]
+            near = []
+            for chrom in data.present:
+                for b in np.unique(data.region_code[data.cands[chrom]]):
+                    toks = data.block_pad[b][data.block_pad[b] >= 0]
+                    if len(toks) > 1:
+                        k = model.keys[torch.from_numpy(toks).to(model.rnr.dev)]
+                        sim = (k @ k.T).fill_diagonal_(-1).max(1).values
+                        near.append(sim.cpu().numpy())
+        near = np.concatenate(near) if near else np.zeros(1)
+        s["median_cosine_to_nearest_other_key"] = round(float(np.median(near)), 3)
+        s["share_of_keys_above_0.95"] = round(float((near > 0.95).mean()), 3)
+        notes = ["ce_floor = the cross-entropy of an oracle pointing at the target's key: the head cannot go "
+                 "below it; compare it with test_set_performance's bigram_reference_entropy"]
+    return {"summary": s, "notes": notes}
+
+
+@task("masked_imputation", "Impute masked haploblocks of test individuals from both flanks: model vs "
+                           "frequency, flank lookup and a Li-Stephens HMM")
+def masked_imputation(ctx, spans: str = "1,2,5", per_haplotype: int = 5, max_individuals: int = 300,
+                      bootstrap: int = 500, model: str = "", device: str = "", ckpt_dir: str = ""):
+    """For each span length in `spans`, `per_haplotype` random spans of that many contiguous
+    haploblocks are masked on both haplotypes of up to max_individuals test individuals per
+    chromosome (the same blocks on both, as in genotype imputation). Reports concordance (top-1 per
+    haplotype) and r^2 between true and expected cluster dosage (0-2 copies), pooled over the masked
+    (individual, haploblock, cluster) entries of each training-frequency bin, for the model (a masked-
+    objective model; a next-token model is skipped) and the baselines; 95% CIs of model - baseline
+    concordance resample individuals."""
+    from haplo_baselines import BlockBaselines
+    model, data, meta = query_model(ctx, model or None, device, ckpt_dir)
+    if data.units != "haplotype":
+        raise ValueError("masked_imputation needs a model with --units haplotype")
+    use_model = meta["objective"] == "masked"
+    rng = ctx.rng
+    test = ctx.test_idx if len(ctx.test_idx) <= max_individuals else np.sort(rng.choice(ctx.test_idx, max_individuals, replace=False))
+    rows = []
+    for chrom in data.chroms:
+        R, K = block_tokens(data, chrom, hap_rows(ctx.train_idx))
+        bl = BlockBaselines(R, K)
+        freq = [f / f.sum() for f in bl.freq]
+        Y, _ = block_tokens(data, chrom, hap_rows(test))
+        B = Y.shape[1]
+        w0, w1 = model.window(B)                         # the model sees the central --max-len haploblocks
+        for L in [int(x) for x in spans.split(",")]:
+            if w1 - w0 < L + 2:
+                continue
+            mask = np.zeros((len(test), B), bool)
+            for i in range(len(test)):
+                for s0 in rng.choice(np.arange(w0 + 1, w1 - L), min(per_haplotype, w1 - w0 - L - 1), replace=False):
+                    mask[i, s0:s0 + L] = True
+            M = np.repeat(mask, 2, axis=0)                                  # both haplotypes
+            hmm = bl.hmm(Y, causal=False, mask=M)
+            for i in range(len(test)):
+                for h in (0, 1):
+                    r = 2 * i + h
+                    blocks = np.where(M[r])[0]
+                    preds = {"frequency": [freq[b] for b in blocks], "hmm": [hmm[b][r] for b in blocks],
+                             "flank": [flank(R, Y[r], b, M[r], K[b]) for b in blocks]}
+                    if use_model:
+                        sc = model.score(chrom, int(hap_rows([test[i]])[h]), mask=blocks, probs=True)
+                        dense = {}
+                        for b, cand, p in zip(sc["pos"], sc["cand"], sc["p"]):
+                            v = np.zeros(K[b])
+                            ok = cand >= 0
+                            v[data.block_pos[cand[ok]]] = p[ok]
+                            dense[b] = v
+                        preds["model"] = [dense[b] for b in blocks]
+                    for b_i, b in enumerate(blocks):
+                        rows.append({"span": L, "individual": i, "hap": h, "chrom": chrom, "block": b, "true": Y[r, b],
+                                     "fvec": freq[b], **{n: v[b_i] for n, v in preds.items()}})
+    if not rows:
+        raise ValueError("no chromosome has enough haploblocks for the requested spans")
+    df = pd.DataFrame(rows)
+    methods = (["model"] if use_model else []) + ["hmm", "flank", "frequency"]
+    out, uniq = [], np.unique(df["individual"])
+    for L, g in df.groupby("span"):
+        res = {"span": L}
+        idx = rng.integers(0, len(uniq), (bootstrap, len(uniq))) if bootstrap else None
+        code = np.searchsorted(uniq, g["individual"].to_numpy())
+        cnt = np.bincount(code, minlength=len(uniq)).astype(float)
+        hits = {m: np.array([p.argmax() == t for p, t in zip(g[m], g["true"])]) for m in methods}
+        for m in methods:
+            res[f"{m}_concordance"] = round(float(hits[m].mean()), 4)
+        if use_model and idx is not None:
+            for m in methods[1:]:
+                d = np.bincount(code, weights=hits["model"].astype(float) - hits[m], minlength=len(uniq))
+                res[f"model_minus_{m}_95ci"] = ratio_ci(d, cnt, idx)
+        # dosage r^2 per training-frequency bin: both haplotypes of an individual at one haploblock
+        dos = g.groupby(["individual", "chrom", "block"])
+        for m in methods:
+            true_d, exp_d, fb = [], [], []
+            for _, gg in dos:
+                if len(gg) != 2:
+                    continue
+                f = gg["fvec"].iloc[0]
+                true_d.append(np.bincount(gg["true"], minlength=len(f)))
+                exp_d.append(np.sum(np.stack(gg[m].to_list()), 0))
+                fb.append(freq_bin(f))
+            if true_d:
+                t, e, f = np.concatenate(true_d), np.concatenate(exp_d), np.concatenate(fb)
+                for bin_ in ("<1%", "1-5%", "5-20%", ">20%"):
+                    sel = f == bin_
+                    if sel.sum() > 2 and t[sel].std() > 0 and e[sel].std() > 0:
+                        res[f"{m}_r2_{bin_}"] = round(float(np.corrcoef(t[sel], e[sel])[0, 1] ** 2), 4)
+        out.append(res)
+    path = ctx.out("masked_imputation.csv")
+    pd.DataFrame(out).to_csv(path, index=False)
+    s = {"model_scored": "yes" if use_model else "no (next-token model)", "test_individuals": int(len(uniq)),
+         "masked_haploblocks": int(len(df))}
+    for r in out:
+        for k, v in r.items():
+            if k != "span":
+                s[f"span{r['span']}_{k}"] = v
+    notes = ["flank = the most frequent cluster among training haplotypes that match the test haplotype at the "
+             "haploblocks just left and right of the masked span (left only, then frequency, if none match)",
+             "r^2 compares true and expected cluster dosage (0-2 copies) over masked (individual, haploblock, "
+             "cluster) entries, pooled per training-frequency bin of the cluster"]
+    if not use_model:
+        notes.append("the model has --objective next, so it cannot use the right flank: only the baselines are scored")
+    return {"summary": s, "notes": notes, "files": [path]}
+
+
+def flank(R, y, b, masked, K):
+    """Training-haplotype cluster distribution at block b given the unmasked flanks of its masked span."""
+    left = b
+    while left >= 0 and masked[left]:
+        left -= 1
+    right = b
+    while right < len(y) and masked[right]:
+        right += 1
+    match = np.ones(len(R), bool)
+    for f in (left, right):
+        if 0 <= f < len(y):
+            m = match & (R[:, f] == y[f])
+            if m.any():
+                match = m
+    c = np.bincount(R[match, b], minlength=K).astype(float)
+    return (c + 1e-3) / (c.sum() + 1e-3 * K)
+
+
+@task("model_comparison", "One table across the --model files (e.g. pretrained / random-init / small / frozen) "
+                          "with paired CIs between every pair")
+def model_comparison(ctx, max_examples: int = 300, bootstrap: int = 1000, device: str = "", ckpt_dir: str = ""):
+    """Every 4a model given with --model is scored on the same test examples: next-token top-1 and
+    cross-entropy (next-token models) or masked-position top-1 and cross-entropy at fixed masks
+    (masked models). Differences between every pair of models get a 95% CI from a paired bootstrap
+    over test individuals; models with different readouts or tokenisations are not compared."""
+    files = [m.path for m in ctx.models]
+    if len(files) < 2:
+        raise ValueError("model_comparison needs at least two --model files")
+    rng = ctx.rng
+    per, table = {}, []
+    test = ctx.test_idx
+    for f in files:
+        model, data, meta = query_model(ctx, f, device, ckpt_dir)
+        ex = sample_examples(data, test, max_examples, np.random.default_rng(0))   # same examples per model
+        hits, lps, inds = [], [], []
+        for c, e in ex:
+            sc = model.score(c, e)
+            hits.append(sc["top1"]); lps.append(sc["logp"])
+            inds.append(np.full(len(sc["top1"]), e // 2 if data.units == "haplotype" else e))
+        hits, lps, inds = map(np.concatenate, (hits, lps, inds))
+        key = (meta["objective"], data.units, meta["config"]["min_support"], tuple(data.chroms))
+        per[f] = (key, inds, hits, lps)
+        table.append({"model": os.path.basename(f), "backend": meta["backend"], "init": meta["init"],
+                      "units": data.units, "objective": meta["objective"], "head": meta["head"],
+                      "train_blocks": meta["config"]["train_blocks"], "trainable_params": meta["trainable_params"],
+                      "top1": round(float(hits.mean()), 4), "loss": round(float(-lps.mean()), 4),
+                      "predictions": int(len(hits))})
+    uniq = np.unique(np.concatenate([v[1] for v in per.values()]))
+    idx = rng.integers(0, len(uniq), (bootstrap, len(uniq))) if bootstrap else None
+    pairs = []
+    for i, a in enumerate(files):
+        for b in files[i + 1:]:
+            (ka, ia, ha, la), (kb, ib, hb, lb) = per[a], per[b]
+            row = {"model_a": os.path.basename(a), "model_b": os.path.basename(b)}
+            if ka != kb or len(ha) != len(hb):
+                row["comparable"] = "no (different readout, units, merging or chromosomes)"
+            else:
+                code = np.searchsorted(uniq, ia)
+                cnt = np.bincount(code, minlength=len(uniq)).astype(float)
+                d1 = np.bincount(code, weights=ha.astype(float) - hb, minlength=len(uniq))
+                d2 = np.bincount(code, weights=lb - la, minlength=len(uniq))
+                row.update(comparable="yes", top1_a_minus_b=round(float(ha.mean() - hb.mean()), 4),
+                           top1_95ci=ratio_ci(d1, cnt, idx) if idx is not None else None,
+                           loss_a_minus_b=round(float(lb.mean() - la.mean()), 4),
+                           loss_95ci=ratio_ci(d2, cnt, idx) if idx is not None else None)
+            pairs.append(row)
+    p1, p2 = ctx.out("model_comparison.csv"), ctx.out("model_comparison_pairs.csv")
+    pd.DataFrame(table).to_csv(p1, index=False)
+    pd.DataFrame(pairs).to_csv(p2, index=False)
+    s = {"models": len(files)}
+    for r in table:
+        s[f"{r['model']}_top1"] = r["top1"]
+    for r in pairs:
+        if r.get("comparable") == "yes":
+            s[f"{r['model_a']}_minus_{r['model_b']}_top1"] = f"{r['top1_a_minus_b']} {r['top1_95ci']}"
+    return {"summary": s, "notes": ["pretraining helps only if the pretrained model beats both the random-init and the "
+                                    "small model at equal data (CI excluding 0)"], "files": [p1, p2]}
 
 
 def auc(scores, labels):
@@ -1054,8 +1387,7 @@ def auc(scores, labels):
 
 
 def binned_auc(scores, labels, dist, n_bins=4):
-    """Mean AUC within genomic-distance quantile bins: compares pairs at similar distance only, so a
-    score that merely encodes position cannot do well."""
+    """Mean AUC within quantile bins of `dist`: compares pairs at similar distance (or frequency) only."""
     edges = np.unique(np.quantile(dist, np.linspace(0, 1, n_bins + 1)))
     b = np.clip(np.searchsorted(edges, dist, side="right") - 1, 0, max(len(edges) - 2, 0))
     vals = [auc(scores[b == k], labels[b == k]) for k in np.unique(b)]
@@ -1063,32 +1395,43 @@ def binned_auc(scores, labels, dist, n_bins=4):
     return float(np.mean(vals)) if vals else float("nan")
 
 
-@task("embedding_cooccurrence", "Do the node embeddings predict cluster co-occurrence in the TEST individuals?")
-def embedding_cooccurrence(ctx, min_lift: float = 2.0, min_support: int = 5, min_expected: float = 5.0,
-                           pairs: int = 50000, max_distance: int = 1_000_000, bootstrap: int = 200):
+@task("embedding_cooccurrence", "Do the node embeddings predict which clusters co-occur in the TEST individuals?")
+def embedding_cooccurrence(ctx, labels: str = "auto", min_lift: float = 2.0, min_support: int = 5,
+                           min_expected: float = 5.0, pairs: int = 50000, max_distance: int = 1_000_000,
+                           bootstrap: int = 200):
     """Held-out test of the step-3 embeddings, no GPU needed. Samples distinct pairs of clusters in
-    DIFFERENT haploblock regions of the same chromosome, at most max_distance bp apart, each carried by
-    at least min_support test individuals and with at least min_expected co-carriers expected under
-    independence among the test individuals (so that one chance co-carrier of two rare clusters cannot
-    make a pair 'linked'). A pair is positive when its test-individual lift is >= min_lift and negative
-    when it is <= 1. Reports, per node_emb_<method>.npy in the graph folder, the ROC AUC of the
-    embeddings' cosine similarity: overall, within genomic-distance bins and within expected-co-count
-    (cluster frequency) bins, with a bootstrap CI that resamples haploblock regions (pairs sharing a
-    region are not independent). References: genomic proximity, cluster frequency (expected co-count),
-    and the lift counted on the TRAINING individuals."""
-    import glob
+    DIFFERENT haploblocks of the same chromosome, at most max_distance bp apart, each seen at least
+    min_support times in the test set and with at least min_expected co-occurrences expected under
+    independence. labels: haplotype (default when the graph has haplotypes.npz) = co-occurrence on the
+    same TEST haplotype; individual = carried by the same test individual. A pair is positive when its
+    test lift is >= min_lift and negative when it is <= 1. Per node_emb_<method>.npy: the ROC AUC of
+    the embeddings' cosine similarity, overall, within genomic-distance bins and within expected-count
+    (frequency) bins, with a bootstrap CI that resamples haploblocks; the AUC minus carrier_svd's
+    (the GNN's and XGBoost's own input features) with a paired CI; and the AUC on pairs of nodes that
+    have no edge in the graph. References: genomic proximity, cluster frequency, training lift."""
     notes = []
     leaked = ctx.split_info.get("test_individuals_in_graph_training_set") or 0
     built_on_all = str(ctx.split_info.get("graph_built_on", "")).startswith("all individuals")
     if leaked or built_on_all:
         notes.append("WARNING: the graph (and so the embeddings) was built with test individuals "
                      f"({'all individuals' if built_on_all else f'{leaked:,} of them'}): this AUC is NOT held-out")
-    nodes, C = ctx.graph.nodes, ctx.graph.carriers
-    te, tr = ctx.test_idx, ctx.train_idx
-    C_te = C[:, te].tocsr().astype(np.float32)
-    C_tr = C[:, tr].tocsr().astype(np.float32)
-    sup_te = np.asarray(C_te.sum(1)).ravel()
-    sup_tr = np.asarray(C_tr.sum(1)).ravel()
+    nodes = ctx.graph.nodes
+    hf = os.path.join(ctx.graph.dir, "haplotypes.npz")
+    labels = ("haplotype" if os.path.exists(hf) else "individual") if labels == "auto" else labels
+    if labels == "haplotype":
+        H = np.load(hf)["node"]
+
+        def unit_matrix(inds):                     # nodes x haplotypes, 0/1
+            rows = hap_rows(inds)
+            return sp.csr_matrix((np.ones(rows.size * H.shape[1], np.float32),
+                                  (H[rows].ravel(), np.repeat(np.arange(len(rows)), H.shape[1]))),
+                                 shape=(len(nodes), len(rows)))
+        C_te, C_tr = unit_matrix(ctx.test_idx), unit_matrix(ctx.train_idx)
+    else:
+        C = ctx.graph.carriers
+        C_te, C_tr = (C[:, i].tocsr().astype(np.float32) for i in (ctx.test_idx, ctx.train_idx))
+    sup_te, sup_tr = (np.asarray(m.sum(1)).ravel() for m in (C_te, C_tr))
+    n_te, n_tr = C_te.shape[1], C_tr.shape[1]
     codes = ctx.graph.region_codes
     start = nodes["start"].to_numpy(dtype=np.float64)
     chrom = nodes["chrom"].to_numpy()
@@ -1097,7 +1440,7 @@ def embedding_cooccurrence(ctx, min_lift: float = 2.0, min_support: int = 5, min
     eligible = np.where((sup_te >= min_support) & np.isfinite(start))[0]
     if len(eligible) < 2:
         return {"summary": {"status": "skipped"}, "notes": notes + [
-            f"skipped: fewer than 2 clusters with >= {min_support} test carriers"]}
+            f"skipped: fewer than 2 clusters seen >= {min_support} times in the test set"]}
     order = eligible[np.lexsort((start[eligible], chrom[eligible]))]
     key_c, key_s = chrom[order], start[order]
     s_idx, t_idx = [], []
@@ -1114,10 +1457,9 @@ def embedding_cooccurrence(ctx, min_lift: float = 2.0, min_support: int = 5, min
         s_idx.append(order[sel[i]]); t_idx.append(order[sel[j]])
     if not s_idx:
         return {"summary": {"status": "skipped"}, "notes": notes + ["skipped: no chromosome has two eligible clusters"]}
-    s_idx, t_idx = np.concatenate(s_idx), np.concatenate(t_idx)
-    pair = np.unique(np.stack([np.minimum(s_idx, t_idx), np.maximum(s_idx, t_idx)], 1), axis=0)   # distinct pairs
+    pair = np.unique(np.stack([np.minimum(np.concatenate(s_idx), np.concatenate(t_idx)),
+                               np.maximum(np.concatenate(s_idx), np.concatenate(t_idx))], 1), axis=0)
     s_idx, t_idx = pair[:, 0], pair[:, 1]
-    n_te = len(te)
     expected = sup_te[s_idx] * sup_te[t_idx] / n_te
     keep = (codes[s_idx] != codes[t_idx]) & (expected >= min_expected)
     s_idx, t_idx, expected = s_idx[keep], t_idx[keep], expected[keep]
@@ -1126,31 +1468,31 @@ def embedding_cooccurrence(ctx, min_lift: float = 2.0, min_support: int = 5, min
         shared = np.asarray(Cm[s_idx].multiply(Cm[t_idx]).sum(1)).ravel()
         return shared * n / np.maximum(sup[s_idx] * sup[t_idx], 1e-12)
 
-    lift_te, lift_tr = lift(C_te, sup_te, n_te), lift(C_tr, sup_tr, len(tr))
+    lift_te, lift_tr = lift(C_te, sup_te, n_te), lift(C_tr, sup_tr, n_tr)
     pos, neg = lift_te >= min_lift, lift_te <= 1.0
     use = pos | neg
-    s_idx, t_idx, labels = s_idx[use], t_idx[use], pos[use]
+    s_idx, t_idx, y = s_idx[use], t_idx[use], pos[use]
     expected, lift_tr = expected[use], lift_tr[use]
     dist = np.abs(start[s_idx] - start[t_idx])
-    if labels.sum() == 0 or (~labels).sum() == 0:
-        return {"summary": {"status": "skipped", "positive_pairs": int(labels.sum()),
-                            "negative_pairs": int((~labels).sum())},
+    if y.sum() == 0 or (~y).sum() == 0:
+        return {"summary": {"status": "skipped", "positive_pairs": int(y.sum()), "negative_pairs": int((~y).sum())},
                 "notes": notes + [f"skipped: need both positive (lift >= {min_lift}) and negative (lift <= 1) "
                                   "test pairs; lower min_lift, min_support or min_expected"]}
-    block = codes[s_idx]                                          # bootstrap unit: haploblock region
+    block = codes[s_idx]                                          # bootstrap unit: haploblock
+    blocks = np.unique(block)
+    members = pd.Series(np.arange(len(block))).groupby(block).apply(np.array)
+    boot = [np.concatenate(members.loc[rng.choice(blocks, len(blocks))].to_list()) for _ in range(bootstrap)]
+    A = sp.load_npz(os.path.join(ctx.graph.dir, "graph.npz"))
+    isolated = np.diff(A.tocsr().indptr) == 0
+    no_edges = isolated[s_idx] & isolated[t_idx]
 
     def evaluate(scores):
-        res = {"auc": round(auc(scores, labels), 4),
-               "auc_distance_matched": round(binned_auc(scores, labels, dist), 4),
-               "auc_frequency_matched": round(binned_auc(scores, labels, expected), 4)}
-        if bootstrap:
-            blocks = np.unique(block)
-            members = pd.Series(np.arange(len(block))).groupby(block).apply(np.array)
-            boots = []
-            for _ in range(bootstrap):
-                take = np.concatenate(members.loc[rng.choice(blocks, len(blocks))].to_list())
-                boots.append(auc(scores[take], labels[take]))
-            lo_, hi_ = np.nanpercentile(boots, [2.5, 97.5])
+        res = {"auc": round(auc(scores, y), 4),
+               "auc_distance_matched": round(binned_auc(scores, y, dist), 4),
+               "auc_frequency_matched": round(binned_auc(scores, y, expected), 4),
+               "auc_no_graph_edges": round(auc(scores[no_edges], y[no_edges]), 4)}
+        if boot:
+            lo_, hi_ = np.nanpercentile([auc(scores[t], y[t]) for t in boot], [2.5, 97.5])
             res["auc_95ci"] = (round(float(lo_), 4), round(float(hi_), 4))
         return res
 
@@ -1160,7 +1502,7 @@ def embedding_cooccurrence(ctx, min_lift: float = 2.0, min_support: int = 5, min
     files = sorted(glob.glob(os.path.join(ctx.graph.dir, "node_emb_*.npy")))
     gi = os.path.join(ctx.graph.dir, "graph_info.json")
     graph_sid = json.load(open(gi)).get("train_set_id", "all") if os.path.exists(gi) else "all"
-    leaked_methods = []
+    leaked_methods, cos = [], {}
     if not files:
         notes.append("no node_emb_<method>.npy in the graph folder (run 3_node_embeddings.py): references only")
     for f in files:
@@ -1177,24 +1519,325 @@ def embedding_cooccurrence(ctx, min_lift: float = 2.0, min_support: int = 5, min
             notes.append(f"WARNING: node_emb_{name} was made from training set {emb_sid}, not the graph's "
                          f"({graph_sid}): its AUC is NOT held-out")
         Zn = Z / np.maximum(np.linalg.norm(Z, axis=1, keepdims=True), 1e-12)
-        rows.append({"name": name, "kind": "embedding", **evaluate((Zn[s_idx] * Zn[t_idx]).sum(1))})
+        cos[name] = (Zn[s_idx] * Zn[t_idx]).sum(1)
+        rows.append({"name": name, "kind": "embedding", **evaluate(cos[name])})
+    if "carrier_svd" in cos:
+        ref = cos["carrier_svd"]
+        for r in rows:
+            if r["kind"] == "embedding" and r["name"] != "carrier_svd":
+                d = [auc(cos[r["name"]][t], y[t]) - auc(ref[t], y[t]) for t in boot]
+                r["auc_minus_carrier_svd"] = round(r["auc"] - auc(ref, y), 4)
+                if d:
+                    lo_, hi_ = np.nanpercentile(d, [2.5, 97.5])
+                    r["auc_minus_carrier_svd_95ci"] = (round(float(lo_), 4), round(float(hi_), 4))
 
     path = ctx.out("embedding_cooccurrence.csv")
     pd.DataFrame(rows).to_csv(path, index=False)
-    s = {"pairs": int(len(labels)), "positive_pairs": int(labels.sum()), "negative_pairs": int((~labels).sum()),
-         "eligible_clusters": int(len(eligible)), "regions_in_pairs": int(len(np.unique(block))),
-         "median_distance_bp": int(np.median(dist)), "held_out": "no" if (leaked or built_on_all or leaked_methods) else "yes"}
+    s = {"labels": labels, "pairs": int(len(y)), "positive_pairs": int(y.sum()), "negative_pairs": int((~y).sum()),
+         "pairs_without_graph_edges": int(no_edges.sum()), "eligible_clusters": int(len(eligible)),
+         "regions_in_pairs": int(len(blocks)), "median_distance_bp": int(np.median(dist)),
+         "held_out": "no" if (leaked or built_on_all or leaked_methods) else "yes"}
     for r in rows:
-        for k in ("auc", "auc_distance_matched", "auc_frequency_matched", "auc_95ci"):
+        for k in ("auc", "auc_distance_matched", "auc_frequency_matched", "auc_no_graph_edges", "auc_95ci",
+                  "auc_minus_carrier_svd", "auc_minus_carrier_svd_95ci"):
             if k in r:
                 s[f"{k}_{r['name']}"] = r[k]
-    notes += ["AUC 0.5 = no information about which clusters are co-inherited in individuals never seen; "
-              "distance- and frequency-matched AUCs compare pairs of similar genomic distance / expected "
-              "co-count only, so a score that merely encodes position or cluster frequency cannot do well",
-              "references: genomic_proximity (position only), cluster_frequency (expected co-count only), "
-              "train_lift (the linkage table of the training individuals)",
-              "the 95% CI resamples haploblock regions, since pairs sharing a region are not independent"]
+    notes += ["AUC 0.5 = no information about which clusters co-occur in individuals never seen; distance- and "
+              "frequency-matched AUCs compare pairs of similar genomic distance / expected co-count only",
+              "auc_minus_carrier_svd: a graph method is useful only if it beats its own input features",
+              "references: genomic_proximity, cluster_frequency (expected co-count), train_lift (the training "
+              "individuals' linkage table); the 95% CI resamples haploblocks"]
     return {"summary": s, "notes": notes, "files": [path]}
+
+
+# ---- phenotypes, GWAS and recombination through the model ------------------
+
+GENETIC_MAP_URL = "https://bochet.gcc.biostat.washington.edu/beagle/genetic_maps/plink.GRCh38.map.zip"
+
+
+def ridge_fit_predict(Xtr, ytr, Xte, lambdas=np.logspace(-2, 4, 13)):
+    """Ridge regression in its kernel form (n << features), lambda by generalized cross-validation.
+    Returns (test predictions, feature weights)."""
+    K = (Xtr @ Xtr.T).toarray() if sp.issparse(Xtr) else Xtr @ Xtr.T
+    w, U = np.linalg.eigh(K)
+    w = np.maximum(w, 0)
+    yc = ytr - ytr.mean()
+    Uy = U.T @ yc
+    best = None
+    for lam in lambdas * max(w.mean(), 1e-12):
+        shrink = w / (w + lam)
+        resid = yc - U @ (shrink * Uy)
+        gcv = np.mean(resid ** 2) / (1 - shrink.sum() / len(yc)) ** 2
+        if best is None or gcv < best[0]:
+            best = (gcv, lam)
+    alpha = U @ (Uy / (w + best[1]))
+    beta = np.asarray(Xtr.T @ alpha).ravel()
+    return np.asarray(Xte @ beta).ravel() + ytr.mean(), beta
+
+
+def r2(pred, y):
+    return float(1 - np.sum((pred - y) ** 2) / max(np.sum((y - y.mean()) ** 2), 1e-12))
+
+
+@task("phenotype_prediction", "Predict a (simulated) phenotype of the test individuals: 4b model vs ridge on "
+                              "cluster dosages, and recovery of the causal haploblocks")
+def phenotype_prediction(ctx, model: str = "", phenotypes: str = "", bootstrap: int = 1000, device: str = "",
+                         ckpt_dir: str = ""):
+    """model = a 4b checkpoint with token input (default: the first --model); phenotypes = folder with
+    <trait>_train.tsv / _test.tsv / _answer.json (default <graph-dir>/phenotypes, written by 4b
+    --simulate). Test R^2 of the model and of ridge regression on cluster dosages (0-2 copies of each
+    step-4a token; lambda by generalized cross-validation), with paired 95% CIs over test
+    individuals. With an answer key: the haploblocks each method ranks first (as many as are causal)
+    against the causal ones, as precision / recall (ridge: sum of |weights| of a haploblock's tokens;
+    model: mean attention of the chromosome pooling on the haploblock's tokens)."""
+    import torch
+    from evo2_model import load_phenotype_model
+    m = ctx.model if not model else Model(model)
+    meta = m.meta
+    if meta.get("mode") != "phenotype" or meta.get("input") != "tokens":
+        raise ValueError(f"{m.path} is {model_kind(meta)}; phenotype_prediction needs a 4b model with token input")
+    trait = meta["trait"]
+    folder = phenotypes or os.path.join(ctx.graph.dir, "phenotypes")
+    read = lambda part: pd.read_csv(os.path.join(folder, f"{trait}_{part}.tsv"), sep="\t", dtype={"individual": str})
+    train, test = read("train"), read("test")
+    pos = {x: i for i, x in enumerate(ctx.graph.individuals)}
+    tr_i, te_i = (np.array([pos[x] for x in d["individual"] if x in pos]) for d in (train, test))
+    y_tr, y_te = (d.set_index("individual").iloc[:, 0].reindex([ctx.graph.individuals[i] for i in idx]).to_numpy(float)
+                  for d, idx in ((train, tr_i), (test, te_i)))
+    pm, data = load_phenotype_model(meta, ctx.graph.dir, device or None, ckpt_dir or None)
+    preds, attn = [], {}
+    with torch.no_grad():
+        for i in te_i:
+            v, a = pm.encode(int(i))
+            preds.append(float(pm.head(v)[0]) * meta["target_std"] + meta["target_mean"])
+            for toks, w in a.values():
+                for b, wt in zip(data.region_code[toks], w):
+                    attn[b] = attn.get(b, 0.0) + wt / len(te_i)
+    p_model = np.array(preds)
+
+    # ridge on token dosages: individual x token
+    cols = np.concatenate([data.block_cols[c] for c in data.chroms])
+    tok = data.canon[data.H[:, cols]]
+    vocab, inv = np.unique(tok, return_inverse=True)
+    inv = inv.reshape(tok.shape)
+    X = sp.csr_matrix((np.ones(inv.size), (np.repeat(np.arange(len(tok)) // 2, inv.shape[1]), inv.ravel())),
+                      shape=(len(ctx.graph.individuals), len(vocab)))
+    p_ridge, beta = ridge_fit_predict(X[tr_i], y_tr, X[te_i])
+    idx = ctx.rng.integers(0, len(te_i), (bootstrap, len(te_i))) if bootstrap else None
+    boot = lambda f: tuple(round(float(v), 4) for v in np.percentile([f(t) for t in idx], [2.5, 97.5])) if idx is not None else None
+    s = {"trait": trait, "train_individuals": len(tr_i), "test_individuals": len(te_i),
+         "model_r2": round(r2(p_model, y_te), 4), "model_r2_95ci": boot(lambda t: r2(p_model[t], y_te[t])),
+         "ridge_r2": round(r2(p_ridge, y_te), 4), "ridge_r2_95ci": boot(lambda t: r2(p_ridge[t], y_te[t])),
+         "model_minus_ridge_r2_95ci": boot(lambda t: r2(p_model[t], y_te[t]) - r2(p_ridge[t], y_te[t]))}
+    s["model_beats_ridge"] = verdict(s["model_minus_ridge_r2_95ci"])
+    notes = []
+    ans = os.path.join(folder, f"{trait}_answer.json")
+    if os.path.exists(ans):
+        key = json.load(open(ans))
+        causal = {b for c in key["causal"] for b in c["haploblocks"]}
+        s["causal_haploblocks"] = len(causal)
+        if causal:
+            k = len(causal)
+            ridge_imp = pd.Series(np.abs(beta)).groupby(data.region_code[vocab]).sum()
+            for name, imp in (("ridge", ridge_imp), ("model", pd.Series(attn))):
+                top = {data.regions[b] for b in imp.sort_values(ascending=False).index[:k]}
+                s[f"{name}_causal_recall"] = round(len(top & causal) / k, 4)
+        if key["trait"] == "cis":
+            notes.append("cis trait: the effect needs two clusters on the SAME haplotype, which an additive model of "
+                         "dosages cannot represent exactly; this is where a haplotype model should beat ridge")
+        if key["trait"] == "null":
+            notes.append("null trait: both R^2 should be ~0 (CI including 0)")
+    notes.append("causal recall = share of the causal haploblocks among the haploblocks a method ranks first "
+                 "(as many as are causal)")
+    return {"summary": s, "notes": notes}
+
+
+def gwas_hit_blocks(ctx, gwas, pvalue, clump):
+    """Haploblocks (indices into ctx.graph.regions) containing a clumped GWAS locus, and the loci."""
+    snps, _, _ = read_gwas(gwas)
+    reg = ctx.graph.regions
+    snps = snps[snps["chrom"].isin(set(reg["chrom"])) & (snps["p"] < pvalue)].reset_index(drop=True)
+    if not len(snps):
+        raise ValueError(f"no GWAS hits (p < {pvalue}) on the graph's chromosomes")
+    c, p_, pv = snps["chrom"].to_numpy(), snps["pos"].to_numpy(), snps["p"].to_numpy()
+    lead = clump_hits(c, p_, pv, np.ones(len(snps), bool), 25_000 if clump == "auto" else int(clump))
+    loci = lead == np.arange(len(snps))
+    si, ri = region_pairs(reg["chrom"].to_numpy(), reg["start"].to_numpy(np.int64), reg["end"].to_numpy(np.int64),
+                          c[loci], p_[loci])
+    return np.unique(ri), c[loci], p_[loci]
+
+
+def block_scores(ctx, model, data, max_examples):
+    """Per haploblock (index into ctx.graph.regions): mean surprisal (-log p) of the model's
+    predictions of that haploblock on test haplotypes, mean entropy of those predictions, and the
+    dispersion of the haploblock's cluster embeddings (1 - mean cosine to their frequency-weighted mean)."""
+    reg_index = pd.Index(ctx.graph.regions["region"])
+    sums = {}
+    for chrom, ex in sample_examples(data, ctx.test_idx, max_examples, ctx.rng):
+        sc = model.score(chrom, ex)
+        for b, lp, en in zip(reg_index.get_indexer(data.regions[data.region_code[sc["target"]]]), sc["logp"], sc["entropy"]):
+            v = sums.setdefault(b, [0.0, 0.0, 0])
+            v[0] -= lp; v[1] += en; v[2] += 1
+    n = len(reg_index)
+    surprisal, entropy = np.full(n, np.nan), np.full(n, np.nan)
+    for b, (a, e, k) in sums.items():
+        surprisal[b], entropy[b] = a / k, e / k
+    Zn = data.Z / np.maximum(np.linalg.norm(data.Z, axis=1, keepdims=True), 1e-12)
+    w = np.maximum(data.support, 1e-9)
+    code = reg_index.get_indexer(data.regions[data.region_code])
+    mean = np.zeros((n, Zn.shape[1])); np.add.at(mean, code, Zn * w[:, None])
+    mean /= np.maximum(np.linalg.norm(mean, axis=1, keepdims=True), 1e-12)
+    cos = (Zn * mean[code]).sum(1)
+    disp = np.bincount(code, weights=(1 - cos) * w, minlength=n) / np.maximum(np.bincount(code, weights=w, minlength=n), 1e-12)
+    return {"surprisal": surprisal, "entropy": entropy, "embedding_dispersion": disp}
+
+
+@task("model_gwas", "Do the model's per-haploblock scores differ at GWAS-hit haploblocks from matched background?")
+def model_gwas(ctx, gwas: str, pvalue: float = 5e-8, clump: str = "auto", matched: int = 10, permutations: int = 200,
+               max_examples: int = 500, bootstrap: int = 500, model: str = "", device: str = "", ckpt_dir: str = ""):
+    """Scores per haploblock (block_scores) of a 4a model at haploblocks holding a clumped GWAS locus
+    vs `matched` background haploblocks each (same chromosome, nearest in log length, log number of
+    clusters and cluster entropy; no hit): mean difference with a CI resampling hit haploblocks. Null
+    p-values for the mean score at hit haploblocks: loci moved to random places on their chromosome,
+    and all loci rotated along the chromosome with their spacing kept (as in gwas_enrichment)."""
+    if not os.path.exists(gwas):
+        raise ValueError(f"GWAS file {gwas} not found (5_download_gwas.py writes haplograph/gwas/<label>.tsv)")
+    qm, data, meta = query_model(ctx, model or None, device, ckpt_dir)
+    hits, lc, lp = gwas_hit_blocks(ctx, gwas, pvalue, clump)
+    scores = block_scores(ctx, qm, data, max_examples)
+    reg = ctx.graph.regions
+    codes = ctx.graph.region_codes
+    sup = ctx.graph.carriers.sum(1).A.ravel().astype(float)
+    tot = np.bincount(codes, weights=sup, minlength=len(reg))
+    f = sup / np.maximum(tot[codes], 1)
+    ent = np.bincount(codes, weights=-f * np.log(np.maximum(f, 1e-12)), minlength=len(reg))
+    feats = np.column_stack([np.log(np.maximum(reg["end"] - reg["start"], 1)), np.log(reg["n_clusters_total"]), ent])
+    feats = (feats - feats.mean(0)) / (feats.std(0) + 1e-9)
+    is_hit = np.zeros(len(reg), bool); is_hit[hits] = True
+    match = {}
+    for b in hits:
+        cand = np.where((reg["chrom"].to_numpy() == reg["chrom"].iloc[b]) & ~is_hit)[0]
+        match[b] = cand[np.argsort(((feats[cand] - feats[b]) ** 2).sum(1))[:matched]]
+    starts, ends = reg["start"].to_numpy(np.int64), reg["end"].to_numpy(np.int64)
+    span = reg.groupby("chrom").agg(lo=("start", "min"), hi=("end", "max"))
+    lo, hi = span.loc[lc, "lo"].to_numpy(), span.loc[lc, "hi"].to_numpy()
+    L = hi - lo + 1
+    rng, chroms = ctx.rng, pd.factorize(lc)
+
+    def blocks_at(pos_):
+        return np.unique(region_pairs(reg["chrom"].to_numpy(), starts, ends, lc, pos_)[1])
+    nulls = {"random_loci": [], "rotation": []}
+    for _ in range(permutations):
+        nulls["random_loci"].append(blocks_at(lo + (rng.random(len(lc)) * L).astype(np.int64)))
+        nulls["rotation"].append(blocks_at(lo + (lp - lo + (rng.random(len(chroms[1]))[chroms[0]] * L).astype(np.int64)) % L))
+    s, rows = {"hit_haploblocks": int(len(hits)), "loci": int(len(lc)), "backbone": meta["backend"]}, []
+    for name, v in scores.items():
+        ok = [b for b in hits if np.isfinite(v[b]) and np.isfinite(v[match[b]]).any()]
+        if not ok:
+            continue
+        diff = np.array([v[b] - np.nanmean(v[match[b]]) for b in ok])
+        obs = float(np.nanmean(v[ok]))
+        row = {"score": name, "hit_mean": round(obs, 4),
+               "matched_mean": round(float(np.nanmean([np.nanmean(v[match[b]]) for b in ok])), 4),
+               "difference": round(float(diff.mean()), 4)}
+        if bootstrap:
+            bt = [diff[rng.integers(0, len(diff), len(diff))].mean() for _ in range(bootstrap)]
+            row["difference_95ci"] = tuple(round(float(x), 4) for x in np.percentile(bt, [2.5, 97.5]))
+        for kind, draws in nulls.items():
+            null = np.array([np.nanmean(v[d]) for d in draws if np.isfinite(v[d]).any()])
+            if len(null):
+                row[f"p_{kind}"] = round(float((1 + (np.abs(null - null.mean()) >= abs(obs - null.mean())).sum())
+                                               / (1 + len(null))), 4)
+        rows.append(row)
+        for k, x in row.items():
+            if k != "score":
+                s[f"{name}_{k}"] = x
+    path = ctx.out("model_gwas.csv")
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return {"summary": s, "notes": [
+        "surprisal / entropy: the model's next-token (or masked-token) predictions of the haploblock on test "
+        "haplotypes; embedding_dispersion: how different the haploblock's cluster embeddings are",
+        "p-values are two-sided; 'rotation' keeps the spacing of the loci, so it also keeps true clustering of "
+        "GWAS signals (see gwas_enrichment)"], "files": [path]}
+
+
+def read_genetic_map(src, chroms, cache):
+    """PLINK .map files (chrom, id, cM, bp) for `chroms`, from a zip (Beagle's GRCh38 maps) or a folder."""
+    import io
+    import zipfile
+    path = download(src, url_cache_path(src, cache)) if is_url(src) else src
+    out = {}
+    names = (lambda: zipfile.ZipFile(path).namelist()) if path.endswith(".zip") else (lambda: os.listdir(path))
+    for c in chroms:
+        hit = [n for n in names() if re.search(rf"(^|[/.]){c}\.GRCh38\.map$|plink\.{c}\.|plink\.chr{c}\.", n)]
+        if not hit:
+            continue
+        raw = zipfile.ZipFile(path).read(hit[0]) if path.endswith(".zip") else open(os.path.join(path, hit[0]), "rb").read()
+        m = pd.read_csv(io.BytesIO(raw), sep=r"\s+", header=None, usecols=[2, 3], names=["cM", "bp"])
+        out[c] = m.sort_values("bp")
+    return out
+
+
+def spearman_ci(x, y, n_boot, rng, chunk=25):
+    ok = np.isfinite(x) & np.isfinite(y)
+    x, y = x[ok], y[ok]
+    rho, p = stats.spearmanr(x, y)
+    groups = np.arange(len(x)) // min(chunk, max(1, len(x) // 10))   # neighbouring boundaries are correlated
+    boot = []
+    for _ in range(n_boot):
+        take = np.concatenate([np.where(groups == g)[0] for g in rng.choice(groups.max() + 1, groups.max() + 1)])
+        boot.append(stats.spearmanr(x[take], y[take])[0])
+    return round(float(rho), 4), float(p), tuple(round(float(v), 4) for v in np.nanpercentile(boot, [2.5, 97.5])), len(x)
+
+
+@task("junction_strength", "Is the next haploblock less predictable where recombination is frequent?")
+def junction_strength(ctx, genetic_map: str = GENETIC_MAP_URL, max_examples: int = 500, bootstrap: int = 200,
+                      model: str = "", device: str = "", ckpt_dir: str = ""):
+    """Recombination rate (cM/Mb) between the midpoints of adjacent haploblocks, from a GRCh38 genetic
+    map (default: Beagle's PLINK maps), against (1) the conditional entropy H(next | current) of the
+    training haplotypes' transitions (junctions.npz) and (2) the mean entropy of a next-token 4a
+    model's predictions of the next haploblock on test haplotypes. Spearman rho with a CI resampling
+    chunks of 25 neighbouring boundaries (rates and entropies are autocorrelated along a chromosome)."""
+    jf = os.path.join(ctx.graph.dir, "junctions.npz")
+    if not os.path.exists(jf):
+        raise ValueError("junction_strength needs junctions.npz (step 1 --haplotypes, then step 2)")
+    reg = ctx.graph.regions
+    gmap = read_genetic_map(genetic_map, list(pd.unique(reg["chrom"])), os.path.join(ctx.out_dir, "inputs"))
+    if not gmap:
+        raise ValueError(f"no chromosome of the graph found in the genetic map {genetic_map}")
+    h = np.load(os.path.join(ctx.graph.dir, "haplotypes.npz"))
+    blocks = h["blocks"]
+    reg_i = pd.Index(reg["region"]).get_indexer(blocks)
+    mid = ((reg["start"] + reg["end"]) / 2).to_numpy()[reg_i]
+    chrom = h["block_chrom"]
+    rate = np.full(len(blocks) - 1, np.nan)
+    for k in range(len(blocks) - 1):
+        if chrom[k] == chrom[k + 1] and chrom[k] in gmap:
+            m = gmap[chrom[k]]
+            cm = np.interp([mid[k], mid[k + 1]], m["bp"], m["cM"])
+            rate[k] = (cm[1] - cm[0]) / max((mid[k + 1] - mid[k]) / 1e6, 1e-9)
+    j = np.load(jf)
+    df = pd.DataFrame({"k": j["block"], "a": j["a"], "n": j["count"]})
+    row_tot = df.groupby(["k", "a"])["n"].transform("sum")
+    df["h"] = -df["n"] * np.log(df["n"] / row_tot)
+    data_h = np.full(len(blocks) - 1, np.nan)
+    agg = df.groupby("k")[["h", "n"]].sum()
+    data_h[agg.index] = agg["h"] / agg["n"]
+    s = {"boundaries_with_rate": int(np.isfinite(rate).sum()), "median_rate_cM_per_Mb": round(float(np.nanmedian(rate)), 3)}
+    rho, p, ci, n = spearman_ci(rate, data_h, bootstrap, ctx.rng)
+    s.update(data_entropy_rho=rho, data_entropy_p=p, data_entropy_rho_95ci=ci, boundaries=n)
+    try:
+        qm, data, meta = query_model(ctx, model or None, device, ckpt_dir)
+    except ValueError:
+        qm = None
+    if qm is not None and meta["objective"] == "next":
+        ent = block_scores(ctx, qm, data, max_examples)["entropy"]
+        model_h = ent[reg_i][1:]                     # prediction of block k+1 = boundary k
+        rho, p, ci, n = spearman_ci(rate, model_h, bootstrap, ctx.rng)
+        s.update(model_entropy_rho=rho, model_entropy_p=p, model_entropy_rho_95ci=ci)
+    return {"summary": s, "notes": ["positive rho: the next haploblock is harder to predict where recombination "
+                                    "between the two is more frequent, as expected if the data (and the model) "
+                                    "track linkage"]}
 
 
 # ---- Nemotron summary ------------------------------------------------------
@@ -1265,7 +1908,7 @@ def nemotron_summary(args, results, out_path, names=()):
 
 
 def check_self_test(summaries, hotspot):
-    """Properties the synthetic self-test must satisfy (see IMPROVEMENT_PLAN.md, testing steps)."""
+    """Properties the synthetic self-test must satisfy."""
     problems = []
 
     def ci_ok(value, ci, what):
@@ -1274,17 +1917,31 @@ def check_self_test(summaries, hotspot):
 
     t = summaries["test_set_performance"]
     ci_ok(t["test_top1_accuracy"], t["test_top1_95ci"], "test top-1")
-    ci_ok(t["bigram_baseline_top1_accuracy"], t["bigram_baseline_top1_95ci"], "bigram top-1")
-    ci_ok(t["model_minus_bigram_top1"], t["model_minus_bigram_95ci"], "model - bigram")
-    if t["test_region_conditioned_top1"] + 1e-9 < t["test_top1_accuracy"]:
-        problems.append("region-conditioned top-1 is below unconditioned top-1")
+    for n in ("frequency", "bigram", "trigram", "hmm"):
+        ci_ok(t[f"model_minus_{n}_top1"], t[f"model_minus_{n}_top1_95ci"], f"model - {n}")
+    if t["test_top1_accuracy"] <= t["frequency_top1_accuracy"] - 0.15:
+        problems.append("the small model is far below the frequency baseline: the learning setup is broken")
+    h = summaries["head_ceiling"]
+    if not 0 <= h["ce_floor_current_scale"] < 10:
+        problems.append(f"head_ceiling floor {h['ce_floor_current_scale']} out of range")
+    m = summaries["masked_imputation"]
+    if m["model_scored"] != "yes" or not 0 <= m["span1_model_concordance"] <= 1:
+        problems.append("masked_imputation did not score the masked model")
+    ph = summaries["phenotype_prediction"]
+    if not (np.isfinite(ph["ridge_r2"]) and ph["causal_haploblocks"] >= 1 and "ridge_causal_recall" in ph):
+        problems.append("phenotype_prediction did not score ridge and causal recovery")
+    if not any(k.startswith("surprisal_") for k in summaries["model_gwas"]):
+        problems.append("model_gwas did not score surprisal at the hit haploblocks")
+    if "data_entropy_rho" not in summaries["junction_strength"]:
+        problems.append("junction_strength did not correlate entropy with the recombination rate")
+    c = summaries["model_comparison"]
+    if c["models"] != 2 or not any(k.endswith("_top1") and "_minus_" in k for k in c):
+        problems.append("model_comparison did not compare the two next-token models")
     e = summaries["embedding_cooccurrence"]
     if e.get("status") == "skipped":
         problems.append("embedding_cooccurrence was skipped on the synthetic data")
     else:
-        if not 0.3 <= e["auc_genomic_proximity"] <= 0.7:   # the synthetic data has no positional linkage
-            problems.append(f"genomic proximity AUC {e['auc_genomic_proximity']} should be near 0.5")
-        if e["auc_train_lift"] <= 0.55:                    # planted group structure replicates in test
+        if e["auc_train_lift"] <= 0.55:                    # planted linkage replicates in test
             problems.append(f"train-lift AUC {e['auc_train_lift']} should be clearly above 0.5")
         if e["auc_gnn"] <= 0.5:
             problems.append(f"GNN AUC {e['auc_gnn']} should be above 0.5")
@@ -1306,15 +1963,38 @@ def check_self_test(summaries, hotspot):
 
 
 def self_test(args):
-    """Synthetic data -> step 4 --test (mock backbone) -> validate it with every data-level task."""
-    importlib.import_module("4a_finetune_evo2_embeddings").main(["--test"])
+    """Synthetic data -> step 4a --test (small backbone, next-token) plus a masked-objective and a frozen
+    model -> every task."""
+    step4 = importlib.import_module("4a_finetune_evo2_embeddings")
+    step4.main(["--test"])
     args.graph_dir = selftest_graph_dir()
+    small = ["--graph-dir", args.graph_dir, "--method", "gnn", "--backbone", "small", "--small-hidden", "32",
+             "--small-layers", "2", "--device", "cpu", "--batch", "4", "--epochs", "2", "--max-len", "64",
+             "--log-every", "1000", "--eval-every", "10000"]
+    step4.main(small + ["--objective", "masked"])
+    step4.main(small + ["--train-blocks", "0", "--out", os.path.join(args.graph_dir, "small_frozen_next_gnn.pt")])
     gwas, args.hotspot = planted_gwas(args.graph_dir, test_workdir("validate_gwas"))
-    args.model = os.path.join(args.graph_dir, "evo2_mock_next_gnn.pt")
+    importlib.import_module("4b_finetune_evo2_phenotype").main(small + [
+        "--simulate", "cis", "--causal-blocks", "3", "--h2", "0.8"])
+    gmap = test_workdir("validate_map") / "map"
+    gmap.mkdir()
+    for c in ("chr21", "chr22"):                      # 1 cM per 100 kb, faster between 1.2 and 1.3 Mb
+        bp = np.arange(0, 4_000_000, 10_000)
+        (gmap / f"plink.{c}.GRCh38.map").write_text("".join(
+            f"{c} . {x / 1e5 + 5 * np.clip((x - 1_200_000) / 1e5, 0, 1):.4f} {x}\n" for x in bp))
+    args.model = [os.path.join(args.graph_dir, f) for f in ("small_next_gnn.pt", "small_frozen_next_gnn.pt")]
+    masked = os.path.join(args.graph_dir, "small_masked_gnn.pt")
+    pheno = os.path.join(args.graph_dir, "small_pheno_cis_gnn.pt")
     args.splits, args.tasks, args.gwas, args.out_dir = GRAPH_SPLIT, None, [], None
-    args.task = ["model_info", "test_set_performance max_examples=40 train_examples=20 bootstrap=200 device=cpu",
+    args.task = ["model_info", "test_set_performance max_examples=60 train_examples=20 bootstrap=200 device=cpu",
+                 "head_ceiling device=cpu",
+                 f"masked_imputation model={shlex.quote(masked)} spans=1,2 per_haplotype=2 bootstrap=100 device=cpu",
+                 "model_comparison bootstrap=100 device=cpu",
                  "embedding_cooccurrence min_lift=1.5 min_support=3 min_expected=1 pairs=5000 bootstrap=50",
                  "cluster_consistency permutations=20",
+                 f"phenotype_prediction model={shlex.quote(pheno)} bootstrap=100 device=cpu",
+                 f"model_gwas gwas={shlex.quote(gwas)} clump=500 permutations=50 bootstrap=50 device=cpu",
+                 f"junction_strength genetic_map={shlex.quote(str(gmap))} bootstrap=50 device=cpu",
                  f"gwas_enrichment gwas={shlex.quote(gwas)} clump=500 label=independent permutations=200",
                  f"gwas_enrichment gwas={shlex.quote(gwas)} label=clumped permutations=200"]
 
@@ -1372,7 +2052,9 @@ def list_tasks():
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", help="fine-tuned model file from step 4 (.pt)")
+    ap.add_argument("--model", action="append", default=[],
+                    help="fine-tuned model file from step 4 (.pt); repeat it to compare models (model_comparison); "
+                         "the other tasks use the first")
     ap.add_argument("--graph-dir", default="haplograph/genome_train_half_A", help="output folder of 2_build_graph.py")
     sg = ap.add_argument_group("train / test split")
     sg.add_argument("--splits", default=GRAPH_SPLIT,
@@ -1399,7 +2081,7 @@ def main(argv=None):
     ng.add_argument("--nemotron-url", default="https://integrate.api.nvidia.com/v1",
                     help="OpenAI-compatible endpoint (build.nvidia.com or a self-hosted NIM)")
     ap.add_argument("--test", action="store_true",
-                    help="self-test: synthetic data, a mock-backbone model from step 4 --test, all tasks (CPU)")
+                    help="self-test: synthetic data, small-backbone models from step 4a --test, every task (CPU)")
     args = ap.parse_args(argv)
     if args.test:
         self_test(args)
@@ -1411,11 +2093,12 @@ def main(argv=None):
         return
     if not args.model:
         ap.error("--model is required")
-    if not os.path.exists(args.model):
-        raise SystemExit(f"error: model file {args.model} not found - run 4a_finetune_evo2_embeddings.py "
-                         "(or 4b_finetune_evo2_hash.py) first")
+    for f in args.model:
+        if not os.path.exists(f):
+            raise SystemExit(f"error: model file {f} not found - run 4a_finetune_evo2_embeddings.py "
+                             "(or 4b_finetune_evo2_hash.py) first")
 
-    model = Model(args.model)                     # loaded once, on first use, shared with the tasks
+    model = Model(args.model[0])                  # loaded once, on first use, shared with the tasks
     try:
         specs = read_tasks_file(args.tasks) if args.tasks else []
         specs += [parse_task_line(t, "--task") for t in args.task]
@@ -1424,7 +2107,10 @@ def main(argv=None):
     if not specs:
         specs = [("model_info", {})]
         if model.kind.startswith("4a"):
-            specs.append(("test_set_performance", {}))
+            next_model = model.meta.get("objective") == "next"
+            specs += [("test_set_performance" if next_model else "masked_imputation", {}), ("head_ceiling", {})]
+            if len(args.model) > 1:
+                specs.append(("model_comparison", {}))
         if glob.glob(os.path.join(args.graph_dir, "node_emb_*.npy")):
             specs.append(("embedding_cooccurrence", {}))
         specs.append(("cluster_consistency", {}))
@@ -1438,7 +2124,7 @@ def main(argv=None):
         except ValueError as e:
             raise SystemExit(str(e))
 
-    stem = re.sub(r"\.pt$", "", os.path.basename(args.model))
+    stem = re.sub(r"\.pt$", "", os.path.basename(args.model[0]))
     args.out_dir = args.out_dir or os.path.join(args.graph_dir, f"validation_{stem}")
     os.makedirs(args.out_dir, exist_ok=True)
     ctx = Context(args, model)
@@ -1471,7 +2157,7 @@ def main(argv=None):
         results.append(rec)
 
     with open(os.path.join(args.out_dir, "summary.json"), "w") as f:
-        json.dump({"model": args.model, "graph_dir": args.graph_dir,
+        json.dump({"model": args.model[0], "models": args.model, "graph_dir": args.graph_dir,
                    "split": ctx.split_info,
                    "tasks": results}, f, indent=2, default=lambda o: o.item() if hasattr(o, "item") else str(o))
     write_report(ctx, results, os.path.join(args.out_dir, "report.md"))

@@ -33,7 +33,7 @@ def test_evo2_refuses_non_linux_with_a_hint(monkeypatch, capsys):
     monkeypatch.setattr(setup.platform, "system", lambda: "Darwin")
     with pytest.raises(SystemExit):
         setup.main(["--evo2", "--dry-run"])
-    assert "--mock-evo2" in capsys.readouterr().err
+    assert "--backbone small" in capsys.readouterr().err
 
 
 def fake_linux_gpu(monkeypatch, cap="12.0", cuda="12.8"):
