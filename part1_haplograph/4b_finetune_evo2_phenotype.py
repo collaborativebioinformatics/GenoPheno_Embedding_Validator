@@ -47,7 +47,8 @@ import re
 import numpy as np
 import pandas as pd
 
-from evo2_model import GenomeData, PhenotypeModel, add_backbone_args, backbone_state, config_of, fit, make_runner
+from evo2_model import (GenomeData, PhenotypeModel, add_backbone_args, backbone_fingerprint, backbone_state, config_of,
+                        fit, make_runner)
 from haplo_common import (METHODS, check_args, die, graph_id, log, parse_chroms, read_graph_individuals,
                           read_individual_list, require_files, selftest_graph_dir, test_workdir)
 
@@ -171,14 +172,28 @@ def train(args):
     data = GenomeData(args.graph_dir, args.method, args.chroms, args.min_support, [examples[j] for j in tr],
                       args.pos_freqs, "haplotype") if tokens else None
     rnr = make_runner(args, args.train_blocks)
+    fingerprint = backbone_fingerprint(rnr.net)
     n_out = 1 if task == "regression" else len(classes)
     model = PhenotypeModel(rnr, n_out, data, args.hash_bits, args.max_len)
     if args.init_from:
-        import torch as T
-        meta = T.load(args.init_from, map_location="cpu", weights_only=True)
-        if meta.get("mode") != "embeddings" or meta.get("graph_method") != args.method or meta.get("backend") != rnr.backend:
-            die(f"--init-from {args.init_from} is not a step-4a model on the same embeddings and backbone")
-        with T.no_grad():
+        meta = torch.load(args.init_from, map_location="cpu", weights_only=True)
+        if meta.get("mode") != "embeddings" or meta.get("backend") != rnr.backend:
+            die(f"--init-from {args.init_from} is not a step-4a model with the {rnr.backend} backbone")
+        if not tokens:
+            die("--init-from needs --input tokens")
+        cfg = meta["config"]
+        checks = [("embeddings", meta["embeddings_sha1"], data.emb_sha1), ("init", meta["init"], args.init),
+                  ("pos_freqs", cfg["pos_freqs"], args.pos_freqs), ("min_support", cfg["min_support"], args.min_support)]
+        if rnr.backend == "small":                     # the whole small backbone comes from the checkpoint
+            checks.append(("small backbone size", (cfg["small_hidden"], cfg["small_layers"]),
+                           (args.small_hidden, args.small_layers)))
+        else:
+            checks.append(("base model", meta["backbone_fingerprint"], fingerprint))
+        differ = {k: (a, b) for k, a, b in checks if a != b}
+        if differ:
+            die(f"--init-from {args.init_from} does not match this run: "
+                + ", ".join(f"{k} {a} there, {b} here" for k, (a, b) in differ.items()))
+        with torch.no_grad():
             rnr.net.load_state_dict({k: v.to(rnr.dev) for k, v in meta["trained_blocks"].items()}, strict=False)
         model.proj_in.load_state_dict(meta["proj_in"])
         model.chrom_emb.load_state_dict(meta["chrom_emb"])
@@ -222,6 +237,7 @@ def train(args):
         "target_mean": mu if task == "regression" else None, "target_std": sd if task == "regression" else None,
         "graph_method": args.method if tokens else None, "chroms": data.chroms if tokens else None,
         "embeddings_sha1": data.emb_sha1 if tokens else None, "graph_id": graph_id(args.graph_dir) if tokens else None,
+        "n_chrom_slots": data.n_chrom_slots if tokens else None, "backbone_fingerprint": fingerprint,
         "simulated": args.simulate, **rnr.describe(),
         "trained_blocks": {k: v.detach().cpu() for k, v in backbone_state(rnr).items()},
         **{k: ({n: t.detach().cpu() for n, t in v.items()} if isinstance(v, dict) else v) for k, v in model.state().items()},

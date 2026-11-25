@@ -11,7 +11,8 @@ Backbones, data and model shared by step 3 (evo2_seq embeddings), 4a / 4b (train
                     tells whether Evo 2's pretraining helps, and a CPU-sized model for checks
   HaploModel        the new layers around a backbone (input projection, chromosome vectors, mask
                     vector, head) and the loss of the next-block or masked-block objective
-  load_finetuned    rebuild a fine-tuned model from a step-4a checkpoint
+  PhenotypeModel    the 4b model: both haplotypes per chromosome (or a hash), attention pooling, phenotype head
+  load_finetuned / load_phenotype_model   rebuild a 4a / 4b checkpoint for step 6 (shared checks: rebuild)
   fit               the training loop of 4a and 4b (best-validation checkpoint, --resume)
 
 Every runner exposes: net (the backbone module), dev, hidden_in, hidden_out, trainable (list of
@@ -820,30 +821,54 @@ class PhenotypeModel:
             self.query.copy_(meta["query"].to(self.query.device))
 
 
-def load_phenotype_model(meta, graph_dir, device=None, ckpt_dir=None):
-    """Rebuild a 4b checkpoint (token input) on graph_dir -> (PhenotypeModel in eval mode, GenomeData)."""
-    import argparse
-    import torch
-    cfg = meta["config"]
-    pos = {x: i for i, x in enumerate(read_graph_individuals(graph_dir))}
-    data = GenomeData(graph_dir, meta["graph_method"], meta["chroms"], cfg["min_support"],
-                      [pos[x] for x in meta["train_individuals"] if x in pos], cfg["pos_freqs"], "haplotype")
-    if data.emb_sha1 != meta["embeddings_sha1"]:
-        raise ValueError("the embeddings changed since the phenotype model was trained; rerun 4b")
-    a = argparse.Namespace(**{**cfg, "backbone": meta["backend"], "bionemo": False, "device": device,
-                              "ckpt_dir": ckpt_dir or cfg.get("ckpt_dir")})
-    rnr = make_runner(a, train_blocks=0)
-    with torch.no_grad():
-        rnr.net.load_state_dict({k: v.to(rnr.dev) for k, v in meta["trained_blocks"].items()}, strict=False)
-    model = PhenotypeModel(rnr, meta["n_out"], data, max_len=cfg["max_len"])
-    model.load(meta)
-    model.train(False)
-    return model, data
-
-
 def backbone_state(rnr):
     """What a checkpoint stores of the backbone: everything for small, the unfrozen blocks otherwise."""
     return rnr.net.state_dict() if rnr.backend == "small" else dict(rnr.trainable)
+
+
+def backbone_fingerprint(net):
+    """Short id of a backbone's weights (the first 64 values of every tensor), stored before training:
+    step 6 checks that it rebuilds the same base model (and, with --init random, the same random init)."""
+    h = hashlib.sha1()
+    for name, t in sorted(list(net.named_parameters()) + list(net.named_buffers()), key=lambda x: x[0]):
+        if name.endswith("_extra_state"):                      # FP8 runtime metadata, not weights
+            continue
+        h.update(name.encode())
+        h.update(t.detach().reshape(-1)[:64].float().cpu().numpy().tobytes())
+    return h.hexdigest()[:12]
+
+
+def rebuild(meta, graph_dir, units, device=None, ckpt_dir=None):
+    """GenomeData and backbone (with the checkpoint's trained parameters) of a 4a / 4b checkpoint,
+    after checking that the graph build, the embeddings and the base model are the ones it was trained on."""
+    import argparse
+    import torch
+    from haplo_common import graph_id
+    cfg = meta["config"]
+    pos = {x: i for i, x in enumerate(read_graph_individuals(graph_dir))}
+    data = GenomeData(graph_dir, meta["graph_method"], meta["chroms"], cfg["min_support"],
+                      [pos[x] for x in meta["train_individuals"] if x in pos], cfg["pos_freqs"], units)
+    if meta["graph_id"] != graph_id(graph_dir):
+        raise ValueError(f"the model was trained on another build of this graph (graph_id {meta['graph_id']}, "
+                         f"now {graph_id(graph_dir)}); rerun steps 3-4 on the current graph")
+    if meta["embeddings_sha1"] != data.emb_sha1:
+        raise ValueError(f"node_emb_{meta['graph_method']}.npy changed since the model was trained (different "
+                         "checksum); rerun step 4 on the current embeddings")
+    if data.n_chrom_slots != meta["n_chrom_slots"]:
+        raise ValueError("this graph has a different set of chromosomes than the one the model was trained on")
+    a = argparse.Namespace(**{**cfg, "backbone": meta["backend"], "bionemo": False, "device": device,
+                              "ckpt_dir": ckpt_dir or cfg.get("ckpt_dir")})
+    rnr = make_runner(a, train_blocks=0)
+    if meta["backend"] != "small" and backbone_fingerprint(rnr.net) != meta["backbone_fingerprint"]:
+        raise ValueError("the backbone rebuilt here is not the one the model was trained from (other base model, "
+                         "Evo 2 version or random init)")
+    tb = {k: v.to(rnr.dev) for k, v in meta["trained_blocks"].items()}
+    missing = set(tb) - set(rnr.net.state_dict())
+    if missing:
+        die(f"{len(missing)} fine-tuned parameters do not exist in the backbone (e.g. {sorted(missing)[:2]})")
+    with torch.no_grad():
+        rnr.net.load_state_dict(tb, strict=False)
+    return data, rnr
 
 
 def load_finetuned(meta, graph_dir, device=None, ckpt_dir=None):
@@ -851,35 +876,21 @@ def load_finetuned(meta, graph_dir, device=None, ckpt_dir=None):
     Returns (HaploModel in eval mode, GenomeData). Evo 2 / BioNeMo backbones need the GPU and the
     same base model as in training (with --init random, the same seed); the small backbone is
     stored whole in the checkpoint."""
-    import argparse
-    import torch
-    from haplo_common import graph_id
     if meta.get("mode") != "embeddings":
         die("only models from 4a_finetune_evo2_embeddings.py can be queried here")
     cfg = meta["config"]
-    pos = {x: i for i, x in enumerate(read_graph_individuals(graph_dir))}
-    trained = [pos[x] for x in meta["train_individuals"] if x in pos]
-    data = GenomeData(graph_dir, meta["graph_method"], meta["chroms"], cfg["min_support"], trained,
-                      cfg["pos_freqs"], meta["units"])
-    if meta["graph_id"] != graph_id(graph_dir):
-        raise ValueError(f"the model was trained on another build of this graph (graph_id {meta['graph_id']}, "
-                         f"now {graph_id(graph_dir)}); rerun steps 3-4 on the current graph")
-    if meta["embeddings_sha1"] != data.emb_sha1:
-        raise ValueError(f"node_emb_{meta['graph_method']}.npy changed since the model was trained (different "
-                         "checksum); rerun step 4a on the current embeddings")
-    if data.n_chrom_slots != meta["n_chrom_slots"]:
-        raise ValueError("this graph has a different set of chromosomes than the one the model was trained on")
-    a = argparse.Namespace(**{**cfg, "backbone": meta["backend"], "bionemo": False, "device": device,
-                              "ckpt_dir": ckpt_dir or cfg.get("ckpt_dir")})
-    rnr = make_runner(a, train_blocks=0)
-    tb = {k: v.to(rnr.dev) for k, v in meta["trained_blocks"].items()}
-    missing = set(tb) - set(rnr.net.state_dict())
-    if missing:
-        die(f"{len(missing)} fine-tuned parameters do not exist in the backbone (e.g. {sorted(missing)[:2]})")
-    with torch.no_grad():
-        rnr.net.load_state_dict(tb, strict=False)
+    data, rnr = rebuild(meta, graph_dir, meta["units"], device, ckpt_dir)
     model = HaploModel(rnr, data, meta["head"], meta["softmax"], meta["objective"], cfg["temperature"],
                        cfg["max_len"], cfg["mask_frac"], cfg["mask_max"])
+    model.load(meta)
+    model.train(False)
+    return model, data
+
+
+def load_phenotype_model(meta, graph_dir, device=None, ckpt_dir=None):
+    """Rebuild a 4b checkpoint (token input) on graph_dir -> (PhenotypeModel in eval mode, GenomeData)."""
+    data, rnr = rebuild(meta, graph_dir, "haplotype", device, ckpt_dir)
+    model = PhenotypeModel(rnr, meta["n_out"], data, max_len=meta["config"]["max_len"])
     model.load(meta)
     model.train(False)
     return model, data

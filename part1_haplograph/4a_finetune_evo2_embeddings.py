@@ -44,7 +44,8 @@ import time
 
 import numpy as np
 
-from evo2_model import HEADS, GenomeData, HaploModel, add_backbone_args, backbone_state, config_of, fit, make_runner
+from evo2_model import (HEADS, GenomeData, HaploModel, add_backbone_args, backbone_fingerprint, backbone_state,
+                        config_of, fit, make_runner)
 from haplo_common import (METHODS, check_args, die, graph_id, log, parse_chroms, read_graph_individuals, require_files,
                           selftest_graph_dir, train_columns)
 
@@ -124,6 +125,7 @@ def train(args):
         f"individuals (both from the training set: {train_src}), {len(train_ex):,} training sequences")
 
     rnr = make_runner(args, args.train_blocks)
+    fingerprint = backbone_fingerprint(rnr.net)
     model = HaploModel(rnr, data, args.head, args.softmax, args.objective, args.temperature, args.max_len,
                        args.mask_frac, args.mask_max)
     blocks = [p for _, p in rnr.trainable]
@@ -141,7 +143,7 @@ def train(args):
         "mode": "embeddings", "backend": rnr.backend, "init": args.init, "units": args.units,
         "objective": args.objective, "head": args.head, "softmax": args.softmax, "graph_method": args.method,
         "chroms": data.chroms, "n_chrom_slots": data.n_chrom_slots, "embeddings_sha1": data.emb_sha1,
-        "graph_id": graph_id(args.graph_dir), **rnr.describe(),
+        "graph_id": graph_id(args.graph_dir), "backbone_fingerprint": fingerprint, **rnr.describe(),
         "trained_blocks": {n: p.detach().cpu() for n, p in backbone_state(rnr).items()},
         **{k: {n: t.detach().cpu() for n, t in v.items()} for k, v in model.state().items()},
         "val_individuals": [individuals[i] for i in val_inds],

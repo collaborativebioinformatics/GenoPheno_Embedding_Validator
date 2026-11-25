@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from conftest import SMALL, STEP4_FAST, script
-from evo2_model import GenomeData, HaploModel, SmallRunner, fit, randomize
+from evo2_model import GenomeData, HaploModel, SmallRunner, backbone_fingerprint, fit, randomize
 from haplo_common import read_graph_individuals, set_id
 
 
@@ -191,3 +191,16 @@ def test_cis_simulation_ignores_trans_configurations(graph_copy):
     y = pd.concat([pd.read_csv(graph_copy / "phenotypes" / f"cis_{p}.tsv", sep="\t") for p in ("train", "test")])
     y = y.set_index("individual")["cis"].reindex(inds).to_numpy()
     assert np.corrcoef(cis, y)[0, 1] ** 2 > 0.99
+
+
+def test_backbone_fingerprint_follows_weights_and_ignores_extra_state():
+    class TE(torch.nn.Linear):                         # like TransformerEngine: FP8 metadata in the state_dict
+        def get_extra_state(self):
+            return torch.randn(4)
+    torch.manual_seed(0)
+    a = TE(4, 4)
+    f = backbone_fingerprint(a)
+    assert backbone_fingerprint(a) == f
+    with torch.no_grad():
+        a.weight[0, 0] += 1
+    assert backbone_fingerprint(a) != f
