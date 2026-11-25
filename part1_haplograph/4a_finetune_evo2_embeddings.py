@@ -131,7 +131,7 @@ def train(args):
     blocks = [p for _, p in rnr.trainable]
     n_trainable = int(sum(p.numel() for p in blocks + model.parameters()))
     log(f"  trainable parameters: {n_trainable:,} (backbone {sum(p.numel() for p in blocks):,})")
-    tag = {"evo2": "evo2", "bionemo": "bionemo", "small": "small"}[rnr.backend] + ("-random" if args.init == "random" else "")
+    tag = rnr.backend + ("-random" if args.init == "random" else "")
     out = args.out or os.path.join(args.graph_dir, f"{tag}_{args.objective}_{args.method}"
                                                    f"{'_individual' if args.units == 'individual' else ''}.pt")
     describe = lambda r: f"val loss {r['loss']:.4f}, val top-1 accuracy {r['accuracy']:.3f}"
@@ -193,7 +193,8 @@ def main(argv=None):
     ap.add_argument("--min-support", type=int, default=2,
                     help="clusters carried by fewer training haplotypes (individuals with --units individual) become "
                          "one token per haploblock (0 = no merging)")
-    ap.add_argument("--out", help="output .pt (default <graph-dir>/<backbone>[-random]_<objective>_<method>.pt)")
+    ap.add_argument("--out", help="output .pt (default <graph-dir>/<backbone>[-random]_<objective>_<method>"
+                                  "[_individual].pt)")
     ap.add_argument("--smoke", action="store_true",
                     help="load the backbone, check one forward/backward, report memory and time per step, exit")
     ap.add_argument("--test", action="store_true", help="self-test on synthetic data with a small backbone (CPU, seconds)")
@@ -229,8 +230,8 @@ def main(argv=None):
     args.softmax = args.softmax or ("block" if args.units == "haplotype" else "all")
     args.chroms = parse_chroms(args.chroms)
     check_args(args, ("mask_max",), training=True)
-    if args.pos_freqs < 0 or not 0 < args.mask_frac < 1:
-        die("--pos-freqs must be >= 0 and --mask-frac between 0 and 1")
+    if args.pos_freqs < 0 or not 0 < args.mask_frac < 1 or args.temperature <= 0:
+        die("--pos-freqs must be >= 0, --mask-frac between 0 and 1 and --temperature > 0")
     require_files(args.graph_dir, ["nodes.csv.gz", "individuals.txt", "carriers.npz"], "2_build_graph.py")
     require_files(args.graph_dir, [f"node_emb_{args.method}.npy"], f"3_node_embeddings.py --method {args.method}")
     train(args)

@@ -105,6 +105,7 @@ class GenomeData:
             self.by_ind.sort_indices()
             support = np.asarray(C[:, support_from].sum(axis=1)).ravel()
         self.support = support
+        self.n_support_units = 2 * len(support_from) if units == "haplotype" else len(support_from)
         self.rare = support < min_support
         self.canon = np.arange(len(nodes))                    # node -> the node standing in for it
         rank = np.empty(len(nodes), np.int64)
@@ -132,7 +133,7 @@ class GenomeData:
         self.block_pos = np.full(len(nodes), -1, np.int64)                   # token -> index in its haploblock
         self.block_pos[tokens] = np.arange(len(tokens)) - np.repeat(np.cumsum(self.block_len) - self.block_len,
                                                                     self.block_len)
-        self.block_pad = np.full((len(self.regions), max(1, self.block_len.max())), -1, np.int64)
+        self.block_pad = np.full((len(self.regions), max(1, self.block_len.max())), -1, np.int32)
         self.block_pad[blk, self.block_pos[tokens]] = tokens
         self.n_nodes = len(nodes)
         self.token_nodes = np.sort(tokens)                                   # rows of a per-token table
@@ -667,7 +668,8 @@ class HaploModel:
                 lg = q @ self.keys[nodes].T
             cand = nodes.expand(len(targets), -1)
         else:
-            cand = self.pad_t[torch.from_numpy(self.data.region_code[targets]).to(self.rnr.dev)]
+            reg = self.data.region_code[targets]
+            cand = self.pad_t[torch.from_numpy(reg).to(self.rnr.dev), :int(self.data.block_len[reg].max())].long()
             safe, parts = cand.clamp(min=0), []
             for c in range(0, len(targets), chunk):          # [chunk, K, dim] at a time
                 sl = slice(c, c + chunk)

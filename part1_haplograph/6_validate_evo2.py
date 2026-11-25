@@ -37,7 +37,8 @@ OUTPUT (--out-dir, default <graph-dir>/validation_<first model name>/)
   masked_imputation.csv               span, <method>_concordance, model_minus_<method>_95ci, <method>_r2_<bin>
   model_comparison.csv / _pairs.csv   per model: top1, loss; per pair: differences with 95% CIs
   embedding_cooccurrence.csv          name, kind, auc, auc_distance_matched, auc_frequency_matched,
-                                      auc_no_graph_edges, auc_95ci, auc_minus_carrier_svd(_95ci)
+                                      auc_no_graph_edges (pairs of clusters that both have no graph edge),
+                                      auc_95ci, auc_minus_carrier_svd(_95ci)
   cluster_consistency_regions.csv.gz  region, chrom, start, end, n_clusters_total/_train/_test,
                                       test_expected, test_ci_low/high, outside_ci, n_test_only,
                                       test_only_carriers, tvd, tvd_null_mean, tvd_p, chi2, chi2_df, chi2_p, chi2_q
@@ -1030,7 +1031,7 @@ def score_next(model, data, examples, train_inds):
             else:
                 t = data.tokens(chrom, ex)
                 pr = predict(t)
-                d["freq"] = data.support[s["target"]] / max(len(train_inds), 1)
+                d["freq"] = data.support[s["target"]] / max(data.n_support_units, 1)
                 d["same_block"] = data.region_code[t[s["pos"] - 1]] == d["block"]
                 for n, p in pr.items():
                     d[f"{n}_top1"] = p[s["pos"] - 1] == t[s["pos"]]
