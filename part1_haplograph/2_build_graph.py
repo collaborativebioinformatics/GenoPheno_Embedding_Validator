@@ -187,6 +187,12 @@ def read_haplotypes(path, ids, regions, carriers, inds):
     if missing:
         die(f"{path}: {len(missing)} haplotypes of nodes.csv.gz individuals are missing (e.g. {missing[:2]})")
     tab = tab.loc[rows]
+    parsed = tab.columns.str.extract(REGION_RE)["start"]
+    if parsed.isna().any():
+        die(f"{path}: haploblock column {tab.columns[parsed.isna().to_numpy()][0]!r} is not <chrom>:<start>-<end>")
+    starts = parsed.astype(np.int64).to_numpy()
+    if (np.diff(starts) < 0).any():
+        die(f"{path}: haploblock columns are not in genomic order; re-run step 1")
     index = pd.Index(ids)
     H = np.empty(tab.shape, np.int32)
     for j, region in enumerate(tab.columns):
@@ -210,14 +216,14 @@ def haplotype_edges(H, starts, hap_rows, n_nodes, args):
     different haploblocks at most --max-span bp apart (start to start). Returns s, t, lift, n_pairs."""
     Ht = H[hap_rows]
     n_A = np.bincount(Ht.ravel(), minlength=n_nodes).astype(np.float64)
-    counts = sp.csr_matrix((n_nodes, n_nodes), dtype=np.float64)
-    for d in range(1, H.shape[1]):
+    c = sp.csr_matrix((n_nodes, n_nodes))
+    for d in range(1, H.shape[1]):                    # columns are in genomic order (checked on reading)
         k = np.where(starts[d:] - starts[:-d] <= args.max_span)[0]
         if not len(k):
-            break
-        a, b = Ht[:, k].ravel(), Ht[:, k + d].ravel()
-        counts = counts + sp.csr_matrix((np.ones(len(a)), (a, b)), shape=(n_nodes, n_nodes))
-    c = counts.tocoo()
+            break                                     # one offset at a time: memory stays bounded
+        key, cnt = np.unique(Ht[:, k].astype(np.int64).ravel() * n_nodes + Ht[:, k + d].ravel(), return_counts=True)
+        c = c + sp.csr_matrix((cnt.astype(np.float64), (key // n_nodes, key % n_nodes)), shape=(n_nodes, n_nodes))
+    c = c.tocoo()
     lift = c.data * len(hap_rows) / (n_A[c.row] * n_A[c.col])
     keep = (c.data >= args.min_pair_count) & (lift >= args.min_lift)
     return c.row[keep].astype(np.int64), c.col[keep].astype(np.int64), lift[keep].astype(np.float32), c.nnz
