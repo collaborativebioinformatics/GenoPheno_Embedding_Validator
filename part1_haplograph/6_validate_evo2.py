@@ -1362,7 +1362,11 @@ def model_comparison(ctx, max_examples: int = 300, bootstrap: int = 1000, device
     """Every 4a model given with --model is scored on the same test examples: next-token top-1 and
     cross-entropy (next-token models) or masked-position top-1 and cross-entropy at fixed masks
     (masked models). Differences between every pair of models get a 95% CI from a paired bootstrap
-    over test individuals; models with different readouts or tokenisations are not compared."""
+    over test individuals; a pair is compared only when both models predict exactly the same targets
+    at the same positions (same readout, units, softmax, rare-cluster merging, windows and masks).
+    Models are loaded one at a time."""
+    import gc
+    import torch
     files = [m.path for m in ctx.models]
     if len(files) < 2:
         raise ValueError("model_comparison needs at least two --model files")
@@ -1372,14 +1376,20 @@ def model_comparison(ctx, max_examples: int = 300, bootstrap: int = 1000, device
     for f in files:
         model, data, meta = query_model(ctx, f, device, ckpt_dir)
         ex = sample_examples(data, test, max_examples, np.random.default_rng(0))   # same examples per model
-        hits, lps, inds = [], [], []
+        hits, lps, inds, targets = [], [], [], []
         for c, e in ex:
             sc = model.score(c, e)
             hits.append(sc["top1"]); lps.append(sc["logp"])
             inds.append(np.full(len(sc["top1"]), e // 2 if data.units == "haplotype" else e))
-        hits, lps, inds = map(np.concatenate, (hits, lps, inds))
-        key = (meta["objective"], data.units, meta["config"]["min_support"], tuple(data.chroms))
-        per[f] = (key, inds, hits, lps)
+            targets.append(np.stack([np.full(len(sc["pos"]), data.cidx[c]), sc["pos"], sc["target"]], 1))
+        hits, lps, inds, targets = map(np.concatenate, (hits, lps, inds, targets))
+        key = (meta["objective"], data.units, meta["softmax"])
+        per[f] = (key, inds, hits, lps, targets)
+        ctx.cache.pop((f, device, ckpt_dir), None)                  # one model in memory at a time
+        del model
+        gc.collect()                                                # the runner's hooks form a reference cycle
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         table.append({"model": os.path.basename(f), "backend": meta["backend"], "init": meta["init"],
                       "units": data.units, "objective": meta["objective"], "head": meta["head"],
                       "train_blocks": meta["config"]["train_blocks"], "trainable_params": meta["trainable_params"],
@@ -1390,10 +1400,10 @@ def model_comparison(ctx, max_examples: int = 300, bootstrap: int = 1000, device
     pairs = []
     for i, a in enumerate(files):
         for b in files[i + 1:]:
-            (ka, ia, ha, la), (kb, ib, hb, lb) = per[a], per[b]
+            (ka, ia, ha, la, ta), (kb, ib, hb, lb, tb) = per[a], per[b]
             row = {"model_a": os.path.basename(a), "model_b": os.path.basename(b)}
-            if ka != kb or len(ha) != len(hb):
-                row["comparable"] = "no (different readout, units, merging or chromosomes)"
+            if ka != kb or ta.shape != tb.shape or not np.array_equal(ta, tb):
+                row["comparable"] = "no (different readout, softmax, targets or positions)"
             else:
                 code = np.searchsorted(uniq, ia)
                 cnt = np.bincount(code, minlength=len(uniq)).astype(float)
