@@ -1232,10 +1232,10 @@ def head_ceiling(ctx, max_targets: int = 5000, model: str = "", device: str = ""
 
 @task("masked_imputation", "Impute masked haploblocks of test individuals from both flanks: model vs "
                            "frequency, flank lookup and a Li-Stephens HMM")
-def masked_imputation(ctx, spans: str = "1,2,5", per_haplotype: int = 5, max_individuals: int = 300,
+def masked_imputation(ctx, spans: str = "1,2,5", per_individual: int = 5, max_individuals: int = 300,
                       bootstrap: int = 500, model: str = "", device: str = "", ckpt_dir: str = ""):
-    """For each span length in `spans`, `per_haplotype` random spans of that many contiguous
-    haploblocks are masked on both haplotypes of up to max_individuals test individuals per
+    """For each span length in `spans`, `per_individual` non-overlapping spans of exactly that many
+    contiguous haploblocks (separated by at least one observed haploblock) are masked on both haplotypes of up to max_individuals test individuals per
     chromosome (the same blocks on both, as in genotype imputation). Reports concordance (top-1 per
     haplotype) and r^2 between true and expected cluster dosage (0-2 copies), pooled over the masked
     (individual, haploblock, cluster) entries of each training-frequency bin, for the model (a masked-
@@ -1257,11 +1257,13 @@ def masked_imputation(ctx, spans: str = "1,2,5", per_haplotype: int = 5, max_ind
         B = Y.shape[1]
         w0, w1 = model.window(B)                         # the model sees the central --max-len haploblocks
         for L in [int(x) for x in spans.split(",")]:
-            if w1 - w0 < L + 2:
+            slots = (w1 - w0 - 1) // (L + 1)            # spans of exactly L, an observed block between them
+            if slots < 1:
                 continue
             mask = np.zeros((len(test), B), bool)
             for i in range(len(test)):
-                for s0 in rng.choice(np.arange(w0 + 1, w1 - L), min(per_haplotype, w1 - w0 - L - 1), replace=False):
+                for j in rng.choice(slots, min(per_individual, slots), replace=False):
+                    s0 = w0 + 1 + j * (L + 1)
                     mask[i, s0:s0 + L] = True
             M = np.repeat(mask, 2, axis=0)                                  # both haplotypes
             hmm = bl.hmm(Y, causal=False, mask=M)
@@ -1274,10 +1276,11 @@ def masked_imputation(ctx, spans: str = "1,2,5", per_haplotype: int = 5, max_ind
                     if use_model:
                         sc = model.score(chrom, int(hap_rows([test[i]])[h]), mask=blocks, probs=True)
                         dense = {}
-                        for b, cand, p in zip(sc["pos"], sc["cand"], sc["p"]):
+                        for b, cand, p, tgt in zip(sc["pos"], sc["cand"], sc["p"], sc["target"]):
                             v = np.zeros(K[b])
-                            ok = cand >= 0
-                            v[data.block_pos[cand[ok]]] = p[ok]
+                            ok = (cand >= 0) & (data.region_code[np.maximum(cand, 0)] == data.region_code[tgt])
+                            v[data.block_pos[cand[ok]]] = p[ok]                 # --softmax all: renormalised
+                            v /= max(v.sum(), 1e-12)                            # within the haploblock
                             dense[b] = v
                         preds["model"] = [dense[b] for b in blocks]
                     for b_i, b in enumerate(blocks):
@@ -2026,7 +2029,7 @@ def self_test(args):
     args.splits, args.tasks, args.gwas, args.out_dir = GRAPH_SPLIT, None, [], None
     args.task = ["model_info", "test_set_performance max_examples=60 train_examples=20 bootstrap=200 device=cpu",
                  "head_ceiling device=cpu",
-                 f"masked_imputation model={shlex.quote(masked)} spans=1,2 per_haplotype=2 bootstrap=100 device=cpu",
+                 f"masked_imputation model={shlex.quote(masked)} spans=1,2 per_individual=2 bootstrap=100 device=cpu",
                  "model_comparison bootstrap=100 device=cpu",
                  "embedding_cooccurrence min_lift=1.5 min_support=3 min_expected=1 pairs=5000 bootstrap=50",
                  "cluster_consistency permutations=20",

@@ -49,6 +49,6 @@ def test_masked_imputation_reaches_most_of_the_hmm(tmp_path):
     script("4a_finetune_evo2_embeddings").main(["--graph-dir", str(G), "--epochs", "80", "--min-support", "0",
                                                 "--objective", "masked", "--mask-frac", "0.3", "--out", str(out)] + CTRL)
     _, tasks = run_validate(["--model", out, "--graph-dir", G, "--task",
-                             "masked_imputation spans=1 per_haplotype=5 bootstrap=0 device=cpu"], tmp_path / "v")
+                             "masked_imputation spans=1 per_individual=5 bootstrap=0 device=cpu"], tmp_path / "v")
     s = tasks["masked_imputation"]["summary"]
     assert s["span1_model_concordance"] >= 0.9 * s["span1_hmm_concordance"], s

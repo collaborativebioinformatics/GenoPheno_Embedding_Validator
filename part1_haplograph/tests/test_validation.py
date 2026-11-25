@@ -206,7 +206,7 @@ def test_masked_model_imputation_and_model_comparison(graph_copy, tmp_path):
     m4.main(["--graph-dir", str(graph_copy), "--train-blocks", "0", "--out", str(frozen)] + STEP4_FAST)
     _, tasks = run_validate(["--model", graph_copy / "small_next_gnn.pt", "--model", frozen, "--model", masked,
                              "--graph-dir", graph_copy, "--task", f"masked_imputation model={masked} spans=1 "
-                             "per_haplotype=2 bootstrap=20 device=cpu", "--task", "model_comparison bootstrap=20 device=cpu"],
+                             "per_individual=2 bootstrap=20 device=cpu", "--task", "model_comparison bootstrap=20 device=cpu"],
                             tmp_path / "v")
     m = tasks["masked_imputation"]["summary"]
     assert m["model_scored"] == "yes" and 0 <= m["span1_model_concordance"] <= 1
