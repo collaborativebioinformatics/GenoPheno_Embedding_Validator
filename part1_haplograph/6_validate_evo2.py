@@ -1607,23 +1607,27 @@ GENETIC_MAP_URL = "https://bochet.gcc.biostat.washington.edu/beagle/genetic_maps
 
 
 def ridge_fit_predict(Xtr, ytr, Xte, lambdas=np.logspace(-2, 4, 13)):
-    """Ridge regression in its kernel form (n << features), lambda by generalized cross-validation.
-    Returns (test predictions, feature weights)."""
-    K = (Xtr @ Xtr.T).toarray() if sp.issparse(Xtr) else Xtr @ Xtr.T
-    w, U = np.linalg.eigh(K)
+    """Ridge regression with an intercept (features centred on the training means) in its kernel form
+    (n << features), lambda by generalized cross-validation. Returns (test predictions, feature weights)."""
+    dense = lambda M: M.toarray() if sp.issparse(M) else np.asarray(M)
+    Ktr, Kte = dense(Xtr @ Xtr.T), dense(Xte @ Xtr.T)
+    r, tot = Ktr.mean(0), Ktr.mean()
+    Kc = Ktr - r[None] - r[:, None] + tot                              # kernel of the centred features
+    Kte_c = Kte - r[None] - Kte.mean(1, keepdims=True) + tot
+    w, U = np.linalg.eigh(Kc)
     w = np.maximum(w, 0)
     yc = ytr - ytr.mean()
     Uy = U.T @ yc
-    best = None
-    for lam in lambdas * max(w.mean(), 1e-12):
+    lams = lambdas * max(w.mean(), 1e-12)
+    gcv = []
+    for lam in lams:
         shrink = w / (w + lam)
         resid = yc - U @ (shrink * Uy)
-        gcv = np.mean(resid ** 2) / (1 - shrink.sum() / len(yc)) ** 2
-        if best is None or gcv < best[0]:
-            best = (gcv, lam)
-    alpha = U @ (Uy / (w + best[1]))
-    beta = np.asarray(Xtr.T @ alpha).ravel()
-    return np.asarray(Xte @ beta).ravel() + ytr.mean(), beta
+        gcv.append(np.mean(resid ** 2) / (1 - (shrink.sum() + 1) / len(yc)) ** 2)   # +1: the intercept
+    alpha = U @ (Uy / (w + lams[int(np.nanargmin(gcv))]))
+    mu = np.asarray(Xtr.mean(0)).ravel()
+    beta = np.asarray(Xtr.T @ alpha).ravel() - mu * alpha.sum()
+    return Kte_c @ alpha + ytr.mean(), beta
 
 
 def r2(pred, y):
@@ -1647,6 +1651,8 @@ def phenotype_prediction(ctx, model: str = "", phenotypes: str = "", bootstrap: 
     meta = m.meta
     if meta.get("mode") != "phenotype" or meta.get("input") != "tokens":
         raise ValueError(f"{m.path} is {model_kind(meta)}; phenotype_prediction needs a 4b model with token input")
+    if meta["task"] != "regression":
+        raise ValueError("phenotype_prediction scores regression models (R^2); this 4b model is a classifier")
     trait = meta["trait"]
     folder = phenotypes or os.path.join(ctx.graph.dir, "phenotypes")
     read = lambda part: pd.read_csv(os.path.join(folder, f"{trait}_{part}.tsv"), sep="\t", dtype={"individual": str})
