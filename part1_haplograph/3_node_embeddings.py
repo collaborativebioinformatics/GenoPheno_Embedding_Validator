@@ -287,7 +287,7 @@ def embed_gnn(args, A):
     up = sp.triu(A, k=1).tocoo()
     pos = np.vstack([up.row, up.col]).astype(np.int64)
     if pos.shape[1] == 0:
-        raise SystemExit("graph has no edges; rebuild it with a lower --min-lift")
+        die("graph has no edges; rebuild it with a lower --min-lift")
 
     class GCN(nn.Module):
         def __init__(s, d_in, d_hid, d_out):
@@ -485,12 +485,12 @@ def embed_evo2_seq(args, A):
     hf = gfile(args, "haplotypes.npz")
     if not os.path.exists(hf):
         die("evo2_seq needs haplotypes.npz (step 1 --haplotypes, then step 2) to know each sequence's cluster")
-    h = np.load(hf)
-    col = {r: j for j, r in enumerate(h["blocks"])}
+    with np.load(hf) as h:                                          # read once: the file is compressed
+        Hn, blocks = h["node"], h["blocks"]
+    col = {r: j for j, r in enumerate(blocks)}
     row = {x: i for i, x in enumerate(read_graph_individuals(args.graph_dir))}
     raw = args.raw_dir or os.path.join(os.path.dirname(os.path.abspath(args.graph_dir)), "raw")
-    args.train_blocks = 0
-    key = {k: getattr(args, k) for k in ("backbone", "bionemo", "init", "seed", "evo2_model", "layer", "ckpt_dir",
+    key = {"graph_id": graph_id(args.graph_dir)} | {k: getattr(args, k) for k in ("backbone", "bionemo", "init", "seed", "evo2_model", "layer", "ckpt_dir",
                                          "model_size", "layer_index", "small_hidden", "small_layers", "seq_window",
                                          "seq_windows")}
     cache = os.path.join(gfile(args, "evo2_seq_cache"), hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:8])
@@ -509,12 +509,13 @@ def embed_evo2_seq(args, A):
                 region = os.path.basename(m.name)[:-len("_rep_seq.fasta")]
                 f = os.path.join(cache, f"{region}.npz")
                 if os.path.exists(f):
-                    V.update(zip(*np.load(f).values()))
+                    with np.load(f) as z:
+                        V.update(zip(*z.values()))
                     continue
                 data = tar.extractfile(m).read()
                 if sums.get(m.name) not in (None, hashlib.md5(data).hexdigest()):
                     die(f"{arc}: {m.name} does not match rep_seq.md5; delete the archive and download it again")
-                rnr = rnr or make_runner(args, 0)
+                rnr = rnr or make_runner(argparse.Namespace(**vars(args)), 0)
                 ids, vecs = [], []
                 for name, seq in read_fasta(data.decode()):
                     sample, hap = name.split("_")[0], int(name[-1])
@@ -526,7 +527,7 @@ def embed_evo2_seq(args, A):
                     with torch.no_grad():
                         v = torch.stack([rnr.run_ids(torch.frombuffer(bytearray(seq[s:s + L]), dtype=torch.uint8))
                                          .mean(0) for s in starts]).mean(0)
-                    ids.append(int(h["node"][2 * row[sample] + hap, col[region]]))
+                    ids.append(int(Hn[2 * row[sample] + hap, col[region]]))
                     vecs.append(v.cpu().numpy())
                 np.savez(f, node=np.array(ids, np.int64), vec=np.array(vecs, np.float32))
                 V.update(zip(ids, vecs))
