@@ -107,10 +107,44 @@ def test_resume_continues_where_training_stopped(tmp_path):
         return lin.weight.detach().clone()
     straight = run(2, False)
     run(1, True)
-    (tmp_path / "rTrue.resume").rename(tmp_path / "keep")
-    (tmp_path / "keep").rename(tmp_path / "rTrue.resume")
     resumed = run(2, True)
     assert torch.allclose(straight, resumed, atol=1e-6)
+
+
+def test_resume_refuses_other_settings(tmp_path):
+    lin = torch.nn.Linear(3, 1)
+    X, y = torch.randn(12, 3), torch.randn(12)
+    loss = lambda j: (lin(X[j]) - y[j]).pow(2).mean()
+    run = lambda lr: fit(argparse.Namespace(lr=lr, head_lr=lr, batch=4, epochs=1, seed=0, log_every=1000,
+                                            eval_every=1000, resume=True),
+                         [], list(lin.parameters()), 12, loss, lambda: {"loss": float(loss(0))}, str,
+                         lambda m: None, ("lin", list(lin.parameters())), resume_path=str(tmp_path / "r.resume"))
+    run(1e-2)
+    with pytest.raises(SystemExit):
+        run(1e-3)
+
+
+def test_init_random_shuffles_parameters_without_a_reset():
+    """Custom parameters (e.g. a norm scale of ones next to varied filter values) keep their values but
+    lose their order: never zeroed."""
+    net = torch.nn.Module()
+    net.scale = torch.nn.Parameter(torch.ones(64))
+    net.filt = torch.nn.Parameter(torch.arange(64.0))
+    net.dev = torch.nn.Linear(2, 2)                   # gives the module a device
+    randomize(net, seed=0)
+    assert torch.equal(net.scale, torch.ones(64))
+    assert torch.equal(net.filt.sort().values, torch.arange(64.0)) and not torch.equal(net.filt, torch.arange(64.0))
+
+
+def test_phenotype_model_reads_every_haploblock(pipeline):
+    """The 4b model covers whole chromosomes in --max-len windows: every token gets an attention weight."""
+    from evo2_model import PhenotypeModel
+    d = data_of(pipeline["G"])
+    m = PhenotypeModel(SmallRunner(16, 1, None, "cpu", 0), 1, d, max_len=3)
+    with torch.no_grad():
+        _, attn = m.encode(0)
+    for c in d.chroms:
+        assert len(attn[c][0]) == len(attn[c][1]) == 2 * len(d.block_cols[c]) > 6
 
 
 def test_smoke_reports_memory_time_and_trainable_parameters():

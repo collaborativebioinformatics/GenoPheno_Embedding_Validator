@@ -933,34 +933,38 @@ class MasterWeights:
                 p.copy_(m)
 
 
+RESUMABLE = ("epochs", "resume", "log_every", "eval_every", "out", "device", "test", "smoke")
+
+
 def fit(args, blocks, new_params, n_examples, example_loss, evaluate, describe, set_train, grad_check,
-        resume_path=None):
+        resume_path=None, rng=None):
     """AdamW on the trainable backbone parameters `blocks` (--lr, through fp32 master weights) and the
     new layers' parameters `new_params` (--head-lr); gradient accumulation over --batch examples,
     gradient clipping at 1; --epochs passes in an order fixed by --seed and the epoch.
-      example_loss(j) -> loss tensor of training example j;  evaluate() -> metrics dict with "loss"
-      (run without gradients in eval mode, every --eval-every steps and at the end of every epoch);
-      set_train(mode) switches every module;  grad_check = (description, parameters that must
-      receive a gradient on the first step).
-    The parameters of the best evaluation (lowest validation loss) are restored at the end. With
-    resume_path, the state after every evaluation is saved there, and --resume continues from it.
+      example_loss(j) -> loss tensor of training example j (it may draw from `rng`);  evaluate() ->
+      metrics dict with "loss" (run without gradients in eval mode, every --eval-every steps and at
+      the end of every epoch);  set_train(mode) switches every module;  grad_check = (description,
+      parameters that must receive a gradient on the first step).
+    The parameters of the best evaluation (lowest validation loss; the untrained parameters count too)
+    are restored at the end. With resume_path, the training state (fp32 master weights, optimizer,
+    best parameters, the state of `rng`, the settings) is saved there after every evaluation, and
+    --resume continues from it; settings other than --epochs and logging must not change.
     Returns {"before", "best", "last", "best_step", "history"}."""
     import torch
-    params = list(blocks) + list(new_params)
     master = MasterWeights(blocks)
     if master.pairs:
         log(f"  {len(master.pairs)} low-precision trainable tensors: optimizing fp32 master copies")
+    trained = master.params + list(new_params)               # what the optimizer updates (fp32)
     opt = torch.optim.AdamW([{"params": master.params, "lr": args.lr}, {"params": list(new_params), "lr": args.head_lr}],
                             weight_decay=0.01)
-    snapshot = lambda: [p.detach().clone() for p in params]
+    snapshot = lambda: [p.detach().cpu().clone() for p in trained]
+    settings = hashlib.sha1(json_dumps({k: v for k, v in config_of(args).items() if k not in RESUMABLE})).hexdigest()
 
     def restore(state):
         with torch.no_grad():
-            for p, v in zip(params, state):
-                p.copy_(v)
-        with torch.no_grad():
-            for p, m in master.pairs:                 # keep the fp32 master copies in step
-                m.copy_(p.float())
+            for p, v in zip(trained, state):
+                p.copy_(v.to(p.device))
+        master.master_to_model()
 
     def run_eval():
         set_train(False)
@@ -973,17 +977,20 @@ def fit(args, blocks, new_params, n_examples, example_loss, evaluate, describe, 
     if batch < 1:
         die("no training examples")
     st = {"step": 0, "epoch": 0, "done": 0, "history": [], "best": None, "best_step": 0}
-    best_params = None
     if getattr(args, "resume", False) and resume_path and os.path.exists(resume_path):
         r = torch.load(resume_path, map_location="cpu", weights_only=True)
-        restore([v.to(p.device) for p, v in zip(params, r["params"])])
-        best_params = [v.to(p.device) for p, v in zip(params, r["best_params"])]
+        if r["settings"] != settings:
+            die(f"{resume_path} was written with other settings; rerun without --resume (or with the same settings)")
+        restore(r["params"])
+        best_params = r["best_params"]
         opt.load_state_dict(r["optimizer"])
-        st = {k: r[k] for k in st}
-        before = r["before"]
+        st, before = {k: r[k] for k in st}, r["before"]
+        if rng is not None:
+            rng.bit_generator.state = r["rng"]
         log(f"  resumed from {resume_path}: epoch {st['epoch'] + 1}, step {st['step']}")
     else:
         before = run_eval()
+        st["best"], best_params = before, snapshot()
         log(f"  before training: {describe(before)}")
     set_train(True)
     t0, steps_here = time.time(), 0
@@ -992,12 +999,13 @@ def fit(args, blocks, new_params, n_examples, example_loss, evaluate, describe, 
         nonlocal best_params
         res = run_eval()
         st["history"].append({"step": st["step"], **res})
-        if st["best"] is None or res["loss"] < st["best"]["loss"]:
+        if res["loss"] < st["best"]["loss"]:
             st["best"], st["best_step"], best_params = res, st["step"], snapshot()
         log(f"  [eval step {st['step']}] {describe(res)}" + ("  (best)" if st["best_step"] == st["step"] else ""))
         if resume_path:
-            torch.save({"params": [p.detach().cpu() for p in params], "best_params": [p.cpu() for p in best_params],
-                        "optimizer": opt.state_dict(), "before": before, **st}, resume_path)
+            torch.save({"params": snapshot(), "best_params": best_params, "optimizer": opt.state_dict(),
+                        "before": before, "settings": settings,
+                        "rng": rng.bit_generator.state if rng is not None else None, **st}, resume_path)
 
     for epoch in range(st["epoch"], args.epochs):
         order = np.random.default_rng([args.seed, epoch]).permutation(n_examples)
@@ -1021,7 +1029,7 @@ def fit(args, blocks, new_params, n_examples, example_loss, evaluate, describe, 
                     die("no gradient reached the trainable backbone blocks; try --train-blocks 0 "
                         "(trains only the new layers through the frozen backbone)")
             master.grads_to_master()
-            torch.nn.utils.clip_grad_norm_(master.params + list(new_params), 1.0)
+            torch.nn.utils.clip_grad_norm_(trained, 1.0)
             opt.step()
             master.master_to_model()
             st["step"] += 1
@@ -1035,12 +1043,16 @@ def fit(args, blocks, new_params, n_examples, example_loss, evaluate, describe, 
         st["epoch"], st["done"] = epoch + 1, 0
         if not st["history"] or st["history"][-1]["step"] != st["step"]:
             evaluation()
-    if best_params is not None:
-        restore(best_params)
+    restore(best_params)
     log(f"  best: {describe(st['best'])} at step {st['best_step']} of {st['step']}")
     log(f"  (before training: {describe(before)})")
     return {"before": before, "best": st["best"], "last": st["history"][-1] if st["history"] else None,
             "best_step": st["best_step"], "history": st["history"]}
+
+
+def json_dumps(d):
+    import json
+    return json.dumps(d, sort_keys=True, default=str).encode()
 
 
 def config_of(args):

@@ -137,7 +137,7 @@ def train(args):
     describe = lambda r: f"val loss {r['loss']:.4f}, val top-1 accuracy {r['accuracy']:.3f}"
     metrics = fit(args, blocks, model.parameters(), len(train_ex), lambda j: model.loss(*train_ex[j], rng)[0],
                   evaluate_fn(model, val_ex), describe, model.train,
-                  ("the input projection", list(model.proj_in.parameters())), resume_path=out + ".resume")
+                  ("the input projection", list(model.proj_in.parameters())), resume_path=out + ".resume", rng=rng)
 
     torch.save({
         "mode": "embeddings", "backend": rnr.backend, "init": args.init, "units": args.units,

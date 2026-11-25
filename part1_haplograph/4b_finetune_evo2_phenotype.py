@@ -232,7 +232,7 @@ def train(args):
     out = args.out or (os.path.join(args.graph_dir, f"{tag}_pheno_{safe}_{args.method}.pt") if tokens else
                        os.path.join(os.path.dirname(os.path.abspath(args.hash_pheno)), f"{tag}_hash_{safe}.pt"))
     metrics = fit(args, blocks, model.parameters(), len(tr), lambda j: example_loss(tr[j]), evaluate, describe,
-                  model.train, ("the phenotype head", list(model.head.parameters())), resume_path=out + ".resume")
+                  model.train, ("the phenotype head", list(model.head.parameters())), resume_path=out + ".resume", rng=rng)
     ind = (lambda idx: [individuals[examples[j]] for j in idx]) if tokens else None
     torch.save({
         "mode": "phenotype", "input": args.input, "backend": rnr.backend, "init": args.init, "task": task,
