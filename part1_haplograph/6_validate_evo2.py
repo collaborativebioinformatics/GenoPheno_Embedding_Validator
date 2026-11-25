@@ -1095,7 +1095,8 @@ def test_set_performance(ctx, max_examples: int = 500, train_examples: int = 200
         s["generalization_gap_top1"] = round(s["train_sample_top1_accuracy"] - top1, 4)
     h_nll, h_n = map(sum, zip(*(bigram_entropy(data, c, ctx.train_idx) for c in sorted(set(df["chrom"])))))
     s["bigram_reference_entropy"] = round(h_nll / h_n, 4) if h_n else None
-    floor = head_floor(model, data, df["target"].to_numpy()[:2000])
+    t_all = df["target"].to_numpy()
+    floor = head_floor(model, data, t_all[rng.choice(len(t_all), min(2000, len(t_all)), replace=False)])
     s["head_ce_floor"] = round(floor, 4) if floor is not None else None
     s["stored_best_val_top1"] = round(float(meta["metrics"]["best"]["accuracy"]), 4)
 
@@ -1139,7 +1140,7 @@ def test_set_performance(ctx, max_examples: int = 500, train_examples: int = 200
         notes.append("the model does not beat every baseline on the test set (paired bootstrap over test individuals): "
                      f"not beaten: {', '.join(n for n in names if n not in beats)}")
     if floor is not None and s["bigram_reference_entropy"] is not None and floor > s["bigram_reference_entropy"]:
-        notes.append(f"the head's cross-entropy floor ({floor:.3f}) is above the bigram reference entropy: comparing the "
+        notes.append(f"the head's cross-entropy floor ({floor:.3f}, optimised oracle) is above the bigram reference entropy: comparing the "
                      "test loss with that reference is not meaningful for this head (see head_ceiling)")
     notes.append("baselines are counted on the training individuals: frequency (= identity-free for haplotype units), "
                  "add-k bigram, trigram with backoff, and a Li-Stephens HMM copying the training haplotypes"
@@ -1150,28 +1151,41 @@ def test_set_performance(ctx, max_examples: int = 500, train_examples: int = 200
     return {"summary": s, "notes": notes, "files": [path]}
 
 
-def head_floor(model, data, targets):
-    """Mean cross-entropy an oracle reaches with the model's head when it points exactly at the target's
-    key (cosine heads; at the head's current logit scale). None for a learned output table."""
+def head_floor(model, data, targets, optimise=True, steps=200):
+    """Mean cross-entropy of an oracle that chooses, for each target, the query direction of the model's
+    cosine head (at its current logit scale): pointed exactly at the target's key (optimise=False), or
+    optimised by gradient descent to minimise the cross-entropy over the target's candidates, which
+    approximates the lowest cross-entropy the head can reach. None for a learned output table, which
+    has no fixed floor."""
     import torch
     if model.head_kind == "table":
         return None
     targets = np.asarray(targets)
-    with torch.no_grad():
-        q = model.keys[torch.from_numpy(targets).to(model.rnr.dev)]      # the best direction: the target's own key
-        total = 0.0
-        for chrom in np.unique(data.chrom_of[targets]):
-            sel = torch.from_numpy(np.where(data.chrom_of[targets] == chrom)[0]).to(model.rnr.dev)
-            lg, t, _ = model.logits(q[sel], targets[sel.cpu().numpy()], chrom)
+    total = 0.0
+    for chrom in np.unique(data.chrom_of[targets]):
+        sel = np.where(data.chrom_of[targets] == chrom)[0]
+        tg = targets[sel]
+        q = model.keys[torch.from_numpy(tg).to(model.rnr.dev)].detach().clone().requires_grad_(optimise)
+        if optimise:
+            opt = torch.optim.Adam([q], lr=0.05)
+            for _ in range(steps):
+                lg, t, _ = model.logits(q, tg, chrom)
+                loss = torch.nn.functional.cross_entropy(lg, t)
+                opt.zero_grad()
+                q.grad = torch.autograd.grad(loss, q)[0]            # only q: the model gets no gradient
+                opt.step()
+        with torch.no_grad():
+            lg, t, _ = model.logits(q, tg, chrom)
             total += torch.nn.functional.cross_entropy(lg, t, reduction="sum").item()
     return total / max(len(targets), 1)
 
 
-@task("head_ceiling", "The best cross-entropy and top-1 the model's output head can reach on the test targets")
+@task("head_ceiling", "The lowest cross-entropy the model's output head can reach on the test targets")
 def head_ceiling(ctx, max_targets: int = 5000, model: str = "", device: str = "", ckpt_dir: str = ""):
-    """An oracle that points the head exactly at each target's key: with a cosine head the softmax
-    over near-collinear keys cannot be sharp, so even a perfect model has a cross-entropy floor; with
-    a learned table there is none. Reported for the model's current scale and the largest allowed one."""
+    """With a cosine head the softmax over near-collinear keys cannot be sharp, so even a perfect model
+    has a cross-entropy floor; a learned table has none. Reports, at the model's logit scale and at
+    the largest allowed one, the cross-entropy of an oracle pointing at each target's key and the
+    floor (the query direction optimised per target), and how collinear the keys are."""
     import torch
     model, data, meta = query_model(ctx, model or None, device, ckpt_dir)
     ex = sample_examples(data, ctx.test_idx, 0, ctx.rng)
@@ -1183,29 +1197,30 @@ def head_ceiling(ctx, max_targets: int = 5000, model: str = "", device: str = ""
         s["ce_floor"] = 0.0
         notes = ["learned output table: every token has its own output vector, so the head has no fixed floor"]
     else:
-        s["ce_floor_current_scale"] = round(head_floor(model, data, targets), 4)
-        s["logit_scale"] = round(float(model.scale().detach() if hasattr(model.scale(), "detach") else model.scale()), 3)
+        scale = model.scale()
+        s["logit_scale"] = round(float(scale.detach() if hasattr(scale, "detach") else scale), 3)
+        s["ce_at_target_keys"] = round(head_floor(model, data, targets, optimise=False), 4)
+        s["ce_floor"] = round(head_floor(model, data, targets), 4)
         if meta["head"] == "scaled-cosine":
             with torch.no_grad():
                 keep = model.extra["log_scale"].clone()
                 model.extra["log_scale"].fill_(float(np.log(100.0)))
-                s["ce_floor_max_scale"] = round(head_floor(model, data, targets), 4)
+            s["ce_floor_max_scale"] = round(head_floor(model, data, targets), 4)
+            with torch.no_grad():
                 model.extra["log_scale"].copy_(keep)
         with torch.no_grad():
-            K = model.keys[torch.from_numpy(targets).to(model.rnr.dev)]
             near = []
             for chrom in data.present:
                 for b in np.unique(data.region_code[data.cands[chrom]]):
                     toks = data.block_pad[b][data.block_pad[b] >= 0]
                     if len(toks) > 1:
                         k = model.keys[torch.from_numpy(toks).to(model.rnr.dev)]
-                        sim = (k @ k.T).fill_diagonal_(-1).max(1).values
-                        near.append(sim.cpu().numpy())
+                        near.append((k @ k.T).fill_diagonal_(-1).max(1).values.cpu().numpy())
         near = np.concatenate(near) if near else np.zeros(1)
         s["median_cosine_to_nearest_other_key"] = round(float(np.median(near)), 3)
         s["share_of_keys_above_0.95"] = round(float((near > 0.95).mean()), 3)
-        notes = ["ce_floor = the cross-entropy of an oracle pointing at the target's key: the head cannot go "
-                 "below it; compare it with test_set_performance's bigram_reference_entropy"]
+        notes = ["ce_floor = the cross-entropy an oracle reaches with the best query direction per target (optimised): "
+                 "compare it with test_set_performance's bigram_reference_entropy"]
     return {"summary": s, "notes": notes}
 
 
@@ -1939,8 +1954,8 @@ def check_self_test(summaries, hotspot):
     if t["test_top1_accuracy"] <= t["frequency_top1_accuracy"] - 0.15:
         problems.append("the small model is far below the frequency baseline: the learning setup is broken")
     h = summaries["head_ceiling"]
-    if not 0 <= h["ce_floor_current_scale"] < 10:
-        problems.append(f"head_ceiling floor {h['ce_floor_current_scale']} out of range")
+    if not 0 <= h["ce_floor"] <= h["ce_at_target_keys"] + 1e-6:
+        problems.append(f"head_ceiling floor {h['ce_floor']} is not below the cross-entropy at the target keys")
     m = summaries["masked_imputation"]
     if m["model_scored"] != "yes" or not 0 <= m["span1_model_concordance"] <= 1:
         problems.append("masked_imputation did not score the masked model")
