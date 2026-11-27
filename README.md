@@ -182,7 +182,7 @@ place. The early versus late fusion comparison has been designed but not run yet
 | Prepare real proteomics | [`proteomics_prep/`](proteomics_prep/) | v0.1.0 on `main`, tested |
 | Synthetic test data | SynthTAN v0.1 (not in this repository) | Shared with the team |
 | Convert synthetic data for ProLM | [`synthtan_prolm/`](synthtan_prolm/) | On `main`, checked |
-| Protein embeddings with ProLM | `proteomics_emb/` (branch `pr_emb`) | First run done, not yet merged |
+| Protein embeddings with ProLM | [`proteomics_emb/`](proteomics_emb/) | Encoder merged (PR #5); fold-internal `cv_embeddings.py` added |
 | Early vs late fusion | – | Designed, not run |
 
 **Preparing real proteomics.** [`proteomics_prep/`](proteomics_prep/) holds five R scripts. They place each protein
@@ -199,14 +199,22 @@ trackers and null controls) are listed in a separate answer key, so tools can be
 [`synthtan_prolm/`](synthtan_prolm/) converts these cohorts to [ProLM](https://github.com/Qiu-Shizheng/ProLM)'s
 input format, with random protein embeddings because the fake proteins have no sequences.
 
-**Protein embeddings.** `proteomics_emb/` (branch `pr_emb`) adapts ProLM's `finetune.py` to train all parameters
-from scratch and to save one embedding per patient for late fusion. A first run produced 200 × 32 patient embeddings.
+**Protein embeddings.** [`proteomics_emb/`](proteomics_emb/) adapts ProLM's `finetune.py` to train all parameters
+from scratch and to save one embedding per patient for late fusion. `cv_embeddings.py` trains ProLM inside each
+cross-validation fold and writes, per fold, the patient embeddings plus `<run>_fold<k>_train.txt` (for the genome
+steps' `--train-individuals`) and `<run>_fold<k>_test.txt` (for `5_validate_evo2.py --test-individuals`), so both
+sides can use the same folds.
 
 **Fusion comparison (next).** Four arms are planned on SynthTAN: genome only, protein only (ProLM), late fusion
-(the ProLM patient embedding joined to the genome embedding, which the validator already accepts) and early fusion
+(the ProLM patient embedding joined to a per-patient genome embedding) and early fusion
 (protein values added to the block tokens in the Evo 2 step). Two points from review:
 
-- On SynthTAN v0.1 the genome alone recovers the planted region labels with 98–100% accuracy, so these labels test
+- On SynthTAN v0.1, observed loss-or-CNI region calls reproduce the true MOT and NULL labels at 98–100% (a simple
+  calling rule, not a held-out model), so these labels test
   whether proteins are tracked, not whether early beats late fusion. Harder labels are needed for that.
-- For a fair comparison, ProLM must be trained inside each cross-validation fold. Its `finetune.py` picks the best
-  epoch on its own test split.
+- For a fair comparison, ProLM must be trained inside each cross-validation fold (`cv_embeddings.py`); ProLM's
+  `finetune.py` picks the best epoch on its own test split.
+- No step exports a per-patient genome embedding yet: step 4a saves only the fine-tuned model, and
+  `5_validate_evo2.py` does not read external patient embeddings.
+- The SynthTAN genome regions were defined from all patients of a cohort, so a genome arm built on them is not
+  fully held out with respect to region discovery (see [`proteomics_emb/README.md`](proteomics_emb/README.md)).
