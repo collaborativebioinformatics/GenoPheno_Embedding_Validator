@@ -183,7 +183,7 @@ place. The early versus late fusion comparison has been designed but not run yet
 | Synthetic test data | SynthTAN v0.1 (not in this repository) | Shared with the team |
 | Convert synthetic data for ProLM | [`synthtan_prolm/`](synthtan_prolm/) | On `main`, checked |
 | Protein embeddings with ProLM | [`proteomics_emb/`](proteomics_emb/) | Encoder merged (PR #5); fold-internal `cv_embeddings.py` added |
-| Early vs late fusion | – | Designed, not run |
+| Early vs late fusion | [`fusion/`](fusion/) | Per-patient genome and protein inputs on shared folds (SynthTAN); Evo 2 run pending |
 
 **Preparing real proteomics.** [`proteomics_prep/`](proteomics_prep/) holds five R scripts. They place each protein
 in the haploblock that holds its gene's transcription start site, compute tumor minus normal per protein and patient,
@@ -214,7 +214,8 @@ sides can use the same folds.
   whether proteins are tracked, not whether early beats late fusion. Harder labels are needed for that.
 - For a fair comparison, ProLM must be trained inside each cross-validation fold (`cv_embeddings.py`); ProLM's
   `finetune.py` picks the best epoch on its own test split.
-- No step exports a per-patient genome embedding yet: step 4a saves only the fine-tuned model, and
-  `5_validate_evo2.py` does not read external patient embeddings.
+- Step 4a saves only the fine-tuned model, and `5_validate_evo2.py` does not read external patient embeddings;
+  [`fusion/genome_patient_embeddings.py`](fusion/) writes per-patient genome embeddings (node2vec means, or Evo 2,
+  not yet run with the real Evo 2 package).
 - The SynthTAN genome regions were defined from all patients of a cohort, so a genome arm built on them is not
   fully held out with respect to region discovery (see [`proteomics_emb/README.md`](proteomics_emb/README.md)).

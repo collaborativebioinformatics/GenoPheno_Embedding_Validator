@@ -40,7 +40,7 @@ OUTPUT  (in --output-dir; <run> = --run-name, default the output folder's name, 
                                    individual names of the genome graph, e.g. S001)
   fold<k>/test_predictions.csv     eid, one predicted probability per task, for the test patients
   fold<k>/metrics.json             per-epoch fit/validation loss, the selected epoch, class counts and metrics per
-                                   task (undefined metrics are null)
+                                   task (undefined metrics are null), sha256 of the embeddings and training list
   fold<k>/classifier.pt, backbone.pt   state_dicts of the selected model
 
 USING THE EMBEDDINGS FOR LATE FUSION
@@ -508,7 +508,9 @@ def run_fold(args, k: int, split, data, labels, tasks, device, out_dir: Path, fi
     torch.save(model.state_dict(), fdir / "classifier.pt")
     torch.save(model.backbone.state_dict(), fdir / "backbone.pt")
     write_json(fdir / "metrics.json", {
-        "fold": k, "run_name": args.run_name, "fingerprint": fingerprint, "n_fit": len(fit), "n_val": len(val), "n_test": len(test),
+        "fold": k, "run_name": args.run_name, "fingerprint": fingerprint,
+        "sha256_patient_embeddings": sha256(fdir / "patient_embeddings.csv"),
+        "sha256_train_list": sha256(fdir / f"{stem}_train.txt"), "n_fit": len(fit), "n_val": len(val), "n_test": len(test),
         "val_stratified": stratified, "best_epoch": best_epoch, "best_val_loss": best_loss,
         "epochs_run": len(history), "history": history, "counts": counts, "val": val_m, "test": test_m})
     final, old = out_dir / f"fold{k}", out_dir / f".fold{k}.old"

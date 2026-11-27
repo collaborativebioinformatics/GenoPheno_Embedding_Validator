@@ -97,19 +97,10 @@ same downstream learner, training rows and tuning budget; `test_predictions.csv`
 training patients' embeddings come from a model trained or selected on their labels, so they may look more
 separable than the test patients' (stacking optimism): compare arms on the test folds only.
 
-**Genome side, still to do.** Passing the training file to the genome steps is necessary but not sufficient:
-
-- The SynthTAN builder files (`builder/nodes.csv`, `edges.csv`) are genome-wide CSVs. `1_build_graph.py` expects
-  `<local-dir>/<chrom>/nodes.csv.gz` and `edges.csv.gz`, defaults to chr1–chr22 (`--chroms chr101,...,chr122` is
-  needed) and downloads from data.haploblocks.org when a local file is missing. A small converter is still needed.
-- `1_build_graph.py` reuses cached parts in `<workdir>/parts/<chrom>/` without checking which cohort they came
-  from, and names its default output folder after the training file, reusing an existing folder of that name.
-  Use a separate `--workdir` per cohort and a separate `--out` per fold, and check the graph folder's
-  `train_individuals.txt` against the fold's file.
-- No step writes a per-patient genome embedding yet (step 4a saves only the fine-tuned model).
-- The SynthTAN builder regions, and the builder's filter on node support (`min_support`), were computed from all
-  patients of a cohort, and step 1 keeps only edges within a chromosome. Step 1's train-only mode recomputes edge
-  weights but cannot undo that, so a genome arm built on these files is not fully held out with respect to region
-  discovery.
+**Genome side.** [`fusion/`](../fusion/) converts the SynthTAN builder files for `1_build_graph.py`, builds
+one graph per fold from the fold's training list (separate `--workdir` per cohort, `--out` per fold, checked
+against `train_individuals.txt`), writes per-patient genome embeddings and puts both sides into one shared layout.
+Its README lists what is still not held out (regions and candidate edges were chosen from all patients of a
+cohort; edges between chromosomes are dropped by step 1).
 
 Needs ProLM installed as the `prolm` package (`pip install -e .` in a ProLM clone).
