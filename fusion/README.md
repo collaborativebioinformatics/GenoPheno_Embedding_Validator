@@ -102,7 +102,9 @@ Treat the first real fold as a test.
    `--train-blocks 0` Evo 2 stays frozen and only the new input layers and the prediction head are trained (less
    memory). A rerun skips completed folds; changing `EVO2_ARGS` afterwards stops with an error until the old
    model is removed.
-6. **Send back** the `fold*/genome_embeddings_evo2.csv`, `.json` and `.prov` files and the log.
+6. **Use them.** Join `fold<k>/genome_embeddings_evo2.csv` with a protein table of the same fold on `eid` (after
+   reducing the 4,096 columns within the fold), exactly as for the other genome tables. Keep the `.json` and
+   `.prov` files with them: they record what each table was made from.
 
 The Evo 2 embeddings have the size of the read-out layer (the model's hidden size, 4,096 for Evo 2 7B): reduce
 them within each fold (e.g. PCA fitted on the training rows) before joining them to a 20-column protein table.
